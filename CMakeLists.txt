@@ -2,5 +2,8 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.22)
 
+set(EXTRA_COMPONENT_DIRS
+    "$ENV{IDF_PATH}/examples/protocols/http_server/captive_portal/components/dns_server")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(Day_Distiller_HW2.0_V1)

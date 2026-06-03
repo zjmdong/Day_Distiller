@@ -13,5 +13,7 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=d:\\ESP-IDF\\Projects\\Day_Distiller_HW2.0_V1\\build"
-  ]
+  ],
+  "idf.portWin": "COM5",
+  "idf.flashType": "UART"
 }
