@@ -19,10 +19,24 @@
 #define REG_MD1_CFG 0x5E
 #define WHO_AM_I_LSM6DS3 0x69
 #define WHO_AM_I_LSM6DSL_COMPAT 0x6A
+#define GYRO_DPS_PER_LSB 0.00875f
+#define RAD_TO_DEG 57.2957795f
+#define DEG_TO_RAD 0.0174532925f
+#define MADGWICK_BETA 0.06f
 
 static const char *TAG = "day_imu";
 
 static i2c_master_dev_handle_t s_dev;
+static uint8_t s_orientation;
+static int64_t s_last_motion_us;
+static float s_roll_deg;
+static float s_pitch_deg;
+static float s_yaw_deg;
+static float s_q0 = 1.0f;
+static float s_q1;
+static float s_q2;
+static float s_q3;
+static bool s_quat_initialized;
 static day_imu_status_t s_status = {
     .last_error = ESP_ERR_INVALID_STATE,
 };
@@ -95,7 +109,202 @@ esp_err_t day_imu_init(uint32_t sample_rate_hz)
     }
     s_status.present = ret == ESP_OK;
     s_status.last_error = ret;
+    if (ret == ESP_OK) {
+        s_last_motion_us = 0;
+        s_roll_deg = 0.0f;
+        s_pitch_deg = 0.0f;
+        s_yaw_deg = 0.0f;
+        s_q0 = 1.0f;
+        s_q1 = 0.0f;
+        s_q2 = 0.0f;
+        s_q3 = 0.0f;
+        s_quat_initialized = false;
+    }
     return ret;
+}
+
+void day_imu_set_orientation(uint8_t orientation)
+{
+    s_orientation = orientation <= 5 ? orientation : 0;
+    s_last_motion_us = 0;
+    s_roll_deg = 0.0f;
+    s_pitch_deg = 0.0f;
+    s_yaw_deg = 0.0f;
+    s_q0 = 1.0f;
+    s_q1 = 0.0f;
+    s_q2 = 0.0f;
+    s_q3 = 0.0f;
+    s_quat_initialized = false;
+}
+
+static void map_device_axes(float ax, float ay, float az, float *out_x, float *out_y, float *out_z)
+{
+    /*
+     * Hardware default from the provided front-side photo:
+     * +X points to the device right edge, +Y points to the device top edge,
+     * +Z points out of the front face.
+     */
+    switch (s_orientation) {
+    case 1: /* Rotate +90 degrees around sensor Z. */
+        *out_x = ay;
+        *out_y = -ax;
+        *out_z = az;
+        break;
+    case 2: /* Rotate -90 degrees around sensor Z. */
+        *out_x = -ay;
+        *out_y = ax;
+        *out_z = az;
+        break;
+    case 3: /* Rotate 180 degrees around sensor Z. */
+        *out_x = -ax;
+        *out_y = -ay;
+        *out_z = az;
+        break;
+    case 4: /* Flip device X. */
+        *out_x = -ax;
+        *out_y = ay;
+        *out_z = az;
+        break;
+    case 5: /* Flip device Y. */
+        *out_x = ax;
+        *out_y = -ay;
+        *out_z = az;
+        break;
+    default:
+        *out_x = ax;
+        *out_y = ay;
+        *out_z = az;
+        break;
+    }
+}
+
+static float wrap_degrees(float value)
+{
+    while (value > 180.0f) {
+        value -= 360.0f;
+    }
+    while (value < -180.0f) {
+        value += 360.0f;
+    }
+    return value;
+}
+
+static float gyro_deadband(float dps)
+{
+    return fabsf(dps) < 0.15f ? 0.0f : dps;
+}
+
+static void normalize_quaternion(void)
+{
+    float norm = sqrtf(s_q0 * s_q0 + s_q1 * s_q1 + s_q2 * s_q2 + s_q3 * s_q3);
+    if (norm <= 0.0f) {
+        s_q0 = 1.0f;
+        s_q1 = 0.0f;
+        s_q2 = 0.0f;
+        s_q3 = 0.0f;
+        return;
+    }
+    norm = 1.0f / norm;
+    s_q0 *= norm;
+    s_q1 *= norm;
+    s_q2 *= norm;
+    s_q3 *= norm;
+}
+
+static void set_quaternion_from_euler(float roll, float pitch, float yaw)
+{
+    float cr = cosf(roll * 0.5f);
+    float sr = sinf(roll * 0.5f);
+    float cp = cosf(pitch * 0.5f);
+    float sp = sinf(pitch * 0.5f);
+    float cy = cosf(yaw * 0.5f);
+    float sy = sinf(yaw * 0.5f);
+    s_q0 = cr * cp * cy + sr * sp * sy;
+    s_q1 = sr * cp * cy - cr * sp * sy;
+    s_q2 = cr * sp * cy + sr * cp * sy;
+    s_q3 = cr * cp * sy - sr * sp * cy;
+    normalize_quaternion();
+    s_quat_initialized = true;
+}
+
+static void init_quaternion_from_accel(float ax, float ay, float az, float yaw_deg)
+{
+    float roll = atan2f(ay, az);
+    float pitch = atan2f(-ax, sqrtf(ay * ay + az * az));
+    set_quaternion_from_euler(roll, pitch, yaw_deg * DEG_TO_RAD);
+}
+
+static void update_euler_from_quaternion(void)
+{
+    float sinr_cosp = 2.0f * (s_q0 * s_q1 + s_q2 * s_q3);
+    float cosr_cosp = 1.0f - 2.0f * (s_q1 * s_q1 + s_q2 * s_q2);
+    float sinp = 2.0f * (s_q0 * s_q2 - s_q3 * s_q1);
+    float siny_cosp = 2.0f * (s_q0 * s_q3 + s_q1 * s_q2);
+    float cosy_cosp = 1.0f - 2.0f * (s_q2 * s_q2 + s_q3 * s_q3);
+
+    s_roll_deg = atan2f(sinr_cosp, cosr_cosp) * RAD_TO_DEG;
+    if (sinp > 1.0f) {
+        sinp = 1.0f;
+    } else if (sinp < -1.0f) {
+        sinp = -1.0f;
+    }
+    s_pitch_deg = asinf(sinp) * RAD_TO_DEG;
+    s_yaw_deg = wrap_degrees(atan2f(siny_cosp, cosy_cosp) * RAD_TO_DEG);
+}
+
+static void madgwick_update_imu(float gx, float gy, float gz, float ax, float ay, float az, float dt)
+{
+    float q0 = s_q0;
+    float q1 = s_q1;
+    float q2 = s_q2;
+    float q3 = s_q3;
+    float q_dot0 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+    float q_dot1 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
+    float q_dot2 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
+    float q_dot3 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
+
+    float accel_norm = sqrtf(ax * ax + ay * ay + az * az);
+    if (accel_norm > 1.0f) {
+        accel_norm = 1.0f / accel_norm;
+        ax *= accel_norm;
+        ay *= accel_norm;
+        az *= accel_norm;
+
+        float _2q0 = 2.0f * q0;
+        float _2q1 = 2.0f * q1;
+        float _2q2 = 2.0f * q2;
+        float _2q3 = 2.0f * q3;
+        float _4q0 = 4.0f * q0;
+        float _4q1 = 4.0f * q1;
+        float _4q2 = 4.0f * q2;
+        float _8q1 = 8.0f * q1;
+        float _8q2 = 8.0f * q2;
+        float q0q0 = q0 * q0;
+        float q1q1 = q1 * q1;
+        float q2q2 = q2 * q2;
+        float q3q3 = q3 * q3;
+
+        float s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+        float s1 = _4q1 * q3q3 - _2q3 * ax + 4.0f * q0q0 * q1 - _2q0 * ay -
+                   _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+        float s2 = 4.0f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay -
+                   _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+        float s3 = 4.0f * q1q1 * q3 - _2q1 * ax + 4.0f * q2q2 * q3 - _2q2 * ay;
+        float step_norm = sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+        if (step_norm > 0.0f) {
+            step_norm = 1.0f / step_norm;
+            q_dot0 -= MADGWICK_BETA * s0 * step_norm;
+            q_dot1 -= MADGWICK_BETA * s1 * step_norm;
+            q_dot2 -= MADGWICK_BETA * s2 * step_norm;
+            q_dot3 -= MADGWICK_BETA * s3 * step_norm;
+        }
+    }
+
+    s_q0 += q_dot0 * dt;
+    s_q1 += q_dot1 * dt;
+    s_q2 += q_dot2 * dt;
+    s_q3 += q_dot3 * dt;
+    normalize_quaternion();
 }
 
 esp_err_t day_imu_read(day_imu_sample_t *sample)
@@ -122,12 +331,37 @@ esp_err_t day_imu_read(day_imu_sample_t *sample)
     sample->ay = (int16_t)((raw[9] << 8) | raw[8]);
     sample->az = (int16_t)((raw[11] << 8) | raw[10]);
 
-    float ax = (float)sample->ax;
-    float ay = (float)sample->ay;
-    float az = (float)sample->az;
-    sample->roll_deg = atan2f(ay, az) * 57.2957795f;
-    sample->pitch_deg = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.2957795f;
-    sample->yaw_deg = 0.0f;
+    float ax = 0.0f;
+    float ay = 0.0f;
+    float az = 0.0f;
+    float gx = 0.0f;
+    float gy = 0.0f;
+    float gz = 0.0f;
+    map_device_axes((float)sample->ax, (float)sample->ay, (float)sample->az, &ax, &ay, &az);
+    map_device_axes((float)sample->gx, (float)sample->gy, (float)sample->gz, &gx, &gy, &gz);
+
+    int64_t now_us = sample->t_us;
+    float dt = s_last_motion_us > 0 ? (float)(now_us - s_last_motion_us) / 1000000.0f : 0.0f;
+    if (!s_quat_initialized) {
+        init_quaternion_from_accel(ax, ay, az, 0.0f);
+    } else if (dt <= 0.0f || dt > 0.25f) {
+        init_quaternion_from_accel(ax, ay, az, s_yaw_deg);
+    } else {
+        float gx_dps = gyro_deadband(gx * GYRO_DPS_PER_LSB);
+        float gy_dps = gyro_deadband(gy * GYRO_DPS_PER_LSB);
+        float gz_dps = gyro_deadband(gz * GYRO_DPS_PER_LSB);
+        madgwick_update_imu(gx_dps * DEG_TO_RAD, gy_dps * DEG_TO_RAD, gz_dps * DEG_TO_RAD,
+                            ax, ay, az, dt);
+    }
+    s_last_motion_us = now_us;
+    update_euler_from_quaternion();
+    sample->roll_deg = s_roll_deg;
+    sample->pitch_deg = s_pitch_deg;
+    sample->yaw_deg = s_yaw_deg;
+    sample->q0 = s_q0;
+    sample->q1 = s_q1;
+    sample->q2 = s_q2;
+    sample->q3 = s_q3;
 
     s_status.present = true;
     s_status.last_sample = *sample;
@@ -142,12 +376,14 @@ esp_err_t day_imu_write_json_sample(FILE *file, const day_imu_sample_t *sample, 
     }
     fprintf(file,
             "%s{\"t_us\":%lld,\"ax\":%d,\"ay\":%d,\"az\":%d,\"gx\":%d,\"gy\":%d,\"gz\":%d,"
-            "\"roll\":%.3f,\"pitch\":%.3f,\"yaw\":%.3f}",
+            "\"roll\":%.3f,\"pitch\":%.3f,\"yaw\":%.3f,"
+            "\"q0\":%.6f,\"q1\":%.6f,\"q2\":%.6f,\"q3\":%.6f}",
             first ? "" : ",",
             (long long)sample->t_us,
             sample->ax, sample->ay, sample->az,
             sample->gx, sample->gy, sample->gz,
-            sample->roll_deg, sample->pitch_deg, sample->yaw_deg);
+            sample->roll_deg, sample->pitch_deg, sample->yaw_deg,
+            sample->q0, sample->q1, sample->q2, sample->q3);
     return ESP_OK;
 }
 

@@ -51,6 +51,7 @@ esp_err_t day_avi_begin(day_avi_writer_t *writer, FILE *file, uint32_t width, ui
 
     w4(file, "avih");
     le32(file, 56);
+    writer->avih_us_per_frame_pos = ftell(file);
     le32(file, 1000000 / fps);
     le32(file, 0);
     le32(file, 0);
@@ -78,7 +79,9 @@ esp_err_t day_avi_begin(day_avi_writer_t *writer, FILE *file, uint32_t width, ui
     le16(file, 0);
     le16(file, 0);
     le32(file, 0);
+    writer->strh_scale_pos = ftell(file);
     le32(file, 1);
+    writer->strh_rate_pos = ftell(file);
     le32(file, fps);
     le32(file, 0);
     writer->strh_frames_pos = ftell(file);
@@ -128,15 +131,21 @@ esp_err_t day_avi_write_frame(day_avi_writer_t *writer, const uint8_t *data, uin
     return ferror(writer->file) ? ESP_FAIL : ESP_OK;
 }
 
-esp_err_t day_avi_finish(day_avi_writer_t *writer)
+esp_err_t day_avi_finish(day_avi_writer_t *writer, uint32_t actual_frame_us)
 {
     if (!writer || !writer->file) {
         return ESP_ERR_INVALID_ARG;
     }
     fflush(writer->file);
     long end = ftell(writer->file);
+    if (actual_frame_us == 0) {
+        actual_frame_us = writer->fps ? (1000000 / writer->fps) : 1000000;
+    }
     patch32(writer->file, writer->riff_size_pos, (uint32_t)(end - 8));
+    patch32(writer->file, writer->avih_us_per_frame_pos, actual_frame_us);
     patch32(writer->file, writer->avih_frames_pos, writer->frames);
+    patch32(writer->file, writer->strh_scale_pos, actual_frame_us);
+    patch32(writer->file, writer->strh_rate_pos, 1000000);
     patch32(writer->file, writer->strh_frames_pos, writer->frames);
     patch32(writer->file, writer->movi_size_pos, (uint32_t)(end - writer->movi_list_pos - 4));
     fflush(writer->file);

@@ -1,6 +1,7 @@
 #include "recorder.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "audio_service.h"
 #include "avi_writer.h"
@@ -8,6 +9,7 @@
 #include "day_pins.h"
 #include "imu.h"
 #include "storage_service.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -39,6 +41,11 @@ typedef struct {
 static volatile bool s_recording;
 static esp_err_t s_last_error = ESP_OK;
 
+static uint32_t sanitize_fps(uint32_t fps)
+{
+    return (fps >= 1 && fps <= 30) ? fps : 15;
+}
+
 bool day_recorder_is_active(void)
 {
     return s_recording;
@@ -62,9 +69,12 @@ static void camera_task(void *arg)
     xEventGroupWaitBits(ctx->events, REC_BIT_START, false, true, portMAX_DELAY);
     day_camera_set_recording(true);
 
+    uint32_t target_fps = sanitize_fps(ctx->cfg->camera_record_fps);
+    int64_t frame_interval_us = 1000000LL / target_fps;
     day_avi_writer_t avi = {0};
     bool avi_started = false;
     while ((xEventGroupGetBits(ctx->events) & REC_BIT_STOP) == 0) {
+        int64_t frame_start_us = esp_timer_get_time();
         camera_fb_t *fb = NULL;
         esp_err_t ret = day_camera_capture(&fb);
         if (ret != ESP_OK) {
@@ -72,7 +82,7 @@ static void camera_task(void *arg)
             break;
         }
         if (!avi_started) {
-            ret = day_avi_begin(&avi, file, fb->width, fb->height, 15);
+            ret = day_avi_begin(&avi, file, fb->width, fb->height, target_fps);
             avi_started = ret == ESP_OK;
         }
         if (ret == ESP_OK) {
@@ -84,9 +94,21 @@ static void camera_task(void *arg)
             break;
         }
         ctx->video_frames++;
+        int64_t remain_us = frame_interval_us - (esp_timer_get_time() - frame_start_us);
+        if (remain_us > 1000) {
+            vTaskDelay(pdMS_TO_TICKS((uint32_t)(remain_us / 1000)));
+        }
+        day_camera_note_frame_done(frame_start_us, target_fps);
     }
     if (avi_started) {
-        day_avi_finish(&avi);
+        int64_t elapsed_us = DAY_RECORD_SECONDS * 1000000LL;
+        uint32_t actual_frame_us = ctx->video_frames > 0 ?
+                                   (uint32_t)((elapsed_us + ctx->video_frames / 2) / ctx->video_frames) :
+                                   (1000000U / target_fps);
+        if (actual_frame_us == 0) {
+            actual_frame_us = 1000000U / target_fps;
+        }
+        day_avi_finish(&avi, actual_frame_us);
     }
     fclose(file);
     day_camera_set_recording(false);
@@ -97,39 +119,58 @@ static void camera_task(void *arg)
 static void audio_task(void *arg)
 {
     record_ctx_t *ctx = arg;
-    FILE *file = fopen(ctx->paths.audio_path, "wb+");
-    if (!file) {
-        ctx->audio_err = ESP_FAIL;
+    uint32_t sample_rate = ctx->cfg->audio_sample_rate_hz;
+    size_t max_samples = (size_t)sample_rate * DAY_RECORD_SECONDS + sample_rate / 2;
+    int16_t *pcm = heap_caps_malloc(max_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pcm) {
+        pcm = malloc(max_samples * sizeof(int16_t));
+    }
+    if (!pcm) {
+        ctx->audio_err = ESP_ERR_NO_MEM;
         xEventGroupSetBits(ctx->events, REC_BIT_AUDIO_DONE);
         vTaskDelete(NULL);
     }
-    uint32_t sample_rate = ctx->cfg->audio_sample_rate_hz;
-    day_audio_write_wav_header(file, sample_rate, 0);
 
+    size_t total_samples = 0;
     int16_t samples[256];
     xEventGroupWaitBits(ctx->events, REC_BIT_START, false, true, portMAX_DELAY);
     esp_err_t ret = day_audio_start(sample_rate);
     if (ret != ESP_OK) {
         ctx->audio_err = ret;
     }
-    while (ret == ESP_OK && (xEventGroupGetBits(ctx->events) & REC_BIT_STOP) == 0) {
+    while (ret == ESP_OK && (xEventGroupGetBits(ctx->events) & REC_BIT_STOP) == 0 && total_samples < max_samples) {
         size_t got = 0;
         ret = day_audio_read_pcm16(samples, 256, &got, 100);
+        if (ret == ESP_ERR_TIMEOUT) {
+            ret = ESP_OK;
+            continue;
+        }
         if (ret == ESP_OK && got > 0) {
-            size_t written = fwrite(samples, sizeof(int16_t), got, file);
-            ctx->audio_bytes += written * sizeof(int16_t);
-            if (written != got) {
-                ret = ESP_FAIL;
-                break;
+            if (got > max_samples - total_samples) {
+                got = max_samples - total_samples;
             }
+            memcpy(pcm + total_samples, samples, got * sizeof(int16_t));
+            total_samples += got;
         }
     }
-    if (ret == ESP_ERR_TIMEOUT) {
-        ret = ESP_OK;
-    }
     day_audio_stop();
-    day_audio_patch_wav_header(file, sample_rate, ctx->audio_bytes);
-    fclose(file);
+    if (ret == ESP_OK) {
+        FILE *file = fopen(ctx->paths.audio_path, "wb");
+        if (!file) {
+            ret = ESP_FAIL;
+        } else {
+            uint32_t data_bytes = (uint32_t)(total_samples * sizeof(int16_t));
+            day_audio_write_wav_header(file, sample_rate, data_bytes);
+            size_t written = fwrite(pcm, sizeof(int16_t), total_samples, file);
+            if (written != total_samples) {
+                ret = ESP_FAIL;
+            } else {
+                ctx->audio_bytes = data_bytes;
+            }
+            fclose(file);
+        }
+    }
+    free(pcm);
     ctx->audio_err = ret;
     xEventGroupSetBits(ctx->events, REC_BIT_AUDIO_DONE);
     vTaskDelete(NULL);
@@ -138,38 +179,58 @@ static void audio_task(void *arg)
 static void imu_task(void *arg)
 {
     record_ctx_t *ctx = arg;
-    FILE *file = fopen(ctx->paths.imu_path, "w");
-    if (!file) {
-        ctx->imu_err = ESP_FAIL;
+    uint32_t sample_rate = ctx->cfg->imu_sample_rate_hz ? ctx->cfg->imu_sample_rate_hz : 104;
+    size_t max_samples = (size_t)sample_rate * DAY_RECORD_SECONDS + sample_rate;
+    day_imu_sample_t *samples = heap_caps_malloc(max_samples * sizeof(day_imu_sample_t),
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!samples) {
+        samples = malloc(max_samples * sizeof(day_imu_sample_t));
+    }
+    if (!samples) {
+        ctx->imu_err = ESP_ERR_NO_MEM;
         xEventGroupSetBits(ctx->events, REC_BIT_IMU_DONE);
         vTaskDelete(NULL);
     }
-    fprintf(file, "{\"sample_rate_hz\":%lu,\"samples\":[", (unsigned long)ctx->cfg->imu_sample_rate_hz);
-    bool first = true;
-    uint32_t delay_ms = 1000 / (ctx->cfg->imu_sample_rate_hz ? ctx->cfg->imu_sample_rate_hz : 104);
+
+    uint32_t delay_ms = 1000 / sample_rate;
     if (delay_ms == 0) {
         delay_ms = 1;
     }
+    TickType_t delay_ticks = pdMS_TO_TICKS(delay_ms);
+    if (delay_ticks == 0) {
+        delay_ticks = 1;
+    }
+    size_t sample_count = 0;
+    esp_err_t ret = ESP_OK;
 
     xEventGroupWaitBits(ctx->events, REC_BIT_START, false, true, portMAX_DELAY);
-    while ((xEventGroupGetBits(ctx->events) & REC_BIT_STOP) == 0) {
+    TickType_t last_wake = xTaskGetTickCount();
+    while ((xEventGroupGetBits(ctx->events) & REC_BIT_STOP) == 0 && sample_count < max_samples) {
         day_imu_sample_t sample;
-        esp_err_t ret = day_imu_read(&sample);
+        ret = day_imu_read(&sample);
         if (ret != ESP_OK) {
-            ctx->imu_err = ret;
             break;
         }
         sample.t_us -= ctx->start_us;
-        day_imu_write_json_sample(file, &sample, first);
-        first = false;
-        ctx->imu_samples++;
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        samples[sample_count++] = sample;
+        vTaskDelayUntil(&last_wake, delay_ticks);
     }
-    fprintf(file, "]}");
-    fclose(file);
-    if (ctx->imu_err == ESP_OK || ctx->imu_err == 0) {
-        ctx->imu_err = ESP_OK;
+    if (ret == ESP_OK) {
+        FILE *file = fopen(ctx->paths.imu_path, "w");
+        if (!file) {
+            ret = ESP_FAIL;
+        } else {
+            fprintf(file, "{\"sample_rate_hz\":%lu,\"samples\":[", (unsigned long)sample_rate);
+            for (size_t i = 0; i < sample_count; ++i) {
+                day_imu_write_json_sample(file, &samples[i], i == 0);
+            }
+            fprintf(file, "]}");
+            fclose(file);
+            ctx->imu_samples = (uint32_t)sample_count;
+        }
     }
+    free(samples);
+    ctx->imu_err = ret;
     xEventGroupSetBits(ctx->events, REC_BIT_IMU_DONE);
     vTaskDelete(NULL);
 }
@@ -251,7 +312,7 @@ esp_err_t day_recorder_record_once(const day_config_t *cfg, day_record_paths_t *
         bool task_started = false;
         if (ctx.camera_err == ESP_OK) {
             day_camera_set_recording(true);
-            task_started |= start_record_task(camera_task, "rec_camera", 6144, 8, &ctx,
+            task_started |= start_record_task(camera_task, "rec_camera", 6144, 5, &ctx,
                                               REC_BIT_CAMERA_DONE, &ctx.camera_err);
             if (ctx.camera_err != ESP_OK) {
                 day_camera_set_recording(false);
@@ -261,14 +322,14 @@ esp_err_t day_recorder_record_once(const day_config_t *cfg, day_record_paths_t *
             xEventGroupSetBits(ctx.events, REC_BIT_CAMERA_DONE);
         }
         if (ctx.audio_err == ESP_OK) {
-            task_started |= start_record_task(audio_task, "rec_audio", 4096, 8, &ctx,
+            task_started |= start_record_task(audio_task, "rec_audio", 4096, 14, &ctx,
                                               REC_BIT_AUDIO_DONE, &ctx.audio_err);
         } else {
             ESP_LOGW(TAG, "audio unavailable: %s", esp_err_to_name(ctx.audio_err));
             xEventGroupSetBits(ctx.events, REC_BIT_AUDIO_DONE);
         }
         if (ctx.imu_err == ESP_OK) {
-            task_started |= start_record_task(imu_task, "rec_imu", 4096, 7, &ctx,
+            task_started |= start_record_task(imu_task, "rec_imu", 4096, 12, &ctx,
                                               REC_BIT_IMU_DONE, &ctx.imu_err);
         } else {
             ESP_LOGW(TAG, "imu unavailable: %s", esp_err_to_name(ctx.imu_err));

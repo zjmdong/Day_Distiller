@@ -4,19 +4,21 @@
 #include <string.h>
 #include "camera_service.h"
 #include "recorder.h"
+#include "rtc_clock.h"
 #include "storage_service.h"
 #include "wifi_portal.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <time.h>
 
 extern const char web_index_html_start[] asm("_binary_index_html_start");
 extern const char web_index_html_end[] asm("_binary_index_html_end");
 
 static const char *TAG = "day_web";
 
-#define DAY_STATUS_JSON_LEN 2600
+#define DAY_STATUS_JSON_LEN 4400
 #define DAY_FILES_JSON_LEN 1800
 #define DAY_WIFI_SCAN_JSON_LEN 2000
 
@@ -39,6 +41,51 @@ static const char *boolstr(bool value)
     return value ? "true" : "false";
 }
 
+static void json_escape_string(const char *src, char *dst, size_t len)
+{
+    if (!dst || len == 0) {
+        return;
+    }
+    size_t used = 0;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    while (*src && used + 1 < len) {
+        char c = *src++;
+        if ((c == '"' || c == '\\') && used + 2 < len) {
+            dst[used++] = '\\';
+            dst[used++] = c;
+        } else if ((unsigned char)c >= 0x20) {
+            dst[used++] = c;
+        }
+    }
+    dst[used] = '\0';
+}
+
+static void audio_waveform_to_json(const day_audio_status_t *audio, char *buf, size_t len)
+{
+    if (!buf || len == 0) {
+        return;
+    }
+    size_t used = snprintf(buf, len, "[");
+    uint8_t count = audio ? audio->waveform_len : 0;
+    if (count > DAY_AUDIO_WAVEFORM_SAMPLES) {
+        count = DAY_AUDIO_WAVEFORM_SAMPLES;
+    }
+    for (uint8_t i = 0; i < count && used < len; ++i) {
+        int written = snprintf(buf + used, len - used, "%s%d", i == 0 ? "" : ",", audio->waveform[i]);
+        if (written < 0 || (size_t)written >= len - used) {
+            buf[len - 1] = '\0';
+            return;
+        }
+        used += (size_t)written;
+    }
+    if (used < len) {
+        snprintf(buf + used, len - used, "]");
+    }
+}
+
 static esp_err_t root_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
@@ -48,6 +95,8 @@ static esp_err_t root_handler(httpd_req_t *req)
 
 static void status_to_json(const day_device_status_t *st, char *buf, size_t len)
 {
+    char wave_json[360];
+    audio_waveform_to_json(&st->audio, wave_json, sizeof(wave_json));
     snprintf(buf, len,
              "{"
              "\"recording\":%s,"
@@ -56,9 +105,10 @@ static void status_to_json(const day_device_status_t *st, char *buf, size_t len)
              "\"rtc\":{\"valid\":%s,\"iso\":\"%s\",\"err\":\"%s\"},"
              "\"storage\":{\"mounted\":%s,\"total\":%llu,\"free\":%llu,\"err\":\"%s\"},"
              "\"camera\":{\"initialized\":%s,\"recording\":%s,\"streaming\":%s,\"frames\":%lu,\"fps\":%.1f,\"err\":\"%s\"},"
-             "\"audio\":{\"initialized\":%s,\"rate\":%lu,\"rms\":%.4f,\"peak\":%.4f,\"err\":\"%s\"},"
+             "\"audio\":{\"initialized\":%s,\"rate\":%lu,\"rms\":%.4f,\"peak\":%.4f,\"wave\":%s,\"err\":\"%s\"},"
              "\"imu\":{\"present\":%s,\"ax\":%d,\"ay\":%d,\"az\":%d,\"gx\":%d,\"gy\":%d,\"gz\":%d,"
-             "\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f,\"err\":\"%s\"},"
+             "\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f,"
+             "\"q0\":%.6f,\"q1\":%.6f,\"q2\":%.6f,\"q3\":%.6f,\"err\":\"%s\"},"
              "\"wifi\":{\"ap\":%s,\"sta\":%s,\"time_synced\":%s,\"clients\":%d,\"ap_ssid\":\"%s\",\"sta_ssid\":\"%s\",\"ip\":\"%s\",\"err\":\"%s\"}"
              "}",
              boolstr(st->recording_active),
@@ -71,10 +121,11 @@ static void status_to_json(const day_device_status_t *st, char *buf, size_t len)
              boolstr(st->camera.initialized), boolstr(st->camera.recording), boolstr(st->camera.streaming),
              (unsigned long)st->camera.frame_count, st->camera.fps, esp_err_to_name(st->camera.last_error),
              boolstr(st->audio.initialized), (unsigned long)st->audio.sample_rate_hz,
-             st->audio.rms, st->audio.peak, esp_err_to_name(st->audio.last_error),
+             st->audio.rms, st->audio.peak, wave_json, esp_err_to_name(st->audio.last_error),
              boolstr(st->imu.present), st->imu.last_sample.ax, st->imu.last_sample.ay, st->imu.last_sample.az,
              st->imu.last_sample.gx, st->imu.last_sample.gy, st->imu.last_sample.gz,
              st->imu.last_sample.roll_deg, st->imu.last_sample.pitch_deg, st->imu.last_sample.yaw_deg,
+             st->imu.last_sample.q0, st->imu.last_sample.q1, st->imu.last_sample.q2, st->imu.last_sample.q3,
              esp_err_to_name(st->imu.last_error),
              boolstr(st->wifi.ap_running), boolstr(st->wifi.sta_connected), boolstr(st->wifi.time_synced),
              st->wifi.ap_clients, st->wifi.ap_ssid, st->wifi.sta_ssid, st->wifi.ip_addr,
@@ -103,6 +154,14 @@ static esp_err_t status_handler(httpd_req_t *req)
 
 static void config_to_json(const day_config_t *cfg, char *buf, size_t len)
 {
+    char ntp[DAY_NTP_SERVER_MAX * 2 + 1];
+    char tz[DAY_TIMEZONE_MAX * 2 + 1];
+    char ssid[DAY_WIFI_SSID_MAX * 2 + 1];
+    char pass[DAY_WIFI_PASSWORD_MAX * 2 + 1];
+    json_escape_string(cfg->ntp_server, ntp, sizeof(ntp));
+    json_escape_string(cfg->timezone, tz, sizeof(tz));
+    json_escape_string(cfg->wifi_ssid, ssid, sizeof(ssid));
+    json_escape_string(cfg->wifi_password, pass, sizeof(pass));
     snprintf(buf, len,
              "{"
              "\"auto_record_enabled\":%s,"
@@ -110,25 +169,39 @@ static void config_to_json(const day_config_t *cfg, char *buf, size_t len)
              "\"shake_trigger_enabled\":%s,"
              "\"camera_framesize\":%d,"
              "\"camera_jpeg_quality\":%d,"
+             "\"camera_preview_fps\":%lu,"
+             "\"camera_record_fps\":%lu,"
              "\"audio_sample_rate_hz\":%lu,"
              "\"imu_sample_rate_hz\":%lu,"
+             "\"imu_orientation\":%u,"
              "\"low_battery_percent\":%u,"
-             "\"wifi_ssid\":\"%s\""
+             "\"ntp_server\":\"%s\","
+             "\"timezone\":\"%s\","
+             "\"wifi_configured\":%s,"
+             "\"wifi_ssid\":\"%s\","
+             "\"wifi_password\":\"%s\""
              "}",
              boolstr(cfg->auto_record_enabled),
              (unsigned long)cfg->wake_interval_sec,
              boolstr(cfg->shake_trigger_enabled),
              cfg->camera_framesize,
              cfg->camera_jpeg_quality,
+             (unsigned long)cfg->camera_preview_fps,
+             (unsigned long)cfg->camera_record_fps,
              (unsigned long)cfg->audio_sample_rate_hz,
              (unsigned long)cfg->imu_sample_rate_hz,
+             cfg->imu_orientation,
              cfg->low_battery_percent,
-             cfg->wifi_ssid);
+             ntp,
+             tz,
+             boolstr(cfg->wifi_ssid[0] != '\0'),
+             ssid,
+             pass);
 }
 
 static esp_err_t config_get_handler(httpd_req_t *req)
 {
-    char json[700];
+    char json[1200];
     config_to_json(s_cb.config, json, sizeof(json));
     json_send(req, json);
     return ESP_OK;
@@ -221,7 +294,7 @@ static bool json_string(const char *json, const char *name, char *out, size_t le
 
 static esp_err_t config_post_handler(httpd_req_t *req)
 {
-    char body[768];
+    char body[1100];
     esp_err_t ret = read_body(req, body, sizeof(body));
     if (ret != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
@@ -233,13 +306,22 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     json_u32(body, "wake_interval_sec", &next.wake_interval_sec);
     json_int(body, "camera_framesize", &next.camera_framesize);
     json_int(body, "camera_jpeg_quality", &next.camera_jpeg_quality);
+    json_u32(body, "camera_preview_fps", &next.camera_preview_fps);
+    json_u32(body, "camera_record_fps", &next.camera_record_fps);
     json_u32(body, "audio_sample_rate_hz", &next.audio_sample_rate_hz);
     json_u32(body, "imu_sample_rate_hz", &next.imu_sample_rate_hz);
+    uint32_t imu_orientation = next.imu_orientation;
+    json_u32(body, "imu_orientation", &imu_orientation);
+    if (imu_orientation <= 5) {
+        next.imu_orientation = (uint8_t)imu_orientation;
+    }
     uint32_t low_batt = next.low_battery_percent;
     json_u32(body, "low_battery_percent", &low_batt);
     if (low_batt > 0 && low_batt < 100) {
         next.low_battery_percent = (uint8_t)low_batt;
     }
+    json_string(body, "ntp_server", next.ntp_server, sizeof(next.ntp_server));
+    json_string(body, "timezone", next.timezone, sizeof(next.timezone));
     if (s_cb.save_config) {
         ret = s_cb.save_config(&next);
     }
@@ -316,7 +398,44 @@ static esp_err_t wifi_connect_handler(httpd_req_t *req)
     }
     json_string(body, "password", pass, sizeof(pass));
     ret = day_wifi_save_credentials_and_connect(s_cb.config, ssid, pass);
-    json_send(req, ret == ESP_OK ? "{\"ok\":true}" : "{\"ok\":false}");
+    if (ret == ESP_OK) {
+        time_t now = 0;
+        time(&now);
+        if (now > 1609459200) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(day_rtc_write_time(now));
+        }
+    }
+    day_wifi_status_t wifi = day_wifi_get_status();
+    char json[180];
+    snprintf(json, sizeof(json),
+             "{\"ok\":%s,\"connected\":%s,\"time_synced\":%s,\"error\":\"%s\"}",
+             boolstr(ret == ESP_OK),
+             boolstr(wifi.sta_connected),
+             boolstr(wifi.time_synced),
+             esp_err_to_name(ret));
+    json_send(req, json);
+    return ESP_OK;
+}
+
+static esp_err_t time_sync_handler(httpd_req_t *req)
+{
+    esp_err_t ret = day_wifi_sync_time(s_cb.config);
+    if (ret == ESP_OK) {
+        time_t now = 0;
+        time(&now);
+        if (now > 1609459200) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(day_rtc_write_time(now));
+        }
+    }
+    day_wifi_status_t wifi = day_wifi_get_status();
+    char json[180];
+    snprintf(json, sizeof(json),
+             "{\"ok\":%s,\"connected\":%s,\"time_synced\":%s,\"error\":\"%s\"}",
+             boolstr(ret == ESP_OK),
+             boolstr(wifi.sta_connected),
+             boolstr(wifi.time_synced),
+             esp_err_to_name(ret));
+    json_send(req, json);
     return ESP_OK;
 }
 
@@ -327,7 +446,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(ret));
         return ret;
     }
-    return day_camera_stream_mjpeg(req);
+    return day_camera_stream_mjpeg(req, s_cb.config ? s_cb.config->camera_preview_fps : 12);
 }
 
 static void record_request_task(void *arg)
@@ -365,6 +484,9 @@ static bool has_ws_clients(void)
 static esp_err_t ws_handler(httpd_req_t *req)
 {
     add_ws_client(httpd_req_to_sockfd(req));
+    if (req->method == HTTP_GET) {
+        return ESP_OK;
+    }
     httpd_ws_frame_t pkt = {
         .type = HTTPD_WS_TYPE_TEXT,
     };
@@ -410,7 +532,8 @@ static void telemetry_task(void *arg)
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(250));
+        uint32_t delay_ms = status->camera.streaming ? 250 : 10;
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
     free(status);
     free(json);
@@ -463,6 +586,7 @@ esp_err_t day_web_start(const day_web_callbacks_t *callbacks)
     httpd_uri_t files = {.uri = "/api/files", .method = HTTP_GET, .handler = files_handler};
     httpd_uri_t scan = {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = wifi_scan_handler};
     httpd_uri_t connect = {.uri = "/api/wifi/connect", .method = HTTP_POST, .handler = wifi_connect_handler};
+    httpd_uri_t sync = {.uri = "/api/time/sync", .method = HTTP_POST, .handler = time_sync_handler};
     httpd_uri_t ws = {.uri = "/ws/telemetry", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true};
     httpd_uri_t captive = {.uri = "/*", .method = HTTP_GET, .handler = captive_redirect_handler};
 
@@ -474,6 +598,7 @@ esp_err_t day_web_start(const day_web_callbacks_t *callbacks)
     httpd_register_uri_handler(s_server, &files);
     httpd_register_uri_handler(s_server, &scan);
     httpd_register_uri_handler(s_server, &connect);
+    httpd_register_uri_handler(s_server, &sync);
     httpd_register_uri_handler(s_server, &ws);
     httpd_register_uri_handler(s_server, &captive);
     httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, redirect_404);

@@ -7,6 +7,9 @@
 
 #define DAY_WIFI_SSID_MAX 32
 #define DAY_WIFI_PASSWORD_MAX 64
+#define DAY_NTP_SERVER_MAX 64
+#define DAY_TIMEZONE_MAX 32
+#define DAY_AUDIO_WAVEFORM_SAMPLES 64
 
 typedef enum {
     DAY_CHARGE_UNKNOWN = 0,
@@ -20,9 +23,14 @@ typedef struct {
     bool shake_trigger_enabled;
     int camera_framesize;
     int camera_jpeg_quality;
+    uint32_t camera_preview_fps;
+    uint32_t camera_record_fps;
     uint32_t audio_sample_rate_hz;
     uint32_t imu_sample_rate_hz;
+    uint8_t imu_orientation;
     uint8_t low_battery_percent;
+    char ntp_server[DAY_NTP_SERVER_MAX + 1];
+    char timezone[DAY_TIMEZONE_MAX + 1];
     char wifi_ssid[DAY_WIFI_SSID_MAX + 1];
     char wifi_password[DAY_WIFI_PASSWORD_MAX + 1];
 } day_config_t;
@@ -53,6 +61,10 @@ typedef struct {
     float roll_deg;
     float pitch_deg;
     float yaw_deg;
+    float q0;
+    float q1;
+    float q2;
+    float q3;
 } day_imu_sample_t;
 
 typedef struct {
@@ -82,6 +94,8 @@ typedef struct {
     uint32_t sample_rate_hz;
     float rms;
     float peak;
+    uint8_t waveform_len;
+    int8_t waveform[DAY_AUDIO_WAVEFORM_SAMPLES];
     esp_err_t last_error;
 } day_audio_status_t;
 

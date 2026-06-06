@@ -1,5 +1,6 @@
 #include "wifi_portal.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "app_config.h"
@@ -32,6 +33,28 @@ static day_wifi_status_t s_status = {
 };
 static int s_retry_count;
 static bool s_connecting;
+
+static void json_escape_string(const char *src, char *dst, size_t len)
+{
+    if (!dst || len == 0) {
+        return;
+    }
+    size_t used = 0;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    while (*src && used + 1 < len) {
+        char c = *src++;
+        if ((c == '"' || c == '\\') && used + 2 < len) {
+            dst[used++] = '\\';
+            dst[used++] = c;
+        } else if ((unsigned char)c >= 0x20) {
+            dst[used++] = c;
+        }
+    }
+    dst[used] = '\0';
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -109,7 +132,9 @@ static esp_err_t connect_sta(const day_config_t *cfg)
     xEventGroupClearBits(s_events, WIFI_BIT_CONNECTED | WIFI_BIT_FAIL);
     s_retry_count = 0;
     s_connecting = true;
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set STA mode failed");
+    s_status.time_synced = false;
+    wifi_mode_t mode = s_status.ap_running ? WIFI_MODE_APSTA : WIFI_MODE_STA;
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(mode), TAG, "set STA mode failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg), TAG, "set STA config failed");
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
     ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "connect failed");
@@ -123,20 +148,29 @@ static esp_err_t connect_sta(const day_config_t *cfg)
     return ESP_ERR_TIMEOUT;
 }
 
-static esp_err_t sync_sntp(void)
+static esp_err_t sync_sntp(const day_config_t *cfg)
 {
-    static bool sntp_started;
-    if (!sntp_started) {
-        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-        esp_sntp_setservername(0, "pool.ntp.org");
-        esp_sntp_init();
-        sntp_started = true;
+    const char *tz = (cfg && cfg->timezone[0]) ? cfg->timezone : "CST-8";
+    const char *server = (cfg && cfg->ntp_server[0]) ? cfg->ntp_server : "ntp1.aliyun.com";
+    setenv("TZ", tz, 1);
+    tzset();
+
+    if (esp_sntp_enabled()) {
+        esp_sntp_stop();
     }
+    esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+    esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, server);
+    esp_sntp_init();
+    ESP_LOGI(TAG, "SNTP sync start server=%s timezone=%s", server, tz);
+
     for (int i = 0; i < 20; ++i) {
-        time_t now = 0;
-        time(&now);
-        if (now > 1609459200) {
+        if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+            time_t now = 0;
+            time(&now);
             s_status.time_synced = true;
+            ESP_LOGI(TAG, "SNTP synced at %lld", (long long)now);
             return ESP_OK;
         }
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -151,7 +185,7 @@ esp_err_t day_wifi_sync_time(const day_config_t *cfg)
         ret = connect_sta(cfg);
     }
     if (ret == ESP_OK) {
-        ret = sync_sntp();
+        ret = sync_sntp(cfg);
     }
     s_status.last_error = ret;
     return ret;
@@ -160,7 +194,7 @@ esp_err_t day_wifi_sync_time(const day_config_t *cfg)
 static void build_ap_ssid(char *out, size_t len)
 {
     uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(out, len, "AI_CAM_%02X%02X", mac[4], mac[5]);
 }
 
@@ -242,6 +276,7 @@ esp_err_t day_wifi_scan_json(char *buffer, size_t len)
         return ESP_ERR_INVALID_ARG;
     }
     ESP_RETURN_ON_ERROR(day_wifi_init(), TAG, "wifi init failed");
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(s_status.ap_running ? WIFI_MODE_APSTA : WIFI_MODE_STA));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
     wifi_scan_config_t scan_cfg = {0};
     esp_err_t ret = esp_wifi_scan_start(&scan_cfg, true);
@@ -256,9 +291,11 @@ esp_err_t day_wifi_scan_json(char *buffer, size_t len)
     }
     size_t used = snprintf(buffer, len, "{\"ok\":true,\"aps\":[");
     for (int i = 0; i < count; ++i) {
+        char ssid[sizeof(aps[i].ssid) * 2 + 1];
+        json_escape_string((const char *)aps[i].ssid, ssid, sizeof(ssid));
         int written = snprintf(buffer + used, len - used,
                                "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d}",
-                               i == 0 ? "" : ",", aps[i].ssid, aps[i].rssi, aps[i].authmode);
+                               i == 0 ? "" : ",", ssid, aps[i].rssi, aps[i].authmode);
         if (written < 0 || (size_t)written >= len - used) {
             return ESP_ERR_NO_MEM;
         }

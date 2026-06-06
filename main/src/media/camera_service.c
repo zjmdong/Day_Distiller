@@ -5,6 +5,8 @@
 #include "day_pins.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "day_camera";
 
@@ -19,6 +21,22 @@ static framesize_t sanitize_framesize(int value)
         return FRAMESIZE_FHD;
     }
     return (framesize_t)value;
+}
+
+static uint32_t sanitize_fps(uint32_t fps, uint32_t fallback)
+{
+    if (fps < 1 || fps > 30) {
+        return fallback;
+    }
+    return fps;
+}
+
+static void update_status_fps(float fps)
+{
+    if (fps < 0.1f || fps > 60.0f) {
+        return;
+    }
+    s_status.fps = s_status.fps > 0.1f ? (s_status.fps * 0.75f + fps * 0.25f) : fps;
 }
 
 esp_err_t day_camera_init(const day_config_t *cfg)
@@ -80,6 +98,8 @@ void day_camera_deinit(void)
     s_status.initialized = false;
     s_status.streaming = false;
     s_status.recording = false;
+    s_status.fps = 0.0f;
+    s_status.frame_count = 0;
 }
 
 esp_err_t day_camera_capture(camera_fb_t **out_fb)
@@ -92,15 +112,12 @@ esp_err_t day_camera_capture(camera_fb_t **out_fb)
         s_status.last_error = ESP_ERR_INVALID_STATE;
         return ESP_ERR_INVALID_STATE;
     }
-    int64_t start = esp_timer_get_time();
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         s_status.last_error = ESP_FAIL;
         return ESP_FAIL;
     }
-    int64_t elapsed = esp_timer_get_time() - start;
     s_status.frame_count++;
-    s_status.fps = elapsed > 0 ? 1000000.0f / (float)elapsed : 0.0f;
     s_status.last_error = ESP_OK;
     *out_fb = fb;
     return ESP_OK;
@@ -113,7 +130,32 @@ void day_camera_return(camera_fb_t *fb)
     }
 }
 
-esp_err_t day_camera_stream_mjpeg(httpd_req_t *req)
+static void delay_to_target_fps(int64_t frame_start_us, uint32_t target_fps)
+{
+    uint32_t fps = sanitize_fps(target_fps, 12);
+    int64_t frame_us = 1000000LL / fps;
+    int64_t elapsed_us = esp_timer_get_time() - frame_start_us;
+    int64_t remain_us = frame_us - elapsed_us;
+    if (remain_us > 1000) {
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)(remain_us / 1000)));
+    }
+}
+
+void day_camera_note_frame_done(int64_t frame_start_us, uint32_t target_fps)
+{
+    int64_t elapsed_us = esp_timer_get_time() - frame_start_us;
+    if (elapsed_us <= 0) {
+        return;
+    }
+    float fps = 1000000.0f / (float)elapsed_us;
+    uint32_t limit = sanitize_fps(target_fps, 30);
+    if (fps > (float)limit) {
+        fps = (float)limit;
+    }
+    update_status_fps(fps);
+}
+
+esp_err_t day_camera_stream_mjpeg(httpd_req_t *req, uint32_t target_fps)
 {
     static const char *boundary = "123456789000000000000987654321";
     char part_header[96];
@@ -123,6 +165,7 @@ esp_err_t day_camera_stream_mjpeg(httpd_req_t *req)
     }
     s_status.streaming = true;
     while (!s_status.recording) {
+        int64_t frame_start_us = esp_timer_get_time();
         camera_fb_t *fb = NULL;
         ret = day_camera_capture(&fb);
         if (ret != ESP_OK) {
@@ -145,6 +188,8 @@ esp_err_t day_camera_stream_mjpeg(httpd_req_t *req)
         if (ret != ESP_OK) {
             break;
         }
+        delay_to_target_fps(frame_start_us, target_fps);
+        day_camera_note_frame_done(frame_start_us, target_fps);
     }
     httpd_resp_send_chunk(req, NULL, 0);
     s_status.streaming = false;

@@ -9,11 +9,12 @@
       color-scheme: light;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
       --ink: #172026;
-      --muted: #5d6d76;
+      --muted: #5c6a72;
       --line: #dce4e8;
       --panel: #ffffff;
       --soft: #f3f6f7;
       --accent: #0f766e;
+      --warn: #d97706;
       --danger: #b42318;
       --dark: #11181d;
     }
@@ -31,6 +32,7 @@
     section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
     h2 { margin: 0; font-size: 16px; }
     h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 700; }
+    .wide { grid-column: 1 / -1; }
     .section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
     .grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
     .split { display: grid; gap: 10px; }
@@ -39,7 +41,8 @@
     .value { margin-top: 5px; font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }
     .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #9aa6ac; display: inline-block; margin-right: 6px; }
     .status-dot.ok { background: var(--accent); }
-    .status-dot.warn { background: #d97706; }
+    .status-dot.warn { background: var(--warn); }
+    .status-dot.bad { background: var(--danger); }
     button {
       min-height: 40px; border: 1px solid var(--dark); border-radius: 6px;
       background: var(--dark); color: white; font-weight: 700; padding: 0 14px;
@@ -55,26 +58,67 @@
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .switch { display: flex; align-items: center; gap: 8px; min-height: 38px; font-size: 14px; color: var(--ink); }
     .switch input { width: 18px; min-height: 18px; }
-    .preview-box { background: #080d10; border-radius: 6px; overflow: hidden; min-height: 210px; display: grid; place-items: center; }
+    .banner {
+      display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px;
+      border: 1px solid #d2ebe7; border-radius: 6px; background: #eefaf7; color: #11443f;
+      font-size: 14px; line-height: 1.45;
+    }
+    .banner.warn { border-color: #f2d39c; background: #fff7ed; color: #7c3d12; }
+    .banner.bad { border-color: #f4b8b0; background: #fff1f0; color: #842018; }
+    .ap-list { display: grid; gap: 6px; max-height: 220px; overflow: auto; margin-top: 8px; }
+    .ap-item {
+      min-height: 44px; display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center;
+      padding: 8px 10px; border: 1px solid #e7ecef; border-radius: 6px; background: #fbfcfc;
+      text-align: left; color: var(--ink);
+    }
+    .ap-item.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+    .ap-item small { display: block; color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .preview-box { background: #080d10; border-radius: 6px; overflow: hidden; min-height: 220px; display: grid; place-items: center; }
     #preview { width: 100%; max-height: 54vh; object-fit: contain; display: block; }
     .placeholder { color: #a8b4ba; font-size: 14px; padding: 30px 10px; text-align: center; }
-    .cube-wrap { height: 180px; display: grid; place-items: center; perspective: 620px; background: #eef3f5; border-radius: 6px; }
-    .cube { width: 78px; height: 78px; position: relative; transform-style: preserve-3d; transition: transform .16s linear; }
-    .face {
-      position: absolute; width: 78px; height: 78px; display: grid; place-items: center;
-      border: 1px solid rgba(0,0,0,.2); background: rgba(15,118,110,.82);
-      color: white; font-size: 12px; font-weight: 750;
+    canvas { width: 100%; height: 144px; background: #10181d; border-radius: 6px; display: block; }
+    .device-wrap {
+      height: 230px; display: grid; place-items: center; perspective: 820px;
+      background: #eef3f5; border-radius: 6px; overflow: hidden;
     }
-    .front { transform: translateZ(39px); } .back { transform: rotateY(180deg) translateZ(39px); }
-    .right { transform: rotateY(90deg) translateZ(39px); } .left { transform: rotateY(-90deg) translateZ(39px); }
-    .top { transform: rotateX(90deg) translateZ(39px); } .bottom { transform: rotateX(-90deg) translateZ(39px); }
-    canvas { width: 100%; height: 110px; background: #10181d; border-radius: 6px; }
+    .cuboid {
+      --w: 150px; --d: 66px;
+      width: var(--w); height: var(--w); position: relative; transform-style: preserve-3d;
+      transform: rotateX(0deg) rotateY(0deg) rotateZ(0deg);
+      transition: none;
+      will-change: transform;
+    }
+    .face {
+      position: absolute; display: grid; place-items: center;
+      border: 1px solid rgba(0,0,0,.24); background: #243039; color: white;
+      font-size: 13px; font-weight: 800; letter-spacing: 0;
+      backface-visibility: hidden;
+    }
+    .front, .back { width: var(--w); height: var(--w); border-radius: 10px; }
+    .front { transform: translateZ(calc(var(--d) / 2)); background: #151d22; }
+    .back { transform: rotateY(180deg) translateZ(calc(var(--d) / 2)); background: #6c7a82; }
+    .right, .left {
+      width: var(--d); height: var(--w); top: 0; left: calc((var(--w) - var(--d)) / 2);
+      background: #2d3a42;
+    }
+    .right { transform: rotateY(90deg) translateZ(calc(var(--w) / 2)); }
+    .left { transform: rotateY(-90deg) translateZ(calc(var(--w) / 2)); }
+    .top, .bottom {
+      width: var(--w); height: var(--d); left: 0; top: calc((var(--w) - var(--d)) / 2);
+      background: #33414a;
+    }
+    .top { transform: rotateX(90deg) translateZ(calc(var(--w) / 2)); }
+    .bottom { transform: rotateX(-90deg) translateZ(calc(var(--w) / 2)); }
+    .front::before {
+      content: ""; width: 30px; height: 30px; border-radius: 50%; position: absolute; top: 24px; left: 24px;
+      background: radial-gradient(circle at 35% 35%, #bde7ff 0 10%, #17313e 28%, #05080a 62%, #39464e 100%);
+      border: 3px solid #11181d; box-shadow: 0 0 0 2px #55656e;
+    }
     .log { min-height: 24px; color: var(--muted); font-size: 13px; }
     .list { display: grid; gap: 6px; max-height: 150px; overflow: auto; }
     .list div { padding: 7px 8px; border: 1px solid #e7ecef; border-radius: 6px; background: #fbfcfc; font-size: 13px; }
     @media (min-width: 820px) {
-      main { grid-template-columns: 1.2fr .8fr; }
-      section.wide { grid-column: 1 / -1; }
+      main { grid-template-columns: 1.15fr .85fr; }
       .split { grid-template-columns: 1fr 1fr; }
     }
   </style>
@@ -89,6 +133,27 @@
   </header>
 
   <main>
+    <section class="wide" id="noticeSection" hidden>
+      <div class="banner" id="noticeBanner"><span class="status-dot"></span><span id="noticeText"></span></div>
+    </section>
+
+    <section class="wide" id="provisionSection" hidden>
+      <div class="section-head">
+        <h2>Wi-Fi 配网</h2>
+        <button id="scanBtn" class="secondary">扫描 Wi-Fi</button>
+      </div>
+      <div class="banner warn" id="provisionHint"><span class="status-dot warn"></span><span>设备还没有可用的联网配置，请先扫描并连接 Wi-Fi。</span></div>
+      <div class="ap-list" id="apList"><div class="log">等待扫描</div></div>
+      <div class="grid" style="margin-top:10px" id="passwordPanel" hidden>
+        <label>已选择网络<input id="provSsid" readonly></label>
+        <label>Wi-Fi 密码<input id="provPassword" type="password" autocomplete="off"></label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="provisionBtn" disabled>保存并连接</button>
+        <span class="log" id="provisionLog"></span>
+      </div>
+    </section>
+
     <section class="wide">
       <div class="section-head">
         <h2>摄像头</h2>
@@ -100,17 +165,18 @@
       <div class="split">
         <div>
           <div class="preview-box">
-            <img id="preview" alt="实时画面">
-            <div id="previewEmpty" class="placeholder" hidden>预览已暂停</div>
+            <img id="preview" alt="实时画面" hidden>
+            <div id="previewEmpty" class="placeholder">预览未启动</div>
           </div>
           <div class="log" id="previewState">预览连接中</div>
         </div>
         <div class="grid">
-          <label>录制/预览分辨率
+          <label>采集分辨率
             <select id="frameSize">
               <option value="10">VGA 640x480</option>
               <option value="11">SVGA 800x600</option>
               <option value="13">HD 1280x720</option>
+              <option value="15">UXGA 1600x1200</option>
               <option value="16">FHD 1920x1080</option>
             </select>
           </label>
@@ -122,31 +188,87 @@
               <option value="25">省空间</option>
             </select>
           </label>
+          <label>预览帧率
+            <select id="previewFps">
+              <option value="5">5 fps</option>
+              <option value="10">10 fps</option>
+              <option value="12">12 fps</option>
+              <option value="15">15 fps</option>
+              <option value="20">20 fps</option>
+              <option value="24">24 fps</option>
+              <option value="30">30 fps</option>
+            </select>
+          </label>
+          <label>录制帧率
+            <select id="recordFps">
+              <option value="5">5 fps</option>
+              <option value="10">10 fps</option>
+              <option value="12">12 fps</option>
+              <option value="15">15 fps</option>
+              <option value="20">20 fps</option>
+              <option value="24">24 fps</option>
+              <option value="30">30 fps</option>
+            </select>
+          </label>
           <div class="metric"><div class="label">相机状态</div><div class="value" id="cameraState">--</div></div>
-          <div class="metric"><div class="label">实时帧率</div><div class="value" id="cameraFps">--</div></div>
+          <div class="metric"><div class="label">实际帧率</div><div class="value" id="cameraFps">--</div></div>
         </div>
       </div>
     </section>
 
     <section>
-      <div class="section-head"><h2>动作</h2><span class="label" id="imuState">--</span></div>
-      <div class="cube-wrap"><div class="cube" id="cube">
-        <div class="face front">前</div><div class="face back">后</div><div class="face right">右</div>
-        <div class="face left">左</div><div class="face top">上</div><div class="face bottom">下</div>
-      </div></div>
+      <div class="section-head"><h2>音频</h2><button id="saveAudioBtn" class="ghost">保存音频设置</button></div>
+      <canvas id="audio" width="640" height="144"></canvas>
       <div class="grid" style="margin-top:8px">
-        <div class="metric"><div class="label">姿态</div><div class="value" id="poseValue">--</div></div>
-        <div class="metric"><div class="label">加速度原始值</div><div class="value" id="accelValue">--</div></div>
-        <div class="metric"><div class="label">陀螺仪原始值</div><div class="value" id="gyroValue">--</div></div>
+        <label>音频采样率
+          <select id="audioRate">
+            <option value="8000">8 kHz</option>
+            <option value="16000">16 kHz</option>
+            <option value="24000">24 kHz</option>
+            <option value="32000">32 kHz</option>
+          </select>
+        </label>
+        <div class="metric"><div class="label">麦克风状态</div><div class="value" id="audioState">--</div></div>
+        <div class="metric"><div class="label">RMS</div><div class="value" id="audioRms">--</div></div>
+        <div class="metric"><div class="label">峰值</div><div class="value" id="audioPeak">--</div></div>
       </div>
     </section>
 
     <section>
-      <div class="section-head"><h2>音频</h2><span class="label" id="audioState">--</span></div>
-      <canvas id="audio" width="640" height="120"></canvas>
+      <div class="section-head"><h2>运动</h2><button id="saveMotionBtn" class="ghost">保存运动设置</button></div>
+      <div class="device-wrap">
+        <div class="cuboid" id="deviceModel">
+          <div class="face front">前</div>
+          <div class="face back">后</div>
+          <div class="face right">右</div>
+          <div class="face left">左</div>
+          <div class="face top">上</div>
+          <div class="face bottom">下</div>
+        </div>
+      </div>
       <div class="grid" style="margin-top:8px">
-        <div class="metric"><div class="label">RMS</div><div class="value" id="audioRms">--</div></div>
-        <div class="metric"><div class="label">峰值</div><div class="value" id="audioPeak">--</div></div>
+        <label>IMU 安装方向
+          <select id="imuOrientation">
+            <option value="0">实拍方向：X右 Y上 Z前</option>
+            <option value="1">水平顺时针 90 度</option>
+            <option value="2">水平逆时针 90 度</option>
+            <option value="3">水平旋转 180 度</option>
+            <option value="4">X 轴反向</option>
+            <option value="5">Y 轴反向</option>
+          </select>
+        </label>
+        <label>IMU 采样率
+          <select id="imuRate">
+            <option value="52">52 Hz</option>
+            <option value="104">104 Hz</option>
+            <option value="208">208 Hz</option>
+            <option value="416">416 Hz</option>
+          </select>
+        </label>
+        <div class="metric"><div class="label">IMU 状态</div><div class="value" id="imuState">--</div></div>
+        <div class="metric"><div class="label">姿态</div><div class="value" id="poseValue">--</div></div>
+        <div class="metric"><div class="label">加速度原始值</div><div class="value" id="accelValue">--</div></div>
+        <div class="metric"><div class="label">陀螺仪原始值</div><div class="value" id="gyroValue">--</div></div>
       </div>
     </section>
 
@@ -163,27 +285,40 @@
       <div class="list" id="fileList"><div>正在读取</div></div>
     </section>
 
-    <section>
-      <div class="section-head"><h2>系统与连接</h2><button id="wifiScanBtn" class="ghost">扫描 Wi-Fi</button></div>
+    <section id="wifiInfoSection">
+      <div class="section-head"><h2>Wi-Fi 状态</h2><button id="reconfigBtn" class="ghost">重新配网</button></div>
       <div class="grid">
-        <div class="metric"><div class="label">电量</div><div class="value" id="batteryState">--</div></div>
-        <div class="metric"><div class="label">RTC</div><div class="value" id="rtcState">--</div></div>
-        <div class="metric"><div class="label">热点</div><div class="value" id="wifiState">--</div></div>
+        <div class="metric"><div class="label">连接状态</div><div class="value" id="wifiConnState">--</div></div>
+        <label>保存的 Wi-Fi 名称<input id="savedSsid" readonly></label>
+        <label>保存的 Wi-Fi 密码<input id="savedPassword" readonly></label>
       </div>
-      <div class="grid" style="margin-top:10px">
-        <label>Wi-Fi 名称<input id="ssid" autocomplete="off"></label>
-        <label>Wi-Fi 密码<input id="password" type="password" autocomplete="off"></label>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>时间同步</h2><button id="syncTimeBtn" class="ghost">立即对时</button></div>
+      <div class="grid">
+        <label>时区
+          <select id="timezone">
+            <option value="CST-8">UTC+8 中国标准时间</option>
+            <option value="UTC0">UTC+0</option>
+            <option value="JST-9">UTC+9</option>
+            <option value="EST5">UTC-5</option>
+            <option value="PST8">UTC-8</option>
+          </select>
+        </label>
+        <label>NTP 服务器<input id="ntpServer" autocomplete="off"></label>
+        <div class="metric"><div class="label">RTC</div><div class="value" id="rtcState">--</div></div>
+        <div class="metric"><div class="label">NTP 状态</div><div class="value" id="ntpState">--</div></div>
       </div>
       <div class="row" style="margin-top:10px">
-        <button id="wifiBtn" class="secondary">连接 Wi-Fi</button>
-        <span class="log" id="wifiLog"></span>
+        <button id="saveTimeBtn" class="secondary">保存时间设置</button>
+        <span class="log" id="timeLog"></span>
       </div>
-      <div class="list" id="wifiList" style="margin-top:8px" hidden></div>
     </section>
 
     <section class="wide">
       <div class="section-head">
-        <h2>自动化与采集配置</h2>
+        <h2>自动化与系统</h2>
         <button id="saveBtn" class="secondary">保存全部配置</button>
       </div>
       <div class="grid">
@@ -196,22 +331,6 @@
             <option value="1800">30 分钟</option>
           </select>
         </label>
-        <label>音频采样率
-          <select id="audioRate">
-            <option value="8000">8 kHz</option>
-            <option value="16000">16 kHz</option>
-            <option value="24000">24 kHz</option>
-            <option value="32000">32 kHz</option>
-          </select>
-        </label>
-        <label>IMU 采样率
-          <select id="imuRate">
-            <option value="26">26 Hz</option>
-            <option value="52">52 Hz</option>
-            <option value="104">104 Hz</option>
-            <option value="208">208 Hz</option>
-          </select>
-        </label>
         <label>低电量阈值
           <select id="lowBatt">
             <option value="10">10%</option>
@@ -220,6 +339,8 @@
             <option value="30">30%</option>
           </select>
         </label>
+        <div class="metric"><div class="label">电量</div><div class="value" id="batteryState">--</div></div>
+        <div class="metric"><div class="label">热点</div><div class="value" id="wifiState">--</div></div>
       </div>
       <div class="row" style="margin-top:10px">
         <label class="switch"><input id="autoRec" type="checkbox">自动记录</label>
@@ -233,43 +354,88 @@
     const $ = id => document.getElementById(id);
     const deviceHost = location.hostname || "192.168.4.1";
     const streamUrl = `${location.protocol}//${deviceHost}:81/stream.mjpg`;
-    const cube = $("cube");
+    const deviceModel = $("deviceModel");
     const canvas = $("audio");
     const ctx = canvas.getContext("2d");
-    const wave = Array(96).fill(0);
     let previewActive = true;
-    let lastStatus = null;
     let ws = null;
+    let currentConfig = null;
+    let currentStatus = null;
+    let selectedAp = "";
+    let forceProvision = false;
+    const audioHistory = Array(180).fill(0);
 
     function errText(v) { return !v || v === "ESP_OK" ? "正常" : v; }
     function fixed(v, n) { return Number.isFinite(v) ? v.toFixed(n) : "--"; }
     function setSelect(id, value) {
       const el = $(id);
-      if ([...el.options].some(o => o.value == value)) el.value = String(value);
+      if (value === undefined || value === null) return;
+      if (![...el.options].some(o => o.value == value)) el.add(new Option(String(value), String(value)));
+      el.value = String(value);
     }
-    function setTop(text, ok) {
-      $("topState").innerHTML = `<span class="status-dot ${ok ? "ok" : "warn"}"></span>${text}`;
+    function setDot(text, ok, bad = false) {
+      return `<span class="status-dot ${bad ? "bad" : (ok ? "ok" : "warn")}"></span>${text}`;
     }
-    function drawAudio(value) {
-      const v = Math.max(0, Math.min(1, value || 0));
-      wave.push(v); wave.shift();
+    function setTop(text, ok, bad = false) {
+      $("topState").innerHTML = setDot(text, ok, bad);
+    }
+    function showNotice(text, kind = "ok") {
+      $("noticeSection").hidden = !text;
+      $("noticeText").textContent = text || "";
+      $("noticeBanner").className = `banner ${kind === "bad" ? "bad" : (kind === "warn" ? "warn" : "")}`;
+    }
+    function drawAudioWave(samples) {
+      const data = Array.isArray(samples) && samples.length ? samples : [0];
+      let level = 0;
+      for (const v of data) {
+        level = Math.max(level, Math.abs(Number(v) || 0) / 127);
+      }
+      level = Math.max(0, Math.min(1, level));
+      audioHistory.push(level);
+      while (audioHistory.length > 180) audioHistory.shift();
+
       ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const mid = canvas.height / 2;
       ctx.strokeStyle = "#26333a"; ctx.lineWidth = 1;
       for (let i = 1; i < 4; i++) {
         const y = i * canvas.height / 4;
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
       }
-      ctx.strokeStyle = "#5eead4"; ctx.lineWidth = 3; ctx.beginPath();
-      wave.forEach((p, i) => {
-        const x = i * canvas.width / (wave.length - 1);
-        const y = canvas.height - 10 - p * (canvas.height - 20);
-        i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      ctx.strokeStyle = "#3b4a52";
+      ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(canvas.width, mid); ctx.stroke();
+
+      const barGap = 1;
+      const barW = Math.max(2, canvas.width / audioHistory.length - barGap);
+      ctx.fillStyle = "#5eead4";
+      audioHistory.forEach((v, i) => {
+        const h = Math.max(2, v * (canvas.height - 20));
+        const x = i * (canvas.width / audioHistory.length);
+        ctx.fillRect(x, mid - h / 2, barW, h);
       });
-      ctx.stroke();
-      if (Math.max(...wave) < 0.002) {
+      if (Math.max(...audioHistory) < 0.03) {
         ctx.fillStyle = "#91a0a8"; ctx.font = "18px system-ui";
         ctx.fillText("等待音频输入", 22, 34);
       }
+    }
+    function quaternionToCssMatrix(q0, q1, q2, q3) {
+      let w = Number(q0), x = Number(q1), y = Number(q2), z = Number(q3);
+      if (![w, x, y, z].every(Number.isFinite)) return "matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1)";
+      const norm = Math.hypot(w, x, y, z) || 1;
+      w /= norm; x /= norm; y /= norm; z /= norm;
+      const xx = x * x, yy = y * y, zz = z * z;
+      const xy = x * y, xz = x * z, yz = y * z;
+      const wx = w * x, wy = w * y, wz = w * z;
+      let r00 = 1 - 2 * (yy + zz);
+      let r01 = 2 * (xy - wz);
+      let r02 = 2 * (xz + wy);
+      let r10 = 2 * (xy + wz);
+      let r11 = 1 - 2 * (xx + zz);
+      let r12 = 2 * (yz - wx);
+      let r20 = 2 * (xz - wy);
+      let r21 = 2 * (yz + wx);
+      let r22 = 1 - 2 * (xx + yy);
+      r01 = -r01; r10 = -r10; r12 = -r12; r21 = -r21;
+      return `matrix3d(${r00},${r10},${r20},0,${r01},${r11},${r21},0,${r02},${r12},${r22},0,0,0,0,1)`;
     }
     function startPreview() {
       previewActive = true;
@@ -278,6 +444,8 @@
       $("preview").src = `${streamUrl}?t=${Date.now()}`;
       $("previewBtn").textContent = "暂停预览";
       $("previewState").textContent = "预览连接中";
+      $("audioState").textContent = "摄像头预览开启，音频波形临时停用";
+      $("imuState").textContent = "摄像头预览开启，运动预览临时停用";
     }
     function stopPreview() {
       previewActive = false;
@@ -287,47 +455,100 @@
       $("previewBtn").textContent = "开始预览";
       $("previewState").textContent = "预览已暂停";
     }
+    function cameraFpsText(value) {
+      const fps = Number(value);
+      return fps > 0 && fps <= 60 ? `${fps.toFixed(1)} fps` : "--";
+    }
+    function updateProvisionUi() {
+      const c = currentConfig;
+      const s = currentStatus;
+      const configured = !!(c && c.wifi_configured);
+      const connected = !!(s && s.wifi && s.wifi.sta);
+      const timeOk = !!(s && s.wifi && s.wifi.time_synced);
+      const healthy = configured && connected && timeOk;
+      const needProvision = !configured || forceProvision || (configured && s && !healthy);
+      $("provisionSection").hidden = !needProvision;
+      $("wifiInfoSection").hidden = !configured && !forceProvision;
+      $("savedSsid").value = c ? (c.wifi_ssid || "") : "";
+      $("savedPassword").value = c ? (c.wifi_password || "") : "";
+      $("wifiConnState").textContent = connected ? (timeOk ? "已联网并完成对时" : "已联网，对时失败") : "未连接";
+      if (!configured) {
+        $("provisionHint").className = "banner warn";
+        $("provisionHint").lastElementChild.textContent = "设备还没有保存 Wi-Fi，请先完成配网。";
+      } else if (!healthy) {
+        $("provisionHint").className = "banner bad";
+        $("provisionHint").lastElementChild.textContent = connected ? "Wi-Fi 已连接但对时失败，请重新配网或检查 NTP 设置。" : "保存的 Wi-Fi 连接失败，请重新配网。";
+      } else {
+        $("provisionHint").className = "banner";
+        $("provisionHint").lastElementChild.textContent = "Wi-Fi 已连接，对时成功。";
+      }
+      if (healthy && !forceProvision) {
+        showNotice("Wi-Fi 已连接并完成对时。", "ok");
+      } else if (configured && s && !healthy) {
+        showNotice("Wi-Fi 或 NTP 对时失败，需要重新配网。", "bad");
+      }
+    }
     function applyStatus(s) {
-      lastStatus = s;
+      currentStatus = s;
       setTop(s.recording ? "正在录制" : "设备在线", true);
       $("cameraState").textContent = `${s.camera.initialized ? "已初始化" : "未初始化"} / ${errText(s.camera.err)}`;
-      $("cameraFps").textContent = `${fixed(s.camera.fps, 1)} fps`;
+      $("cameraFps").textContent = cameraFpsText(s.camera.fps);
       $("recordState").textContent = s.recording ? "正在录制 5 秒" : errText(s.last_record_error);
       $("storageState").textContent = s.storage.mounted ? `${fixed(s.storage.free / 1048576, 0)} MB 可用` : `未挂载 / ${errText(s.storage.err)}`;
       $("batteryState").textContent = `${fixed(s.battery.soc, 1)}% / ${fixed(s.battery.voltage, 2)} V`;
       $("rtcState").textContent = s.rtc.valid ? s.rtc.iso : `无效 / ${errText(s.rtc.err)}`;
       $("wifiState").textContent = s.wifi.ap ? `${s.wifi.ap_ssid} / ${s.wifi.clients} 台` : (s.wifi.sta ? s.wifi.ip : "关闭");
+      $("ntpState").textContent = s.wifi.time_synced ? "已完成" : errText(s.wifi.err);
       $("imuState").textContent = s.imu.present ? errText(s.imu.err) : `未检测 / ${errText(s.imu.err)}`;
-      $("poseValue").textContent = `俯仰 ${fixed(s.imu.pitch, 1)} / 横滚 ${fixed(s.imu.roll, 1)}`;
+      $("poseValue").textContent = `X ${fixed(s.imu.roll, 1)} / Y ${fixed(s.imu.pitch, 1)} / Z ${fixed(s.imu.yaw, 1)}`;
       $("accelValue").textContent = `${s.imu.ax}, ${s.imu.ay}, ${s.imu.az}`;
       $("gyroValue").textContent = `${s.imu.gx}, ${s.imu.gy}, ${s.imu.gz}`;
-      cube.style.transform = `rotateX(${s.imu.pitch || 0}deg) rotateY(${s.imu.roll || 0}deg) rotateZ(${s.imu.yaw || 0}deg)`;
+      if (!previewActive) {
+        deviceModel.style.transform = quaternionToCssMatrix(s.imu.q0, s.imu.q1, s.imu.q2, s.imu.q3);
+      }
       $("audioState").textContent = s.audio.initialized ? `${s.audio.rate} Hz / ${errText(s.audio.err)}` : `未初始化 / ${errText(s.audio.err)}`;
       $("audioRms").textContent = fixed(s.audio.rms, 4);
       $("audioPeak").textContent = fixed(s.audio.peak, 4);
-      drawAudio(Math.max(s.audio.peak || 0, s.audio.rms || 0));
+      if (!previewActive) {
+        drawAudioWave(s.audio.wave || []);
+      } else {
+        $("audioState").textContent = "摄像头预览开启，音频波形临时停用";
+        $("imuState").textContent = "摄像头预览开启，运动预览临时停用";
+      }
       if (s.camera.streaming && previewActive) $("previewState").textContent = "预览运行中";
+      updateProvisionUi();
     }
     async function loadConfig() {
       const c = await fetch("/api/config").then(r => r.json());
+      currentConfig = c;
       setSelect("wake", c.wake_interval_sec);
       setSelect("frameSize", c.camera_framesize);
       setSelect("quality", c.camera_jpeg_quality);
+      setSelect("previewFps", c.camera_preview_fps);
+      setSelect("recordFps", c.camera_record_fps);
       setSelect("audioRate", c.audio_sample_rate_hz);
       setSelect("imuRate", c.imu_sample_rate_hz);
+      setSelect("imuOrientation", c.imu_orientation);
       setSelect("lowBatt", c.low_battery_percent);
-      $("ssid").value = c.wifi_ssid || "";
+      setSelect("timezone", c.timezone || "CST-8");
+      $("ntpServer").value = c.ntp_server || "ntp1.aliyun.com";
       $("autoRec").checked = c.auto_record_enabled;
       $("shake").checked = c.shake_trigger_enabled;
+      updateProvisionUi();
     }
     function configBody() {
       return {
         wake_interval_sec: +$("wake").value,
         camera_framesize: +$("frameSize").value,
         camera_jpeg_quality: +$("quality").value,
+        camera_preview_fps: +$("previewFps").value,
+        camera_record_fps: +$("recordFps").value,
         audio_sample_rate_hz: +$("audioRate").value,
         imu_sample_rate_hz: +$("imuRate").value,
+        imu_orientation: +$("imuOrientation").value,
         low_battery_percent: +$("lowBatt").value,
+        ntp_server: $("ntpServer").value.trim() || "ntp1.aliyun.com",
+        timezone: $("timezone").value || "CST-8",
         auto_record_enabled: $("autoRec").checked,
         shake_trigger_enabled: $("shake").checked
       };
@@ -338,10 +559,11 @@
       $(messageTarget).textContent = r.ok ? "已保存" : "保存失败";
       await loadConfig();
       await poll();
+      return r.ok;
     }
     async function poll() {
       try { applyStatus(await fetch("/api/status").then(r => r.json())); }
-      catch(e) { setTop("状态读取失败", false); }
+      catch(e) { setTop("状态读取失败", false, true); }
     }
     async function loadFiles() {
       try {
@@ -364,20 +586,65 @@
       setTimeout(() => { $("recordBtn").disabled = false; $("recordBtn2").disabled = false; }, 1200);
       setTimeout(async () => { await poll(); await loadFiles(); if (wasPreviewing) startPreview(); }, 7200);
     }
+    function renderAps(aps) {
+      $("apList").innerHTML = (aps || []).map(ap => {
+        const name = ap.ssid || "(隐藏网络)";
+        const selected = selectedAp === ap.ssid ? " selected" : "";
+        return `<button class="ap-item${selected}" data-ssid="${name.replaceAll('"', '&quot;')}"><span>${name}<small>${ap.rssi} dBm / 加密 ${ap.auth}</small></span><span>选择</span></button>`;
+      }).join("") || "<div class=\"log\">未发现 Wi-Fi</div>";
+      [...$("apList").querySelectorAll("button")].forEach(btn => {
+        btn.onclick = () => {
+          selectedAp = btn.dataset.ssid || "";
+          $("provSsid").value = selectedAp;
+          $("passwordPanel").hidden = false;
+          $("provisionBtn").disabled = false;
+          renderAps(aps);
+        };
+      });
+    }
     async function scanWifi() {
-      $("wifiLog").textContent = "正在扫描";
+      $("provisionLog").textContent = "正在扫描";
+      $("apList").innerHTML = "<div class=\"log\">正在扫描周围 Wi-Fi</div>";
       try {
         const data = await fetch("/api/wifi/scan").then(r => r.json());
-        $("wifiList").hidden = false;
-        $("wifiList").innerHTML = (data.aps || []).map(ap => `<div>${ap.ssid || "(隐藏网络)"} / ${ap.rssi} dBm</div>`).join("") || "<div>未发现 Wi-Fi</div>";
-        $("wifiLog").textContent = data.ok ? "扫描完成" : "扫描失败";
-      } catch(e) { $("wifiLog").textContent = "扫描失败"; }
+        renderAps(data.aps || []);
+        $("provisionLog").textContent = data.ok ? "扫描完成" : "扫描失败";
+      } catch(e) { $("provisionLog").textContent = "扫描失败"; }
+    }
+    async function provisionWifi() {
+      if (!selectedAp) return;
+      $("provisionBtn").disabled = true;
+      $("provisionLog").textContent = "正在连接并对时";
+      const body = {ssid:selectedAp, password:$("provPassword").value};
+      const r = await fetch("/api/wifi/connect", {method:"POST", body: JSON.stringify(body)})
+        .then(r => r.json()).catch(() => ({ok:false, connected:false, time_synced:false, error:"请求失败"}));
+      await loadConfig();
+      await poll();
+      if (r.ok && r.connected && r.time_synced) {
+        forceProvision = false;
+        $("provisionLog").textContent = "连接成功，对时成功";
+        showNotice("Wi-Fi 连接成功，对时成功。", "ok");
+      } else {
+        forceProvision = true;
+        $("provisionBtn").disabled = false;
+        $("provisionLog").textContent = `失败：${r.error || "未知错误"}`;
+        showNotice("Wi-Fi 连接或 NTP 对时失败，请重新配网。", "bad");
+      }
+      updateProvisionUi();
+    }
+    async function syncTimeNow() {
+      $("timeLog").textContent = "正在保存并对时";
+      const saved = await saveConfig("timeLog");
+      if (!saved) return;
+      const r = await fetch("/api/time/sync", {method:"POST"}).then(r => r.json()).catch(() => ({ok:false, error:"请求失败"}));
+      $("timeLog").textContent = r.ok ? "对时成功" : `对时失败：${r.error || "未知错误"}`;
+      await poll();
     }
     function connectWs() {
       try {
         ws = new WebSocket(`ws://${location.host}/ws/telemetry`);
         ws.onmessage = e => applyStatus(JSON.parse(e.data));
-        ws.onclose = () => setTimeout(connectWs, 1500);
+        ws.onclose = () => setTimeout(connectWs, 1200);
       } catch(e) { setInterval(poll, 1500); }
     }
     $("previewBtn").onclick = () => previewActive ? stopPreview() : startPreview();
@@ -385,19 +652,18 @@
     $("recordBtn2").onclick = startRecord;
     $("saveBtn").onclick = () => saveConfig("configLog");
     $("saveCameraBtn").onclick = async () => { await saveConfig("previewState"); stopPreview(); setTimeout(startPreview, 500); };
-    $("wifiBtn").onclick = async () => {
-      $("wifiLog").textContent = "正在连接";
-      const body = {ssid:$("ssid").value, password:$("password").value};
-      const r = await fetch("/api/wifi/connect", {method:"POST", body: JSON.stringify(body)}).then(r => r.json()).catch(() => ({ok:false}));
-      $("wifiLog").textContent = r.ok ? "连接成功" : "连接失败";
-      poll();
-    };
-    $("wifiScanBtn").onclick = scanWifi;
+    $("saveAudioBtn").onclick = () => saveConfig("configLog");
+    $("saveMotionBtn").onclick = () => saveConfig("configLog");
+    $("saveTimeBtn").onclick = () => saveConfig("timeLog");
+    $("syncTimeBtn").onclick = syncTimeNow;
+    $("scanBtn").onclick = scanWifi;
+    $("provisionBtn").onclick = provisionWifi;
+    $("reconfigBtn").onclick = () => { forceProvision = true; showNotice(""); updateProvisionUi(); };
     $("preview").onload = () => $("previewState").textContent = "预览运行中";
     $("preview").onerror = () => { if (previewActive) $("previewState").textContent = "预览连接失败"; };
 
-    loadConfig(); poll(); loadFiles(); connectWs(); startPreview();
-    setInterval(poll, 3000);
+    loadConfig(); poll(); loadFiles(); connectWs(); stopPreview();
+    setInterval(poll, 1500);
     setInterval(loadFiles, 12000);
   </script>
 </body>

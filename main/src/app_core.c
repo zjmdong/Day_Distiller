@@ -1,6 +1,8 @@
 #include "day_app.h"
 
+#include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 #include "app_config.h"
 #include "audio_service.h"
@@ -17,6 +19,7 @@
 #include "wifi_portal.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -24,6 +27,22 @@
 static const char *TAG = "day_app";
 
 static day_config_t s_config;
+static day_battery_status_t s_cached_battery;
+static day_rtc_status_t s_cached_rtc;
+static day_storage_status_t s_cached_storage;
+static int64_t s_battery_status_us;
+static int64_t s_rtc_status_us;
+static int64_t s_storage_status_us;
+
+static void apply_runtime_config(const day_config_t *config)
+{
+    if (!config) {
+        return;
+    }
+    setenv("TZ", config->timezone[0] ? config->timezone : "CST-8", 1);
+    tzset();
+    day_imu_set_orientation(config->imu_orientation);
+}
 
 static esp_err_t init_nvs(void)
 {
@@ -41,27 +60,42 @@ static esp_err_t collect_status(day_device_status_t *status)
         return ESP_ERR_INVALID_ARG;
     }
     memset(status, 0, sizeof(*status));
+    int64_t now_us = esp_timer_get_time();
     status->config = s_config;
     status->recording_active = day_recorder_is_active();
-    day_battery_read(&status->battery);
-    day_rtc_read(&status->rtc);
-    day_imu_sample_t sample;
-    if (day_imu_read(&sample) == ESP_OK) {
-        (void)sample;
+    if (now_us - s_battery_status_us > 1500000LL || s_battery_status_us == 0) {
+        day_battery_read(&s_cached_battery);
+        s_battery_status_us = now_us;
     }
-    if (!status->recording_active) {
-        int16_t audio_samples[128];
+    if (now_us - s_rtc_status_us > 1000000LL || s_rtc_status_us == 0) {
+        day_rtc_read(&s_cached_rtc);
+        s_rtc_status_us = now_us;
+    }
+    if (now_us - s_storage_status_us > 2500000LL || s_storage_status_us == 0) {
+        s_cached_storage = day_storage_get_status();
+        s_storage_status_us = now_us;
+    }
+    status->battery = s_cached_battery;
+    status->rtc = s_cached_rtc;
+    status->storage = s_cached_storage;
+    status->camera = day_camera_get_status();
+
+    bool fast_sensors_enabled = !status->recording_active && !status->camera.streaming;
+    if (fast_sensors_enabled) {
+        day_imu_sample_t sample;
+        if (day_imu_read(&sample) == ESP_OK) {
+            (void)sample;
+        }
+        int16_t audio_samples[64];
         size_t got = 0;
         if (day_audio_start(s_config.audio_sample_rate_hz) == ESP_OK) {
-            esp_err_t ret = day_audio_read_pcm16(audio_samples, 128, &got, 20);
+            esp_err_t ret = day_audio_read_pcm16(audio_samples, 64, &got, 8);
             if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) {
                 ESP_LOGD(TAG, "audio status sample failed: %s", esp_err_to_name(ret));
             }
         }
     }
     status->imu = day_imu_get_status();
-    status->storage = day_storage_get_status();
-    status->camera = day_camera_get_status();
     status->audio = day_audio_get_status();
     status->wifi = day_wifi_get_status();
     status->last_record_error = day_recorder_get_last_error();
@@ -73,7 +107,26 @@ static esp_err_t save_config_cb(const day_config_t *config)
     if (!config) {
         return ESP_ERR_INVALID_ARG;
     }
-    s_config = *config;
+    day_config_t next = *config;
+    day_config_normalize(&next);
+    bool camera_changed = next.camera_framesize != s_config.camera_framesize ||
+                          next.camera_jpeg_quality != s_config.camera_jpeg_quality;
+    bool audio_changed = next.audio_sample_rate_hz != s_config.audio_sample_rate_hz;
+    bool imu_changed = next.imu_sample_rate_hz != s_config.imu_sample_rate_hz ||
+                       next.imu_orientation != s_config.imu_orientation;
+    s_config = next;
+    apply_runtime_config(&s_config);
+    if (!day_recorder_is_active()) {
+        if (camera_changed) {
+            day_camera_deinit();
+        }
+        if (audio_changed) {
+            day_audio_deinit();
+        }
+        if (imu_changed) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(day_imu_init(s_config.imu_sample_rate_hz));
+        }
+    }
     return day_config_save(&s_config);
 }
 
@@ -92,6 +145,20 @@ static void sync_rtc_from_system_if_valid(void)
     time(&now);
     if (now > 1609459200) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_rtc_write_time(now));
+    }
+}
+
+static void sync_system_from_rtc_if_valid(void)
+{
+    day_rtc_status_t rtc;
+    if (day_rtc_read(&rtc) == ESP_OK && rtc.valid && rtc.unix_time > 1609459200) {
+        struct timeval tv = {
+            .tv_sec = rtc.unix_time,
+            .tv_usec = 0,
+        };
+        if (settimeofday(&tv, NULL) == 0) {
+            ESP_LOGI(TAG, "system time restored from RTC: %s", rtc.iso8601);
+        }
     }
 }
 
@@ -115,6 +182,7 @@ void day_app_run(void)
 {
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(day_config_load(&s_config));
+    apply_runtime_config(&s_config);
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_board_init());
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_init());
     day_led_task_start();
@@ -136,6 +204,7 @@ void day_app_run(void)
             sync_rtc_from_system_if_valid();
         } else {
             ESP_LOGW(TAG, "network time sync skipped/failed: %s", esp_err_to_name(sync_ret));
+            sync_system_from_rtc_if_valid();
         }
 
         day_web_callbacks_t web = {
@@ -150,8 +219,7 @@ void day_app_run(void)
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_web_stop());
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_stop_portal());
     } else {
-        day_rtc_status_t rtc;
-        ESP_ERROR_CHECK_WITHOUT_ABORT(day_rtc_read(&rtc));
+        sync_system_from_rtc_if_valid();
     }
 
     if (low_battery_blocking_record()) {
