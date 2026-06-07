@@ -202,7 +202,7 @@ esp_err_t day_wifi_sync_time(const day_config_t *cfg)
 static void build_ap_ssid(char *out, size_t len)
 {
     uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     snprintf(out, len, "AI_CAM_%02X%02X", mac[4], mac[5]);
 }
 

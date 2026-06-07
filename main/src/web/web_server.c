@@ -2,7 +2,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <math.h>
 #include "audio_service.h"
 #include "camera_service.h"
@@ -528,7 +527,7 @@ static void add_ws_client(int fd)
     }
     s_ws_clients[0] = fd;
     s_ws_send_pending = false;
-    ESP_LOGI(TAG, "telemetry websocket client fd=%d", fd);
+    ESP_LOGD(TAG, "telemetry websocket client fd=%d", fd);
 }
 
 static void remove_ws_client(size_t index)
@@ -665,7 +664,7 @@ static void telemetry_task(void *arg)
                 }
             }
         }
-        uint32_t delay_ms = status->camera.streaming ? 250 : 5;
+        uint32_t delay_ms = status->camera.streaming ? 250 : 16;
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
     free(status);
@@ -697,6 +696,9 @@ esp_err_t day_web_start(const day_web_callbacks_t *callbacks)
         return ESP_ERR_INVALID_ARG;
     }
     s_cb = *callbacks;
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_ws", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_uri", ESP_LOG_ERROR);
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 16;
     config.max_open_sockets = 6;

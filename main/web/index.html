@@ -212,6 +212,7 @@
           </label>
           <div class="metric"><div class="label">相机状态</div><div class="value" id="cameraState">--</div></div>
           <div class="metric"><div class="label">实际帧率</div><div class="value" id="cameraFps">--</div></div>
+          <div class="metric"><div class="label">遥测帧率</div><div class="value" id="telemetryHz">等待连接</div></div>
         </div>
       </div>
     </section>
@@ -368,6 +369,7 @@
     let lastLiveTextMs = 0;
     let liveRxCount = 0;
     let liveHz = 0;
+    let lastLiveRxMs = 0;
     let liveHzWindowMs = performance.now();
     const audioHistory = Array(180).fill(0);
 
@@ -384,6 +386,10 @@
     }
     function setTop(text, ok, bad = false) {
       $("topState").innerHTML = setDot(text, ok, bad);
+    }
+    function setTelemetryText(text) {
+      $("telemetryHz").textContent = text;
+      if (!previewActive) $("previewState").textContent = text;
     }
     function showNotice(text, kind = "ok") {
       $("noticeSection").hidden = !text;
@@ -490,14 +496,13 @@
     function applyLive(s) {
       liveRxCount++;
       const now = performance.now();
+      lastLiveRxMs = now;
       if (now - liveHzWindowMs >= 1000) {
         liveHz = liveRxCount * 1000 / (now - liveHzWindowMs);
         liveRxCount = 0;
         liveHzWindowMs = now;
       }
-      if (!previewActive) {
-        $("previewState").textContent = liveHz > 0 ? `实时遥测 ${liveHz.toFixed(0)} Hz` : "实时遥测接收中";
-      }
+      setTelemetryText(liveHz > 0 ? `实时遥测 ${liveHz.toFixed(0)} Hz` : "实时遥测接收中");
       if (currentStatus) {
         currentStatus.recording = s.recording;
         if (s.camera) Object.assign(currentStatus.camera, s.camera);
@@ -522,7 +527,7 @@
       $("preview").hidden = true;
       $("previewEmpty").hidden = false;
       $("previewBtn").textContent = "开始预览";
-      $("previewState").textContent = "预览已暂停";
+      $("previewState").textContent = lastLiveRxMs ? $("telemetryHz").textContent : "预览已暂停";
     }
     function cameraFpsText(value) {
       const fps = Number(value);
@@ -713,14 +718,17 @@
       try {
         ws = new WebSocket(`ws://${location.host}/ws/telemetry`);
         ws.onopen = () => {
-          if (!previewActive) $("previewState").textContent = "实时遥测连接中";
+          setTelemetryText("实时遥测连接中");
           try { ws.send("hello"); } catch(e) {}
         };
         ws.onmessage = e => {
           const data = JSON.parse(e.data);
           data.live ? applyLive(data) : applyStatus(data);
         };
-        ws.onclose = () => setTimeout(connectWs, 1200);
+        ws.onclose = () => {
+          setTelemetryText("遥测重连中");
+          setTimeout(connectWs, 1200);
+        };
       } catch(e) { setInterval(poll, 5000); }
     }
     $("previewBtn").onclick = () => previewActive ? stopPreview() : startPreview();
@@ -739,6 +747,13 @@
     $("preview").onerror = () => { if (previewActive) $("previewState").textContent = "预览连接失败"; };
 
     loadConfig(); poll(); loadFiles(); connectWs(); stopPreview();
+    setInterval(() => {
+      if (lastLiveRxMs && performance.now() - lastLiveRxMs > 2500) {
+        liveHz = 0;
+        liveRxCount = 0;
+        setTelemetryText("遥测重连中");
+      }
+    }, 1000);
     setInterval(poll, 5000);
     setInterval(loadFiles, 12000);
   </script>

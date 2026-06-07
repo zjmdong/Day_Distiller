@@ -16,24 +16,24 @@ static i2s_chan_handle_t s_rx_chan;
 static uint32_t s_sample_rate;
 static bool s_rx_enabled;
 static float s_dc_estimate;
-static float s_preview_gain = 1.0f;
 static day_audio_status_t s_status = {
     .last_error = ESP_ERR_INVALID_STATE,
 };
 
-static void update_waveform_preview(const int16_t *samples, size_t count, float peak)
+static void update_waveform_preview(const int16_t *samples, size_t count, float rms, float peak)
 {
     if (!samples || count == 0) {
         s_status.waveform_len = 0;
         return;
     }
-    float target_gain = peak > 0.001f ? 0.85f / peak : 1.0f;
-    if (target_gain > 48.0f) {
-        target_gain = 48.0f;
-    } else if (target_gain < 1.0f) {
-        target_gain = 1.0f;
+    float noise_gate = 0.045f;
+    if (rms < 0.060f && peak > noise_gate) {
+        noise_gate = peak * 0.85f;
     }
-    s_preview_gain = s_preview_gain * 0.85f + target_gain * 0.15f;
+    if (noise_gate > 0.140f) {
+        noise_gate = 0.140f;
+    }
+    const float display_gain = 3.2f;
 
     s_status.waveform_len = DAY_AUDIO_WAVEFORM_SAMPLES;
     for (size_t i = 0; i < DAY_AUDIO_WAVEFORM_SAMPLES; ++i) {
@@ -55,7 +55,11 @@ static void update_waveform_preview(const int16_t *samples, size_t count, float 
                 peak_sample = samples[j];
             }
         }
-        float normalized = ((float)peak_abs / 32768.0f) * s_preview_gain;
+        float normalized = ((float)peak_abs / 32768.0f) - noise_gate;
+        if (normalized < 0.0f) {
+            normalized = 0.0f;
+        }
+        normalized *= display_gain;
         if (normalized > 1.0f) {
             normalized = 1.0f;
         }
@@ -158,7 +162,7 @@ esp_err_t day_audio_read_pcm16(int16_t *samples, size_t sample_count, size_t *ou
     if (count > 0) {
         s_status.rms = sqrtf(sum_sq / (float)count);
         s_status.peak = peak;
-        update_waveform_preview(samples, count, peak);
+        update_waveform_preview(samples, count, s_status.rms, peak);
     }
     s_status.last_error = ESP_OK;
     return ESP_OK;
@@ -188,7 +192,6 @@ void day_audio_deinit(void)
     s_sample_rate = 0;
     s_status.initialized = false;
     s_status.waveform_len = 0;
-    s_preview_gain = 1.0f;
 }
 
 day_audio_status_t day_audio_get_status(void)
