@@ -366,6 +366,9 @@
     let latestLive = null;
     let liveFramePending = false;
     let lastLiveTextMs = 0;
+    let liveRxCount = 0;
+    let liveHz = 0;
+    let liveHzWindowMs = performance.now();
     const audioHistory = Array(180).fill(0);
 
     function errText(v) { return !v || v === "ESP_OK" ? "正常" : v; }
@@ -388,7 +391,7 @@
       $("noticeBanner").className = `banner ${kind === "bad" ? "bad" : (kind === "warn" ? "warn" : "")}`;
     }
     function drawAudioWave(samples) {
-      const data = Array.isArray(samples) && samples.length ? samples : [0];
+      const data = typeof samples === "number" ? [samples * 127] : (Array.isArray(samples) && samples.length ? samples : [0]);
       let level = 0;
       for (const v of data) {
         level = Math.max(level, Math.abs(Number(v) || 0) / 127);
@@ -455,7 +458,7 @@
         deviceModel.style.transform = quaternionToCssMatrix(s.imu.q0, s.imu.q1, s.imu.q2, s.imu.q3);
       }
       if (!previewActive && s.audio) {
-        drawAudioWave(s.audio.wave || []);
+        drawAudioWave(Number.isFinite(s.audio.level) ? s.audio.level : (s.audio.wave || []));
       }
       if (now - lastLiveTextMs < 120) return;
       lastLiveTextMs = now;
@@ -466,6 +469,7 @@
       if (s.camera) {
         $("cameraFps").textContent = cameraFpsText(s.camera.fps);
         if (s.camera.streaming && previewActive) $("previewState").textContent = "预览运行中";
+        if (!previewActive) $("previewState").textContent = `实时遥测 ${liveHz.toFixed(0)} Hz`;
       }
       if (s.imu) {
         $("imuState").textContent = s.imu.present ? errText(s.imu.err) : `未检测 / ${errText(s.imu.err)}`;
@@ -484,6 +488,13 @@
       }
     }
     function applyLive(s) {
+      liveRxCount++;
+      const now = performance.now();
+      if (now - liveHzWindowMs >= 1000) {
+        liveHz = liveRxCount * 1000 / (now - liveHzWindowMs);
+        liveRxCount = 0;
+        liveHzWindowMs = now;
+      }
       if (currentStatus) {
         currentStatus.recording = s.recording;
         if (s.camera) Object.assign(currentStatus.camera, s.camera);

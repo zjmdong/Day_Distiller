@@ -2,6 +2,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <math.h>
 #include "audio_service.h"
 #include "camera_service.h"
 #include "imu.h"
@@ -11,8 +13,11 @@
 #include "wifi_portal.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "lwip/sockets.h"
+#include "lwip/tcp.h"
 #include <time.h>
 
 extern const char web_index_html_start[] asm("_binary_index_html_start");
@@ -30,6 +35,7 @@ static httpd_handle_t s_stream_server;
 static day_web_callbacks_t s_cb;
 static int s_ws_clients[4] = {-1, -1, -1, -1};
 static volatile bool s_record_request_active;
+static uint32_t s_live_seq;
 
 static void record_request_task(void *arg);
 
@@ -137,22 +143,35 @@ static void status_to_json(const day_device_status_t *st, char *buf, size_t len)
 
 static void live_to_json(const day_device_status_t *st, char *buf, size_t len)
 {
-    char wave_json[360];
-    audio_waveform_to_json(&st->audio, wave_json, sizeof(wave_json));
+    float audio_level = 0.0f;
+    uint8_t wave_count = st->audio.waveform_len;
+    if (wave_count > DAY_AUDIO_WAVEFORM_SAMPLES) {
+        wave_count = DAY_AUDIO_WAVEFORM_SAMPLES;
+    }
+    for (uint8_t i = 0; i < wave_count; ++i) {
+        float level = fabsf((float)st->audio.waveform[i]) / 127.0f;
+        if (level > audio_level) {
+            audio_level = level;
+        }
+    }
     snprintf(buf, len,
              "{"
              "\"live\":true,"
+             "\"seq\":%lu,"
+             "\"t_ms\":%lld,"
              "\"recording\":%s,"
              "\"camera\":{\"streaming\":%s,\"fps\":%.1f},"
-             "\"audio\":{\"initialized\":%s,\"rate\":%lu,\"rms\":%.4f,\"peak\":%.4f,\"wave\":%s,\"err\":\"%s\"},"
+             "\"audio\":{\"initialized\":%s,\"rate\":%lu,\"rms\":%.4f,\"peak\":%.4f,\"level\":%.3f,\"err\":\"%s\"},"
              "\"imu\":{\"present\":%s,\"ax\":%d,\"ay\":%d,\"az\":%d,\"gx\":%d,\"gy\":%d,\"gz\":%d,"
              "\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f,"
              "\"q0\":%.6f,\"q1\":%.6f,\"q2\":%.6f,\"q3\":%.6f,\"err\":\"%s\"}"
              "}",
+             (unsigned long)s_live_seq++,
+             (long long)(esp_timer_get_time() / 1000),
              boolstr(st->recording_active),
              boolstr(st->camera.streaming), st->camera.fps,
              boolstr(st->audio.initialized), (unsigned long)st->audio.sample_rate_hz,
-             st->audio.rms, st->audio.peak, wave_json, esp_err_to_name(st->audio.last_error),
+             st->audio.rms, st->audio.peak, audio_level, esp_err_to_name(st->audio.last_error),
              boolstr(st->imu.present), st->imu.last_sample.ax, st->imu.last_sample.ay, st->imu.last_sample.az,
              st->imu.last_sample.gx, st->imu.last_sample.gy, st->imu.last_sample.gz,
              st->imu.last_sample.roll_deg, st->imu.last_sample.pitch_deg, st->imu.last_sample.yaw_deg,
@@ -487,16 +506,28 @@ static void record_request_task(void *arg)
 
 static void add_ws_client(int fd)
 {
+    /* Keep only the newest live dashboard. Hidden captive-portal tabs otherwise
+     * keep stale sockets that can block high-rate telemetry sends.
+     */
     for (size_t i = 0; i < sizeof(s_ws_clients) / sizeof(s_ws_clients[0]); ++i) {
-        if (s_ws_clients[i] == fd) {
-            return;
-        }
-        if (s_ws_clients[i] < 0) {
-            s_ws_clients[i] = fd;
-            return;
-        }
+        s_ws_clients[i] = -1;
     }
     s_ws_clients[0] = fd;
+}
+
+static void configure_ws_socket(int fd)
+{
+    int nodelay = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
+        ESP_LOGW(TAG, "TCP_NODELAY failed fd=%d errno=%d", fd, errno);
+    }
+}
+
+static void remove_ws_client(size_t index)
+{
+    if (index < sizeof(s_ws_clients) / sizeof(s_ws_clients[0])) {
+        s_ws_clients[index] = -1;
+    }
 }
 
 static bool has_ws_clients(void)
@@ -511,7 +542,9 @@ static bool has_ws_clients(void)
 
 static esp_err_t ws_handler(httpd_req_t *req)
 {
-    add_ws_client(httpd_req_to_sockfd(req));
+    int fd = httpd_req_to_sockfd(req);
+    add_ws_client(fd);
+    configure_ws_socket(fd);
     if (req->method == HTTP_GET) {
         return ESP_OK;
     }
@@ -571,8 +604,9 @@ static void telemetry_task(void *arg)
         };
         for (size_t i = 0; i < sizeof(s_ws_clients) / sizeof(s_ws_clients[0]); ++i) {
             if (s_ws_clients[i] >= 0) {
-                if (httpd_ws_send_frame_async(s_server, s_ws_clients[i], &frame) != ESP_OK) {
-                    s_ws_clients[i] = -1;
+                if (httpd_ws_get_fd_info(s_server, s_ws_clients[i]) != HTTPD_WS_CLIENT_WEBSOCKET ||
+                    httpd_ws_send_frame_async(s_server, s_ws_clients[i], &frame) != ESP_OK) {
+                    remove_ws_client(i);
                 }
             }
         }
@@ -613,6 +647,8 @@ esp_err_t day_web_start(const day_web_callbacks_t *callbacks)
     config.max_open_sockets = 6;
     config.stack_size = 6144;
     config.lru_purge_enable = true;
+    config.recv_wait_timeout = 1;
+    config.send_wait_timeout = 1;
     config.uri_match_fn = httpd_uri_match_wildcard;
 
     esp_err_t ret = httpd_start(&s_server, &config);
@@ -650,7 +686,7 @@ esp_err_t day_web_start(const day_web_callbacks_t *callbacks)
     for (size_t i = 0; i < sizeof(s_ws_clients) / sizeof(s_ws_clients[0]); ++i) {
         s_ws_clients[i] = -1;
     }
-    if (xTaskCreate(telemetry_task, "web_telemetry", 4096, NULL, 4, NULL) != pdPASS) {
+    if (xTaskCreate(telemetry_task, "web_telemetry", 4096, NULL, 6, NULL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create telemetry task");
     }
     httpd_config_t stream_config = HTTPD_DEFAULT_CONFIG();
@@ -660,6 +696,8 @@ esp_err_t day_web_start(const day_web_callbacks_t *callbacks)
     stream_config.max_open_sockets = 2;
     stream_config.stack_size = 6144;
     stream_config.lru_purge_enable = true;
+    stream_config.recv_wait_timeout = 1;
+    stream_config.send_wait_timeout = 1;
     ret = httpd_start(&s_stream_server, &stream_config);
     if (ret == ESP_OK) {
         httpd_uri_t stream = {.uri = "/stream.mjpg", .method = HTTP_GET, .handler = stream_handler};
