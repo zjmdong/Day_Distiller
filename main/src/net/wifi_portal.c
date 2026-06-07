@@ -34,6 +34,11 @@ static day_wifi_status_t s_status = {
 static int s_retry_count;
 static bool s_connecting;
 
+static void set_wifi_low_latency(void)
+{
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_NONE));
+}
+
 static void json_escape_string(const char *src, char *dst, size_t len)
 {
     if (!dst || len == 0) {
@@ -111,6 +116,8 @@ esp_err_t day_wifi_init(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init failed");
+    set_wifi_low_latency();
+    esp_log_level_set("example_dns_redirect_server", ESP_LOG_WARN);
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_storage(WIFI_STORAGE_RAM));
@@ -137,6 +144,7 @@ static esp_err_t connect_sta(const day_config_t *cfg)
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(mode), TAG, "set STA mode failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg), TAG, "set STA config failed");
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
+    set_wifi_low_latency();
     ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "connect failed");
     EventBits_t bits = xEventGroupWaitBits(s_events, WIFI_BIT_CONNECTED | WIFI_BIT_FAIL,
                                            pdTRUE, pdFALSE, pdMS_TO_TICKS(15000));
@@ -232,9 +240,17 @@ esp_err_t day_wifi_run_portal_window(uint32_t window_ms)
     strlcpy((char *)ap_cfg.ap.ssid, s_status.ap_ssid, sizeof(ap_cfg.ap.ssid));
 
     wifi_mode_t mode = s_status.sta_connected ? WIFI_MODE_APSTA : WIFI_MODE_AP;
+    if (s_status.sta_connected) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
+        s_status.sta_connected = false;
+        s_status.ip_addr[0] = '\0';
+        mode = WIFI_MODE_AP;
+    }
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(mode), TAG, "set AP mode failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg), TAG, "set AP config failed");
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
+    set_wifi_low_latency();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW20));
     set_captive_portal_url();
 
     if (!s_dns) {
@@ -270,6 +286,25 @@ esp_err_t day_wifi_stop_portal(void)
     return ret;
 }
 
+esp_err_t day_wifi_restore_portal_ap_only(void)
+{
+    if (!s_initialized || !s_status.ap_running) {
+        return ESP_OK;
+    }
+    if (s_status.sta_connected) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
+        s_status.sta_connected = false;
+        s_status.ip_addr[0] = '\0';
+    }
+    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (ret == ESP_OK) {
+        set_wifi_low_latency();
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW20));
+    }
+    s_status.last_error = ret;
+    return ret;
+}
+
 esp_err_t day_wifi_scan_json(char *buffer, size_t len)
 {
     if (!buffer || len == 0) {
@@ -278,6 +313,7 @@ esp_err_t day_wifi_scan_json(char *buffer, size_t len)
     ESP_RETURN_ON_ERROR(day_wifi_init(), TAG, "wifi init failed");
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(s_status.ap_running ? WIFI_MODE_APSTA : WIFI_MODE_STA));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
+    set_wifi_low_latency();
     wifi_scan_config_t scan_cfg = {0};
     esp_err_t ret = esp_wifi_scan_start(&scan_cfg, true);
     if (ret != ESP_OK) {
@@ -287,6 +323,7 @@ esp_err_t day_wifi_scan_json(char *buffer, size_t len)
     uint16_t count = sizeof(aps) / sizeof(aps[0]);
     ret = esp_wifi_scan_get_ap_records(&count, aps);
     if (ret != ESP_OK) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_restore_portal_ap_only());
         return ret;
     }
     size_t used = snprintf(buffer, len, "{\"ok\":true,\"aps\":[");
@@ -302,8 +339,10 @@ esp_err_t day_wifi_scan_json(char *buffer, size_t len)
         used += (size_t)written;
     }
     if (snprintf(buffer + used, len - used, "]}") >= len - used) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_restore_portal_ap_only());
         return ESP_ERR_NO_MEM;
     }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_restore_portal_ap_only());
     return ESP_OK;
 }
 

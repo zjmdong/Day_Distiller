@@ -18,6 +18,7 @@
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
+#include "sys/time.h"
 #include <time.h>
 
 extern const char web_index_html_start[] asm("_binary_index_html_start");
@@ -35,6 +36,7 @@ static httpd_handle_t s_stream_server;
 static day_web_callbacks_t s_cb;
 static int s_ws_clients[4] = {-1, -1, -1, -1};
 static volatile bool s_record_request_active;
+static volatile bool s_ws_send_pending;
 static uint32_t s_live_seq;
 
 static void record_request_task(void *arg);
@@ -461,6 +463,7 @@ static esp_err_t wifi_connect_handler(httpd_req_t *req)
              boolstr(wifi.time_synced),
              esp_err_to_name(ret));
     json_send(req, json);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_restore_portal_ap_only());
     return ESP_OK;
 }
 
@@ -483,6 +486,7 @@ static esp_err_t time_sync_handler(httpd_req_t *req)
              boolstr(wifi.time_synced),
              esp_err_to_name(ret));
     json_send(req, json);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_restore_portal_ap_only());
     return ESP_OK;
 }
 
@@ -521,12 +525,28 @@ static void configure_ws_socket(int fd)
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
         ESP_LOGW(TAG, "TCP_NODELAY failed fd=%d errno=%d", fd, errno);
     }
+    struct timeval send_timeout = {
+        .tv_sec = 0,
+        .tv_usec = 80000,
+    };
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout)) < 0) {
+        ESP_LOGW(TAG, "SO_SNDTIMEO failed fd=%d errno=%d", fd, errno);
+    }
 }
 
 static void remove_ws_client(size_t index)
 {
     if (index < sizeof(s_ws_clients) / sizeof(s_ws_clients[0])) {
         s_ws_clients[index] = -1;
+    }
+}
+
+static void remove_ws_fd(int fd)
+{
+    for (size_t i = 0; i < sizeof(s_ws_clients) / sizeof(s_ws_clients[0]); ++i) {
+        if (s_ws_clients[i] == fd) {
+            remove_ws_client(i);
+        }
     }
 }
 
@@ -544,6 +564,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
 {
     int fd = httpd_req_to_sockfd(req);
     add_ws_client(fd);
+    s_ws_send_pending = false;
     configure_ws_socket(fd);
     if (req->method == HTTP_GET) {
         return ESP_OK;
@@ -558,6 +579,15 @@ static esp_err_t ws_handler(httpd_req_t *req)
         httpd_ws_recv_frame(req, &pkt, sizeof(drain));
     }
     return ESP_OK;
+}
+
+static void ws_send_done(esp_err_t err, int socket, void *arg)
+{
+    free(arg);
+    s_ws_send_pending = false;
+    if (err != ESP_OK) {
+        remove_ws_fd(socket);
+    }
 }
 
 static void telemetry_task(void *arg)
@@ -596,21 +626,40 @@ static void telemetry_task(void *arg)
         }
         status->imu = day_imu_get_status();
         status->audio = day_audio_get_status();
-        live_to_json(status, json, DAY_LIVE_JSON_LEN);
-        httpd_ws_frame_t frame = {
-            .type = HTTPD_WS_TYPE_TEXT,
-            .payload = (uint8_t *)json,
-            .len = strlen(json),
-        };
-        for (size_t i = 0; i < sizeof(s_ws_clients) / sizeof(s_ws_clients[0]); ++i) {
-            if (s_ws_clients[i] >= 0) {
-                if (httpd_ws_get_fd_info(s_server, s_ws_clients[i]) != HTTPD_WS_CLIENT_WEBSOCKET ||
-                    httpd_ws_send_frame_async(s_server, s_ws_clients[i], &frame) != ESP_OK) {
-                    remove_ws_client(i);
+        if (!s_ws_send_pending) {
+            live_to_json(status, json, DAY_LIVE_JSON_LEN);
+            size_t json_len = strlen(json);
+            char *payload = malloc(json_len + 1);
+            if (payload) {
+                memcpy(payload, json, json_len + 1);
+                httpd_ws_frame_t frame = {
+                    .type = HTTPD_WS_TYPE_TEXT,
+                    .payload = (uint8_t *)payload,
+                    .len = json_len,
+                };
+                bool queued = false;
+                for (size_t i = 0; i < sizeof(s_ws_clients) / sizeof(s_ws_clients[0]); ++i) {
+                    if (s_ws_clients[i] >= 0) {
+                        if (httpd_ws_get_fd_info(s_server, s_ws_clients[i]) != HTTPD_WS_CLIENT_WEBSOCKET) {
+                            remove_ws_client(i);
+                            continue;
+                        }
+                        s_ws_send_pending = true;
+                        if (httpd_ws_send_data_async(s_server, s_ws_clients[i], &frame, ws_send_done, payload) != ESP_OK) {
+                            s_ws_send_pending = false;
+                            remove_ws_client(i);
+                        } else {
+                            queued = true;
+                        }
+                        break;
+                    }
+                }
+                if (!queued) {
+                    free(payload);
                 }
             }
         }
-        uint32_t delay_ms = status->camera.streaming ? 250 : 10;
+        uint32_t delay_ms = status->camera.streaming ? 250 : 5;
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
     free(status);
@@ -620,7 +669,7 @@ static void telemetry_task(void *arg)
 
 static esp_err_t redirect_404(httpd_req_t *req, httpd_err_code_t err)
 {
-    ESP_LOGI(TAG, "captive redirect uri=%s", req->uri);
+    ESP_LOGD(TAG, "captive redirect uri=%s", req->uri);
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -686,6 +735,7 @@ esp_err_t day_web_start(const day_web_callbacks_t *callbacks)
     for (size_t i = 0; i < sizeof(s_ws_clients) / sizeof(s_ws_clients[0]); ++i) {
         s_ws_clients[i] = -1;
     }
+    s_ws_send_pending = false;
     if (xTaskCreate(telemetry_task, "web_telemetry", 4096, NULL, 6, NULL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create telemetry task");
     }
@@ -721,6 +771,7 @@ esp_err_t day_web_stop(void)
     if (s_server) {
         httpd_handle_t server = s_server;
         s_server = NULL;
+        s_ws_send_pending = false;
         return httpd_stop(server);
     }
     return ESP_OK;
