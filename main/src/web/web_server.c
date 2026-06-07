@@ -5,6 +5,7 @@
 #include <math.h>
 #include "audio_service.h"
 #include "camera_service.h"
+#include "app_config.h"
 #include "imu.h"
 #include "recorder.h"
 #include "rtc_clock.h"
@@ -130,7 +131,7 @@ static void status_to_json(const day_device_status_t *st, char *buf, size_t len)
              "\"imu\":{\"present\":%s,\"ax\":%d,\"ay\":%d,\"az\":%d,\"gx\":%d,\"gy\":%d,\"gz\":%d,"
              "\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f,"
              "\"q0\":%.6f,\"q1\":%.6f,\"q2\":%.6f,\"q3\":%.6f,\"err\":\"%s\"},"
-             "\"wifi\":{\"ap\":%s,\"sta\":%s,\"time_synced\":%s,\"clients\":%d,\"ap_ssid\":\"%s\",\"sta_ssid\":\"%s\",\"ip\":\"%s\","
+             "\"wifi\":{\"ap\":%s,\"sta\":%s,\"time_synced\":%s,\"clients\":%d,\"retry_count\":%u,\"ap_ssid\":\"%s\",\"sta_ssid\":\"%s\",\"ip\":\"%s\","
              "\"op_active\":%s,\"op_ok\":%s,\"op_connected\":%s,\"op_time_synced\":%s,\"op_error\":\"%s\",\"err\":\"%s\"}"
              "}",
              boolstr(st->recording_active),
@@ -150,7 +151,7 @@ static void status_to_json(const day_device_status_t *st, char *buf, size_t len)
              st->imu.last_sample.q0, st->imu.last_sample.q1, st->imu.last_sample.q2, st->imu.last_sample.q3,
              esp_err_to_name(st->imu.last_error),
              boolstr(st->wifi.ap_running), boolstr(st->wifi.sta_connected), boolstr(st->wifi.time_synced),
-             st->wifi.ap_clients, st->wifi.ap_ssid, st->wifi.sta_ssid, st->wifi.ip_addr,
+             st->wifi.ap_clients, st->wifi.retry_count, st->wifi.ap_ssid, st->wifi.sta_ssid, st->wifi.ip_addr,
              boolstr(s_wifi_op_active), boolstr(s_wifi_op_last_error == ESP_OK),
              boolstr(s_wifi_op_connected), boolstr(s_wifi_op_time_synced), esp_err_to_name(s_wifi_op_last_error),
              esp_err_to_name(st->wifi.last_error));
@@ -230,6 +231,8 @@ static void config_to_json(const day_config_t *cfg, char *buf, size_t len)
              "\"wake_interval_sec\":%lu,"
              "\"shake_trigger_enabled\":%s,"
              "\"camera_framesize\":%d,"
+             "\"camera_preview_framesize\":%d,"
+             "\"camera_record_framesize\":%d,"
              "\"camera_jpeg_quality\":%d,"
              "\"camera_preview_fps\":%lu,"
              "\"camera_record_fps\":%lu,"
@@ -247,6 +250,8 @@ static void config_to_json(const day_config_t *cfg, char *buf, size_t len)
              (unsigned long)cfg->wake_interval_sec,
              boolstr(cfg->shake_trigger_enabled),
              cfg->camera_framesize,
+             cfg->camera_preview_framesize,
+             cfg->camera_record_framesize,
              cfg->camera_jpeg_quality,
              (unsigned long)cfg->camera_preview_fps,
              (unsigned long)cfg->camera_record_fps,
@@ -367,6 +372,8 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     json_bool(body, "shake_trigger_enabled", &next.shake_trigger_enabled);
     json_u32(body, "wake_interval_sec", &next.wake_interval_sec);
     json_int(body, "camera_framesize", &next.camera_framesize);
+    json_int(body, "camera_preview_framesize", &next.camera_preview_framesize);
+    json_int(body, "camera_record_framesize", &next.camera_record_framesize);
     json_int(body, "camera_jpeg_quality", &next.camera_jpeg_quality);
     json_u32(body, "camera_preview_fps", &next.camera_preview_fps);
     json_u32(body, "camera_record_fps", &next.camera_record_fps);
@@ -517,7 +524,7 @@ static esp_err_t time_sync_handler(httpd_req_t *req)
 
 static esp_err_t stream_handler(httpd_req_t *req)
 {
-    esp_err_t ret = day_camera_init(s_cb.config);
+    esp_err_t ret = day_camera_init_preview(s_cb.config);
     if (ret != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(ret));
         return ret;
@@ -822,6 +829,7 @@ esp_err_t day_web_start(const day_web_callbacks_t *callbacks)
         ESP_LOGE(TAG, "failed to create telemetry task");
     }
     httpd_config_t stream_config = HTTPD_DEFAULT_CONFIG();
+    stream_config.task_priority = tskIDLE_PRIORITY + 7;
     stream_config.server_port = 81;
     stream_config.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 1;
     stream_config.max_uri_handlers = 2;

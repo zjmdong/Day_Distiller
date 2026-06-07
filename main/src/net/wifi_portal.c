@@ -189,11 +189,25 @@ static esp_err_t sync_sntp(const day_config_t *cfg)
 esp_err_t day_wifi_sync_time(const day_config_t *cfg)
 {
     esp_err_t ret = day_wifi_init();
-    if (ret == ESP_OK) {
-        ret = connect_sta(cfg);
+    if (ret != ESP_OK) {
+        s_status.last_error = ret;
+        return ret;
     }
-    if (ret == ESP_OK) {
-        ret = sync_sntp(cfg);
+    s_status.retry_count = 0;
+    for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
+        s_status.retry_count = attempt - 1;
+        ret = connect_sta(cfg);
+        if (ret == ESP_OK) {
+            ret = sync_sntp(cfg);
+        }
+        if (ret == ESP_OK) {
+            s_status.retry_count = attempt - 1;
+            break;
+        }
+        ESP_LOGW(TAG, "Wi-Fi/SNTP attempt %u failed: %s", attempt, esp_err_to_name(ret));
+        s_status.retry_count = attempt;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
     s_status.last_error = ret;
     return ret;

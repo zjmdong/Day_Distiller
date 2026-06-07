@@ -171,8 +171,16 @@
           <div class="log" id="previewState">预览连接中</div>
         </div>
         <div class="grid">
-          <label>采集分辨率
-            <select id="frameSize">
+          <label>预览分辨率
+            <select id="previewFrameSize">
+              <option value="6">QVGA 320x240</option>
+              <option value="10">VGA 640x480</option>
+              <option value="11">SVGA 800x600</option>
+              <option value="13">HD 1280x720</option>
+            </select>
+          </label>
+          <label>录制分辨率
+            <select id="recordFrameSize">
               <option value="10">VGA 640x480</option>
               <option value="11">SVGA 800x600</option>
               <option value="13">HD 1280x720</option>
@@ -190,24 +198,10 @@
           </label>
           <label>预览帧率
             <select id="previewFps">
-              <option value="5">5 fps</option>
-              <option value="10">10 fps</option>
-              <option value="12">12 fps</option>
-              <option value="15">15 fps</option>
-              <option value="20">20 fps</option>
-              <option value="24">24 fps</option>
-              <option value="30">30 fps</option>
             </select>
           </label>
           <label>录制帧率
             <select id="recordFps">
-              <option value="5">5 fps</option>
-              <option value="10">10 fps</option>
-              <option value="12">12 fps</option>
-              <option value="15">15 fps</option>
-              <option value="20">20 fps</option>
-              <option value="24">24 fps</option>
-              <option value="30">30 fps</option>
             </select>
           </label>
           <div class="metric"><div class="label">相机状态</div><div class="value" id="cameraState">--</div></div>
@@ -287,7 +281,7 @@
     </section>
 
     <section id="wifiInfoSection">
-      <div class="section-head"><h2>Wi-Fi 状态</h2><button id="reconfigBtn" class="ghost">重新配网</button></div>
+      <div class="section-head"><h2>Wi-Fi 状态</h2><div class="row"><button id="retryWifiBtn" class="ghost">重试联网</button><button id="reconfigBtn" class="ghost">重新配网</button></div></div>
       <div class="grid">
         <div class="metric"><div class="label">连接状态</div><div class="value" id="wifiConnState">--</div></div>
         <label>保存的 Wi-Fi 名称<input id="savedSsid" readonly></label>
@@ -380,6 +374,27 @@
       if (value === undefined || value === null) return;
       if (![...el.options].some(o => o.value == value)) el.add(new Option(String(value), String(value)));
       el.value = String(value);
+    }
+    function cameraMaxFps(framesize) {
+      const fs = Number(framesize);
+      if (fs <= 10) return 30;
+      if (fs <= 11) return 20;
+      if (fs <= 13) return 15;
+      if (fs <= 15) return 10;
+      if (fs === 16) return 15;
+      return 5;
+    }
+    function fillFpsOptions(id, framesize, selected) {
+      const max = cameraMaxFps(framesize);
+      const values = [5, 10, 12, 15, 20, 24, 30].filter(v => v <= max);
+      const el = $(id);
+      el.innerHTML = values.map(v => `<option value="${v}">${v} fps</option>`).join("");
+      const value = Math.min(Number(selected) || max, max);
+      setSelect(id, value);
+    }
+    function updateCameraFpsOptions() {
+      fillFpsOptions("previewFps", $("previewFrameSize").value, $("previewFps").value || 30);
+      fillFpsOptions("recordFps", $("recordFrameSize").value, $("recordFps").value || 15);
     }
     function setDot(text, ok, bad = false) {
       return `<span class="status-dot ${bad ? "bad" : (ok ? "ok" : "warn")}"></span>${text}`;
@@ -557,7 +572,8 @@
         $("provisionHint").lastElementChild.textContent = "正在连接 Wi-Fi 并进行 NTP 对时，热点可能会短暂重连。";
       } else if (!healthy) {
         $("provisionHint").className = "banner bad";
-        $("provisionHint").lastElementChild.textContent = connected ? "Wi-Fi 已连接但对时失败，请重新配网或检查 NTP 设置。" : "保存的 Wi-Fi 连接失败，请重新配网。";
+        const retried = s && s.wifi && s.wifi.retry_count >= 3 ? "已自动重试 3 次，" : "";
+        $("provisionHint").lastElementChild.textContent = connected ? `${retried}Wi-Fi 已连接但对时失败，请重新配网或检查 NTP 设置。` : `${retried}保存的 Wi-Fi 连接失败，请重新配网。`;
       } else {
         $("provisionHint").className = "banner";
         $("provisionHint").lastElementChild.textContent = "Wi-Fi 已连接，对时成功。";
@@ -578,7 +594,8 @@
       $("batteryState").textContent = `${fixed(s.battery.soc, 1)}% / ${fixed(s.battery.voltage, 2)} V`;
       $("rtcState").textContent = s.rtc.valid ? s.rtc.iso : `无效 / ${errText(s.rtc.err)}`;
       $("wifiState").textContent = s.wifi.ap ? `${s.wifi.ap_ssid} / ${s.wifi.clients} 台` : (s.wifi.sta ? s.wifi.ip : "关闭");
-      $("ntpState").textContent = s.wifi.op_active ? "正在对时" : ((s.wifi.time_synced || s.wifi.op_time_synced) ? "已完成" : errText(s.wifi.op_error || s.wifi.err));
+      $("ntpState").textContent = s.wifi.op_active ? `正在对时 / 第 ${Math.max(1, (s.wifi.retry_count || 0) + 1)} 次` :
+        ((s.wifi.time_synced || s.wifi.op_time_synced) ? "已完成" : `${errText(s.wifi.op_error || s.wifi.err)}${s.wifi.retry_count >= 3 ? " / 已重试3次" : ""}`);
       $("imuState").textContent = s.imu.present ? errText(s.imu.err) : `未检测 / ${errText(s.imu.err)}`;
       $("poseValue").textContent = `X ${fixed(s.imu.roll, 1)} / Y ${fixed(s.imu.pitch, 1)} / Z ${fixed(s.imu.yaw, 1)}`;
       $("accelValue").textContent = `${s.imu.ax}, ${s.imu.ay}, ${s.imu.az}`;
@@ -602,10 +619,11 @@
       const c = await fetch("/api/config").then(r => r.json());
       currentConfig = c;
       setSelect("wake", c.wake_interval_sec);
-      setSelect("frameSize", c.camera_framesize);
+      setSelect("previewFrameSize", c.camera_preview_framesize ?? 10);
+      setSelect("recordFrameSize", c.camera_record_framesize ?? c.camera_framesize);
       setSelect("quality", c.camera_jpeg_quality);
-      setSelect("previewFps", c.camera_preview_fps);
-      setSelect("recordFps", c.camera_record_fps);
+      fillFpsOptions("previewFps", $("previewFrameSize").value, c.camera_preview_fps);
+      fillFpsOptions("recordFps", $("recordFrameSize").value, c.camera_record_fps);
       setSelect("audioRate", c.audio_sample_rate_hz);
       setSelect("imuRate", c.imu_sample_rate_hz);
       setSelect("imuOrientation", c.imu_orientation);
@@ -619,7 +637,9 @@
     function configBody() {
       return {
         wake_interval_sec: +$("wake").value,
-        camera_framesize: +$("frameSize").value,
+        camera_framesize: +$("recordFrameSize").value,
+        camera_preview_framesize: +$("previewFrameSize").value,
+        camera_record_framesize: +$("recordFrameSize").value,
         camera_jpeg_quality: +$("quality").value,
         camera_preview_fps: +$("previewFps").value,
         camera_record_fps: +$("recordFps").value,
@@ -747,14 +767,17 @@
       $("timeLog").textContent = "正在保存并对时";
       const saved = await saveConfig("timeLog");
       if (!saved) return;
+      await retryWifiSync("timeLog");
+    }
+    async function retryWifiSync(logId = "timeLog") {
       const r = await fetch("/api/time/sync", {method:"POST"}).then(r => r.json()).catch(() => ({ok:true, started:true, maybe_lost:true}));
       if (!r.ok && !r.started) {
-        $("timeLog").textContent = `启动失败：${r.error || "未知错误"}`;
+        $(logId).textContent = `启动失败：${r.error || "未知错误"}`;
         return;
       }
-      $("timeLog").textContent = "已开始对时，请等待";
-      const done = await waitForWifiOp("timeLog");
-      $("timeLog").textContent = done.ok ? "对时成功" : `对时失败：${done.error || "未知错误"}`;
+      $(logId).textContent = "已开始联网+对时，请等待";
+      const done = await waitForWifiOp(logId);
+      $(logId).textContent = done.ok ? "联网+对时成功" : `失败：${done.error || "未知错误"}`;
       await poll();
     }
     function connectWs() {
@@ -775,6 +798,8 @@
       } catch(e) { setInterval(poll, 5000); }
     }
     $("previewBtn").onclick = () => previewActive ? stopPreview() : startPreview();
+    $("previewFrameSize").onchange = updateCameraFpsOptions;
+    $("recordFrameSize").onchange = updateCameraFpsOptions;
     $("recordBtn").onclick = startRecord;
     $("recordBtn2").onclick = startRecord;
     $("saveBtn").onclick = () => saveConfig("configLog");
@@ -783,6 +808,7 @@
     $("saveMotionBtn").onclick = () => saveConfig("configLog");
     $("saveTimeBtn").onclick = () => saveConfig("timeLog");
     $("syncTimeBtn").onclick = syncTimeNow;
+    $("retryWifiBtn").onclick = () => retryWifiSync("configLog");
     $("scanBtn").onclick = scanWifi;
     $("provisionBtn").onclick = provisionWifi;
     $("reconfigBtn").onclick = () => { forceProvision = true; showNotice(""); updateProvisionUi(); };

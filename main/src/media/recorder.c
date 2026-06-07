@@ -309,7 +309,7 @@ esp_err_t day_recorder_record_once(const day_config_t *cfg, day_record_paths_t *
         ret = day_storage_make_record_paths(&ctx.paths, time(NULL));
     }
     if (ret == ESP_OK) {
-        ctx.camera_err = day_camera_init(cfg);
+        ctx.camera_err = day_camera_init_record(cfg);
         ctx.imu_err = day_imu_init(cfg->imu_sample_rate_hz);
         ctx.audio_err = day_audio_init(cfg->audio_sample_rate_hz);
 

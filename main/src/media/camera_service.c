@@ -11,6 +11,8 @@
 static const char *TAG = "day_camera";
 
 static bool s_initialized;
+static framesize_t s_current_framesize = FRAMESIZE_INVALID;
+static int s_current_quality = -1;
 static day_camera_status_t s_status = {
     .last_error = ESP_ERR_INVALID_STATE,
 };
@@ -41,14 +43,24 @@ static void update_status_fps(float fps)
 
 esp_err_t day_camera_init(const day_config_t *cfg)
 {
+    return day_camera_init_record(cfg);
+}
+
+static esp_err_t init_with_framesize(const day_config_t *cfg, int framesize_value)
+{
     if (s_initialized) {
-        return ESP_OK;
+        int jpeg_quality = cfg ? cfg->camera_jpeg_quality : 12;
+        framesize_t frame_size = sanitize_framesize(framesize_value);
+        if (s_current_framesize == frame_size && s_current_quality == jpeg_quality) {
+            return ESP_OK;
+        }
+        day_camera_deinit();
     }
     int jpeg_quality = cfg ? cfg->camera_jpeg_quality : 12;
     if (jpeg_quality < 4 || jpeg_quality > 63) {
         jpeg_quality = 12;
     }
-    framesize_t frame_size = cfg ? sanitize_framesize(cfg->camera_framesize) : FRAMESIZE_FHD;
+    framesize_t frame_size = sanitize_framesize(framesize_value);
 
     camera_config_t camera_config = {
         .pin_pwdn = -1,
@@ -83,10 +95,28 @@ esp_err_t day_camera_init(const day_config_t *cfg)
     s_initialized = ret == ESP_OK;
     s_status.initialized = s_initialized;
     s_status.last_error = ret;
+    if (ret == ESP_OK) {
+        s_current_framesize = frame_size;
+        s_current_quality = jpeg_quality;
+        s_status.fps = 0.0f;
+        s_status.frame_count = 0;
+    }
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "camera init failed: %s", esp_err_to_name(ret));
     }
     return ret;
+}
+
+esp_err_t day_camera_init_preview(const day_config_t *cfg)
+{
+    int framesize = cfg ? cfg->camera_preview_framesize : FRAMESIZE_VGA;
+    return init_with_framesize(cfg, framesize);
+}
+
+esp_err_t day_camera_init_record(const day_config_t *cfg)
+{
+    int framesize = cfg ? cfg->camera_record_framesize : FRAMESIZE_FHD;
+    return init_with_framesize(cfg, framesize);
 }
 
 void day_camera_deinit(void)
@@ -100,6 +130,8 @@ void day_camera_deinit(void)
     s_status.recording = false;
     s_status.fps = 0.0f;
     s_status.frame_count = 0;
+    s_current_framesize = FRAMESIZE_INVALID;
+    s_current_quality = -1;
 }
 
 esp_err_t day_camera_capture(camera_fb_t **out_fb)
@@ -158,11 +190,13 @@ void day_camera_note_frame_done(int64_t frame_start_us, uint32_t target_fps)
 esp_err_t day_camera_stream_mjpeg(httpd_req_t *req, uint32_t target_fps)
 {
     static const char *boundary = "123456789000000000000987654321";
-    char part_header[96];
+    char part_header[160];
     esp_err_t ret = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=123456789000000000000987654321");
     if (ret != ESP_OK) {
         return ret;
     }
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "X-Framerate", "stream");
     s_status.streaming = true;
     while (!s_status.recording) {
         int64_t frame_start_us = esp_timer_get_time();
@@ -171,16 +205,10 @@ esp_err_t day_camera_stream_mjpeg(httpd_req_t *req, uint32_t target_fps)
         if (ret != ESP_OK) {
             break;
         }
-        ret = httpd_resp_send_chunk(req, "\r\n--", 4);
-        if (ret == ESP_OK) {
-            ret = httpd_resp_send_chunk(req, boundary, strlen(boundary));
-        }
-        if (ret == ESP_OK) {
-            int hlen = snprintf(part_header, sizeof(part_header),
-                                "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                                (unsigned)fb->len);
-            ret = httpd_resp_send_chunk(req, part_header, hlen);
-        }
+        int hlen = snprintf(part_header, sizeof(part_header),
+                            "\r\n--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                            boundary, (unsigned)fb->len);
+        ret = httpd_resp_send_chunk(req, part_header, hlen);
         if (ret == ESP_OK) {
             ret = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
         }

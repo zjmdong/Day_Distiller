@@ -22,7 +22,9 @@
 #define GYRO_DPS_PER_LSB 0.00875f
 #define RAD_TO_DEG 57.2957795f
 #define DEG_TO_RAD 0.0174532925f
-#define MADGWICK_BETA 0.06f
+#define IMU_ACCEL_1G_LSB 16384.0f
+#define MADGWICK_BETA_MOVING 0.08f
+#define MADGWICK_BETA_STILL 0.22f
 
 static const char *TAG = "day_imu";
 
@@ -36,6 +38,9 @@ static float s_q0 = 1.0f;
 static float s_q1;
 static float s_q2;
 static float s_q3;
+static float s_gyro_bias_x_dps;
+static float s_gyro_bias_y_dps;
+static float s_gyro_bias_z_dps;
 static bool s_quat_initialized;
 static day_imu_status_t s_status = {
     .last_error = ESP_ERR_INVALID_STATE,
@@ -118,6 +123,9 @@ esp_err_t day_imu_init(uint32_t sample_rate_hz)
         s_q1 = 0.0f;
         s_q2 = 0.0f;
         s_q3 = 0.0f;
+        s_gyro_bias_x_dps = 0.0f;
+        s_gyro_bias_y_dps = 0.0f;
+        s_gyro_bias_z_dps = 0.0f;
         s_quat_initialized = false;
     }
     return ret;
@@ -134,6 +142,9 @@ void day_imu_set_orientation(uint8_t orientation)
     s_q1 = 0.0f;
     s_q2 = 0.0f;
     s_q3 = 0.0f;
+    s_gyro_bias_x_dps = 0.0f;
+    s_gyro_bias_y_dps = 0.0f;
+    s_gyro_bias_z_dps = 0.0f;
     s_quat_initialized = false;
 }
 
@@ -191,7 +202,25 @@ static float wrap_degrees(float value)
 
 static float gyro_deadband(float dps)
 {
-    return fabsf(dps) < 0.15f ? 0.0f : dps;
+    return fabsf(dps) < 0.03f ? 0.0f : dps;
+}
+
+static bool imu_is_stationary(float ax, float ay, float az, float gx_dps, float gy_dps, float gz_dps)
+{
+    float accel_norm = sqrtf(ax * ax + ay * ay + az * az);
+    float gyro_norm = sqrtf(gx_dps * gx_dps + gy_dps * gy_dps + gz_dps * gz_dps);
+    return fabsf(accel_norm - IMU_ACCEL_1G_LSB) < 1800.0f && gyro_norm < 2.5f;
+}
+
+static void update_gyro_bias(bool stationary, float gx_dps, float gy_dps, float gz_dps)
+{
+    if (!stationary) {
+        return;
+    }
+    const float alpha = 0.01f;
+    s_gyro_bias_x_dps += (gx_dps - s_gyro_bias_x_dps) * alpha;
+    s_gyro_bias_y_dps += (gy_dps - s_gyro_bias_y_dps) * alpha;
+    s_gyro_bias_z_dps += (gz_dps - s_gyro_bias_z_dps) * alpha;
 }
 
 static void normalize_quaternion(void)
@@ -252,7 +281,7 @@ static void update_euler_from_quaternion(void)
     s_yaw_deg = wrap_degrees(atan2f(siny_cosp, cosy_cosp) * RAD_TO_DEG);
 }
 
-static void madgwick_update_imu(float gx, float gy, float gz, float ax, float ay, float az, float dt)
+static void madgwick_update_imu(float gx, float gy, float gz, float ax, float ay, float az, float dt, float beta)
 {
     float q0 = s_q0;
     float q1 = s_q1;
@@ -293,10 +322,10 @@ static void madgwick_update_imu(float gx, float gy, float gz, float ax, float ay
         float step_norm = sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
         if (step_norm > 0.0f) {
             step_norm = 1.0f / step_norm;
-            q_dot0 -= MADGWICK_BETA * s0 * step_norm;
-            q_dot1 -= MADGWICK_BETA * s1 * step_norm;
-            q_dot2 -= MADGWICK_BETA * s2 * step_norm;
-            q_dot3 -= MADGWICK_BETA * s3 * step_norm;
+            q_dot0 -= beta * s0 * step_norm;
+            q_dot1 -= beta * s1 * step_norm;
+            q_dot2 -= beta * s2 * step_norm;
+            q_dot3 -= beta * s3 * step_norm;
         }
     }
 
@@ -347,11 +376,17 @@ esp_err_t day_imu_read(day_imu_sample_t *sample)
     } else if (dt <= 0.0f || dt > 0.25f) {
         init_quaternion_from_accel(ax, ay, az, s_yaw_deg);
     } else {
-        float gx_dps = gyro_deadband(gx * GYRO_DPS_PER_LSB);
-        float gy_dps = gyro_deadband(gy * GYRO_DPS_PER_LSB);
-        float gz_dps = gyro_deadband(gz * GYRO_DPS_PER_LSB);
+        float gx_raw_dps = gx * GYRO_DPS_PER_LSB;
+        float gy_raw_dps = gy * GYRO_DPS_PER_LSB;
+        float gz_raw_dps = gz * GYRO_DPS_PER_LSB;
+        bool stationary = imu_is_stationary(ax, ay, az, gx_raw_dps, gy_raw_dps, gz_raw_dps);
+        update_gyro_bias(stationary, gx_raw_dps, gy_raw_dps, gz_raw_dps);
+        float gx_dps = gyro_deadband(gx_raw_dps - s_gyro_bias_x_dps);
+        float gy_dps = gyro_deadband(gy_raw_dps - s_gyro_bias_y_dps);
+        float gz_dps = gyro_deadband(gz_raw_dps - s_gyro_bias_z_dps);
+        float beta = stationary ? MADGWICK_BETA_STILL : MADGWICK_BETA_MOVING;
         madgwick_update_imu(gx_dps * DEG_TO_RAD, gy_dps * DEG_TO_RAD, gz_dps * DEG_TO_RAD,
-                            ax, ay, az, dt);
+                            ax, ay, az, dt, beta);
     }
     s_last_motion_us = now_us;
     update_euler_from_quaternion();

@@ -110,6 +110,8 @@ static esp_err_t save_config_cb(const day_config_t *config)
     day_config_t next = *config;
     day_config_normalize(&next);
     bool camera_changed = next.camera_framesize != s_config.camera_framesize ||
+                          next.camera_preview_framesize != s_config.camera_preview_framesize ||
+                          next.camera_record_framesize != s_config.camera_record_framesize ||
                           next.camera_jpeg_quality != s_config.camera_jpeg_quality;
     bool audio_changed = next.audio_sample_rate_hz != s_config.audio_sample_rate_hz;
     bool imu_changed = next.imu_sample_rate_hz != s_config.imu_sample_rate_hz ||

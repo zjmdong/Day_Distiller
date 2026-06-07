@@ -6,6 +6,8 @@
 #include "esp_camera.h"
 
 esp_err_t day_camera_init(const day_config_t *cfg);
+esp_err_t day_camera_init_preview(const day_config_t *cfg);
+esp_err_t day_camera_init_record(const day_config_t *cfg);
 void day_camera_deinit(void);
 esp_err_t day_camera_capture(camera_fb_t **out_fb);
 void day_camera_return(camera_fb_t *fb);

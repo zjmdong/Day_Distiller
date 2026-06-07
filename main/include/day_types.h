@@ -22,6 +22,8 @@ typedef struct {
     uint32_t wake_interval_sec;
     bool shake_trigger_enabled;
     int camera_framesize;
+    int camera_preview_framesize;
+    int camera_record_framesize;
     int camera_jpeg_quality;
     uint32_t camera_preview_fps;
     uint32_t camera_record_fps;
@@ -104,6 +106,7 @@ typedef struct {
     bool sta_connected;
     bool time_synced;
     int ap_clients;
+    uint8_t retry_count;
     char ap_ssid[DAY_WIFI_SSID_MAX + 1];
     char sta_ssid[DAY_WIFI_SSID_MAX + 1];
     char ip_addr[16];
