@@ -2,7 +2,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "audio_service.h"
 #include "camera_service.h"
+#include "imu.h"
 #include "recorder.h"
 #include "rtc_clock.h"
 #include "storage_service.h"
@@ -19,6 +21,7 @@ extern const char web_index_html_end[] asm("_binary_index_html_end");
 static const char *TAG = "day_web";
 
 #define DAY_STATUS_JSON_LEN 4400
+#define DAY_LIVE_JSON_LEN 1200
 #define DAY_FILES_JSON_LEN 1800
 #define DAY_WIFI_SCAN_JSON_LEN 2000
 
@@ -130,6 +133,31 @@ static void status_to_json(const day_device_status_t *st, char *buf, size_t len)
              boolstr(st->wifi.ap_running), boolstr(st->wifi.sta_connected), boolstr(st->wifi.time_synced),
              st->wifi.ap_clients, st->wifi.ap_ssid, st->wifi.sta_ssid, st->wifi.ip_addr,
              esp_err_to_name(st->wifi.last_error));
+}
+
+static void live_to_json(const day_device_status_t *st, char *buf, size_t len)
+{
+    char wave_json[360];
+    audio_waveform_to_json(&st->audio, wave_json, sizeof(wave_json));
+    snprintf(buf, len,
+             "{"
+             "\"live\":true,"
+             "\"recording\":%s,"
+             "\"camera\":{\"streaming\":%s,\"fps\":%.1f},"
+             "\"audio\":{\"initialized\":%s,\"rate\":%lu,\"rms\":%.4f,\"peak\":%.4f,\"wave\":%s,\"err\":\"%s\"},"
+             "\"imu\":{\"present\":%s,\"ax\":%d,\"ay\":%d,\"az\":%d,\"gx\":%d,\"gy\":%d,\"gz\":%d,"
+             "\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f,"
+             "\"q0\":%.6f,\"q1\":%.6f,\"q2\":%.6f,\"q3\":%.6f,\"err\":\"%s\"}"
+             "}",
+             boolstr(st->recording_active),
+             boolstr(st->camera.streaming), st->camera.fps,
+             boolstr(st->audio.initialized), (unsigned long)st->audio.sample_rate_hz,
+             st->audio.rms, st->audio.peak, wave_json, esp_err_to_name(st->audio.last_error),
+             boolstr(st->imu.present), st->imu.last_sample.ax, st->imu.last_sample.ay, st->imu.last_sample.az,
+             st->imu.last_sample.gx, st->imu.last_sample.gy, st->imu.last_sample.gz,
+             st->imu.last_sample.roll_deg, st->imu.last_sample.pitch_deg, st->imu.last_sample.yaw_deg,
+             st->imu.last_sample.q0, st->imu.last_sample.q1, st->imu.last_sample.q2, st->imu.last_sample.q3,
+             esp_err_to_name(st->imu.last_error));
 }
 
 static esp_err_t status_handler(httpd_req_t *req)
@@ -502,7 +530,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
 static void telemetry_task(void *arg)
 {
     day_device_status_t *status = calloc(1, sizeof(*status));
-    char *json = malloc(DAY_STATUS_JSON_LEN);
+    char *json = malloc(DAY_LIVE_JSON_LEN);
     if (!status || !json) {
         ESP_LOGE(TAG, "telemetry alloc failed");
         free(status);
@@ -516,10 +544,26 @@ static void telemetry_task(void *arg)
             continue;
         }
         memset(status, 0, sizeof(*status));
-        if (s_cb.get_status) {
-            s_cb.get_status(status);
+        status->recording_active = day_recorder_is_active();
+        status->camera = day_camera_get_status();
+        bool fast_sensors_enabled = !status->recording_active && !status->camera.streaming && s_cb.config;
+        if (fast_sensors_enabled) {
+            day_imu_sample_t sample;
+            if (day_imu_read(&sample) == ESP_OK) {
+                (void)sample;
+            }
+            int16_t audio_samples[64];
+            size_t got = 0;
+            if (day_audio_start(s_cb.config->audio_sample_rate_hz) == ESP_OK) {
+                esp_err_t ret = day_audio_read_pcm16(audio_samples, 64, &got, 8);
+                if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) {
+                    ESP_LOGD(TAG, "live audio sample failed: %s", esp_err_to_name(ret));
+                }
+            }
         }
-        status_to_json(status, json, DAY_STATUS_JSON_LEN);
+        status->imu = day_imu_get_status();
+        status->audio = day_audio_get_status();
+        live_to_json(status, json, DAY_LIVE_JSON_LEN);
         httpd_ws_frame_t frame = {
             .type = HTTPD_WS_TYPE_TEXT,
             .payload = (uint8_t *)json,

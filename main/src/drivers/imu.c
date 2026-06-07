@@ -369,17 +369,20 @@ esp_err_t day_imu_read(day_imu_sample_t *sample)
     return ESP_OK;
 }
 
-esp_err_t day_imu_write_json_sample(FILE *file, const day_imu_sample_t *sample, bool first)
+esp_err_t day_imu_write_json_sample(FILE *file, const day_imu_sample_t *sample, uint32_t id, bool first)
 {
     if (!file || !sample) {
         return ESP_ERR_INVALID_ARG;
     }
     fprintf(file,
-            "%s{\"t_us\":%lld,\"ax\":%d,\"ay\":%d,\"az\":%d,\"gx\":%d,\"gy\":%d,\"gz\":%d,"
-            "\"roll\":%.3f,\"pitch\":%.3f,\"yaw\":%.3f,"
-            "\"q0\":%.6f,\"q1\":%.6f,\"q2\":%.6f,\"q3\":%.6f}",
-            first ? "" : ",",
+            "%s    {\"id\":%lu,\"time_us\":%lld,\"time_s\":%.6f,"
+            "\"raw\":{\"ax\":%d,\"ay\":%d,\"az\":%d,\"gx\":%d,\"gy\":%d,\"gz\":%d},"
+            "\"pose\":{\"roll\":%.3f,\"pitch\":%.3f,\"yaw\":%.3f},"
+            "\"quat\":{\"q0\":%.6f,\"q1\":%.6f,\"q2\":%.6f,\"q3\":%.6f}}",
+            first ? "" : ",\n",
+            (unsigned long)id,
             (long long)sample->t_us,
+            (double)sample->t_us / 1000000.0,
             sample->ax, sample->ay, sample->az,
             sample->gx, sample->gy, sample->gz,
             sample->roll_deg, sample->pitch_deg, sample->yaw_deg,

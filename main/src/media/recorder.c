@@ -220,11 +220,15 @@ static void imu_task(void *arg)
         if (!file) {
             ret = ESP_FAIL;
         } else {
-            fprintf(file, "{\"sample_rate_hz\":%lu,\"samples\":[", (unsigned long)sample_rate);
+            fprintf(file,
+                    "{\n"
+                    "  \"sample_rate_hz\":%lu,\n"
+                    "  \"samples\":[\n",
+                    (unsigned long)sample_rate);
             for (size_t i = 0; i < sample_count; ++i) {
-                day_imu_write_json_sample(file, &samples[i], i == 0);
+                day_imu_write_json_sample(file, &samples[i], (uint32_t)i, i == 0);
             }
-            fprintf(file, "]}");
+            fprintf(file, "\n  ]\n}\n");
             fclose(file);
             ctx->imu_samples = (uint32_t)sample_count;
         }

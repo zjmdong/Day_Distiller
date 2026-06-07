@@ -363,6 +363,9 @@
     let currentStatus = null;
     let selectedAp = "";
     let forceProvision = false;
+    let latestLive = null;
+    let liveFramePending = false;
+    let lastLiveTextMs = 0;
     const audioHistory = Array(180).fill(0);
 
     function errText(v) { return !v || v === "ESP_OK" ? "正常" : v; }
@@ -436,6 +439,58 @@
       let r22 = 1 - 2 * (xx + yy);
       r01 = -r01; r10 = -r10; r12 = -r12; r21 = -r21;
       return `matrix3d(${r00},${r10},${r20},0,${r01},${r11},${r21},0,${r02},${r12},${r22},0,0,0,0,1)`;
+    }
+    function queueLiveFrame(s) {
+      latestLive = s;
+      if (!liveFramePending) {
+        liveFramePending = true;
+        requestAnimationFrame(renderLiveFrame);
+      }
+    }
+    function renderLiveFrame(now) {
+      liveFramePending = false;
+      const s = latestLive;
+      if (!s) return;
+      if (!previewActive && s.imu) {
+        deviceModel.style.transform = quaternionToCssMatrix(s.imu.q0, s.imu.q1, s.imu.q2, s.imu.q3);
+      }
+      if (!previewActive && s.audio) {
+        drawAudioWave(s.audio.wave || []);
+      }
+      if (now - lastLiveTextMs < 120) return;
+      lastLiveTextMs = now;
+      if (s.recording !== undefined) {
+        setTop(s.recording ? "正在录制" : "设备在线", true);
+        $("recordState").textContent = s.recording ? "正在录制 5 秒" : $("recordState").textContent;
+      }
+      if (s.camera) {
+        $("cameraFps").textContent = cameraFpsText(s.camera.fps);
+        if (s.camera.streaming && previewActive) $("previewState").textContent = "预览运行中";
+      }
+      if (s.imu) {
+        $("imuState").textContent = s.imu.present ? errText(s.imu.err) : `未检测 / ${errText(s.imu.err)}`;
+        $("poseValue").textContent = `X ${fixed(s.imu.roll, 1)} / Y ${fixed(s.imu.pitch, 1)} / Z ${fixed(s.imu.yaw, 1)}`;
+        $("accelValue").textContent = `${s.imu.ax}, ${s.imu.ay}, ${s.imu.az}`;
+        $("gyroValue").textContent = `${s.imu.gx}, ${s.imu.gy}, ${s.imu.gz}`;
+      }
+      if (s.audio) {
+        $("audioState").textContent = s.audio.initialized ? `${s.audio.rate} Hz / ${errText(s.audio.err)}` : `未初始化 / ${errText(s.audio.err)}`;
+        $("audioRms").textContent = fixed(s.audio.rms, 4);
+        $("audioPeak").textContent = fixed(s.audio.peak, 4);
+      }
+      if (previewActive) {
+        $("audioState").textContent = "摄像头预览开启，音频波形临时停用";
+        $("imuState").textContent = "摄像头预览开启，运动预览临时停用";
+      }
+    }
+    function applyLive(s) {
+      if (currentStatus) {
+        currentStatus.recording = s.recording;
+        if (s.camera) Object.assign(currentStatus.camera, s.camera);
+        if (s.audio) Object.assign(currentStatus.audio, s.audio);
+        if (s.imu) Object.assign(currentStatus.imu, s.imu);
+      }
+      queueLiveFrame(s);
     }
     function startPreview() {
       previewActive = true;
@@ -643,9 +698,12 @@
     function connectWs() {
       try {
         ws = new WebSocket(`ws://${location.host}/ws/telemetry`);
-        ws.onmessage = e => applyStatus(JSON.parse(e.data));
+        ws.onmessage = e => {
+          const data = JSON.parse(e.data);
+          data.live ? applyLive(data) : applyStatus(data);
+        };
         ws.onclose = () => setTimeout(connectWs, 1200);
-      } catch(e) { setInterval(poll, 1500); }
+      } catch(e) { setInterval(poll, 5000); }
     }
     $("previewBtn").onclick = () => previewActive ? stopPreview() : startPreview();
     $("recordBtn").onclick = startRecord;
@@ -663,7 +721,7 @@
     $("preview").onerror = () => { if (previewActive) $("previewState").textContent = "预览连接失败"; };
 
     loadConfig(); poll(); loadFiles(); connectWs(); stopPreview();
-    setInterval(poll, 1500);
+    setInterval(poll, 5000);
     setInterval(loadFiles, 12000);
   </script>
 </body>
