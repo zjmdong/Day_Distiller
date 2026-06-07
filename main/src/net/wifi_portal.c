@@ -334,6 +334,7 @@ esp_err_t day_wifi_scan_json(char *buffer, size_t len)
                                "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d}",
                                i == 0 ? "" : ",", ssid, aps[i].rssi, aps[i].authmode);
         if (written < 0 || (size_t)written >= len - used) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_restore_portal_ap_only());
             return ESP_ERR_NO_MEM;
         }
         used += (size_t)written;

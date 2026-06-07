@@ -539,16 +539,22 @@
       const configured = !!(c && c.wifi_configured);
       const connected = !!(s && s.wifi && s.wifi.sta);
       const timeOk = !!(s && s.wifi && s.wifi.time_synced);
-      const healthy = configured && connected && timeOk;
-      const needProvision = !configured || forceProvision || (configured && s && !healthy);
+      const opActive = !!(s && s.wifi && s.wifi.op_active);
+      const opOk = !!(s && s.wifi && s.wifi.op_ok && s.wifi.op_time_synced);
+      const healthy = configured && (opOk || (connected && timeOk));
+      const needProvision = !configured || forceProvision || opActive || (configured && s && !healthy);
       $("provisionSection").hidden = !needProvision;
       $("wifiInfoSection").hidden = !configured && !forceProvision;
       $("savedSsid").value = c ? (c.wifi_ssid || "") : "";
       $("savedPassword").value = c ? (c.wifi_password || "") : "";
-      $("wifiConnState").textContent = connected ? (timeOk ? "已联网并完成对时" : "已联网，对时失败") : "未连接";
+      $("wifiConnState").textContent = opActive ? "正在配网/对时" :
+        (opOk ? "最近配网成功，对时成功" : (connected ? (timeOk ? "已联网并完成对时" : "已联网，对时失败") : "未连接"));
       if (!configured) {
         $("provisionHint").className = "banner warn";
         $("provisionHint").lastElementChild.textContent = "设备还没有保存 Wi-Fi，请先完成配网。";
+      } else if (opActive) {
+        $("provisionHint").className = "banner warn";
+        $("provisionHint").lastElementChild.textContent = "正在连接 Wi-Fi 并进行 NTP 对时，热点可能会短暂重连。";
       } else if (!healthy) {
         $("provisionHint").className = "banner bad";
         $("provisionHint").lastElementChild.textContent = connected ? "Wi-Fi 已连接但对时失败，请重新配网或检查 NTP 设置。" : "保存的 Wi-Fi 连接失败，请重新配网。";
@@ -572,7 +578,7 @@
       $("batteryState").textContent = `${fixed(s.battery.soc, 1)}% / ${fixed(s.battery.voltage, 2)} V`;
       $("rtcState").textContent = s.rtc.valid ? s.rtc.iso : `无效 / ${errText(s.rtc.err)}`;
       $("wifiState").textContent = s.wifi.ap ? `${s.wifi.ap_ssid} / ${s.wifi.clients} 台` : (s.wifi.sta ? s.wifi.ip : "关闭");
-      $("ntpState").textContent = s.wifi.time_synced ? "已完成" : errText(s.wifi.err);
+      $("ntpState").textContent = s.wifi.op_active ? "正在对时" : ((s.wifi.time_synced || s.wifi.op_time_synced) ? "已完成" : errText(s.wifi.op_error || s.wifi.err));
       $("imuState").textContent = s.imu.present ? errText(s.imu.err) : `未检测 / ${errText(s.imu.err)}`;
       $("poseValue").textContent = `X ${fixed(s.imu.roll, 1)} / Y ${fixed(s.imu.pitch, 1)} / Z ${fixed(s.imu.yaw, 1)}`;
       $("accelValue").textContent = `${s.imu.ax}, ${s.imu.ay}, ${s.imu.az}`;
@@ -685,23 +691,54 @@
         $("provisionLog").textContent = data.ok ? "扫描完成" : "扫描失败";
       } catch(e) { $("provisionLog").textContent = "扫描失败"; }
     }
+    async function waitForWifiOp(logId) {
+      for (let i = 0; i < 24; i++) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        try {
+          const s = await fetch("/api/status", {cache:"no-store"}).then(r => r.json());
+          applyStatus(s);
+          const w = s.wifi || {};
+          if (w.op_active) {
+            $(logId).textContent = "正在连接并对时，热点可能短暂重连";
+            continue;
+          }
+          if (w.op_ok && w.op_time_synced) {
+            return {ok:true};
+          }
+          return {ok:false, error:w.op_error || w.err || "ESP_FAIL"};
+        } catch(e) {
+          $(logId).textContent = "等待设备热点恢复";
+        }
+      }
+      return {ok:false, error:"ESP_ERR_TIMEOUT"};
+    }
     async function provisionWifi() {
       if (!selectedAp) return;
       $("provisionBtn").disabled = true;
-      $("provisionLog").textContent = "正在连接并对时";
+      $("provisionLog").textContent = "正在启动配网";
       const body = {ssid:selectedAp, password:$("provPassword").value};
       const r = await fetch("/api/wifi/connect", {method:"POST", body: JSON.stringify(body)})
-        .then(r => r.json()).catch(() => ({ok:false, connected:false, time_synced:false, error:"请求失败"}));
-      await loadConfig();
+        .then(r => r.json()).catch(() => ({ok:true, started:true, maybe_lost:true}));
+      if (!r.ok && !r.started) {
+        forceProvision = true;
+        $("provisionBtn").disabled = false;
+        $("provisionLog").textContent = `启动失败：${r.error || "未知错误"}`;
+        showNotice("Wi-Fi 配网任务启动失败。", "bad");
+        updateProvisionUi();
+        return;
+      }
+      $("provisionLog").textContent = "已开始配网，请等待";
+      const done = await waitForWifiOp("provisionLog");
+      await loadConfig().catch(() => {});
       await poll();
-      if (r.ok && r.connected && r.time_synced) {
+      if (done.ok) {
         forceProvision = false;
         $("provisionLog").textContent = "连接成功，对时成功";
         showNotice("Wi-Fi 连接成功，对时成功。", "ok");
       } else {
         forceProvision = true;
         $("provisionBtn").disabled = false;
-        $("provisionLog").textContent = `失败：${r.error || "未知错误"}`;
+        $("provisionLog").textContent = `失败：${done.error || "未知错误"}`;
         showNotice("Wi-Fi 连接或 NTP 对时失败，请重新配网。", "bad");
       }
       updateProvisionUi();
@@ -710,8 +747,14 @@
       $("timeLog").textContent = "正在保存并对时";
       const saved = await saveConfig("timeLog");
       if (!saved) return;
-      const r = await fetch("/api/time/sync", {method:"POST"}).then(r => r.json()).catch(() => ({ok:false, error:"请求失败"}));
-      $("timeLog").textContent = r.ok ? "对时成功" : `对时失败：${r.error || "未知错误"}`;
+      const r = await fetch("/api/time/sync", {method:"POST"}).then(r => r.json()).catch(() => ({ok:true, started:true, maybe_lost:true}));
+      if (!r.ok && !r.started) {
+        $("timeLog").textContent = `启动失败：${r.error || "未知错误"}`;
+        return;
+      }
+      $("timeLog").textContent = "已开始对时，请等待";
+      const done = await waitForWifiOp("timeLog");
+      $("timeLog").textContent = done.ok ? "对时成功" : `对时失败：${done.error || "未知错误"}`;
       await poll();
     }
     function connectWs() {

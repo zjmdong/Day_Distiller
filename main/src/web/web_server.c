@@ -33,13 +33,27 @@ static day_web_callbacks_t s_cb;
 static int s_ws_clients[4] = {-1, -1, -1, -1};
 static volatile bool s_record_request_active;
 static volatile bool s_ws_send_pending;
+static volatile bool s_wifi_op_active;
+static esp_err_t s_wifi_op_last_error = ESP_ERR_INVALID_STATE;
+static bool s_wifi_op_connected;
+static bool s_wifi_op_time_synced;
 static uint32_t s_live_seq;
 
 static void record_request_task(void *arg);
+static void wifi_op_task(void *arg);
+static void close_ws_clients(void);
+
+typedef struct {
+    bool connect;
+    char ssid[DAY_WIFI_SSID_MAX + 1];
+    char password[DAY_WIFI_PASSWORD_MAX + 1];
+} wifi_op_ctx_t;
 
 static void json_send(httpd_req_t *req, const char *json)
 {
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_sendstr(req, json);
 }
 
@@ -116,7 +130,8 @@ static void status_to_json(const day_device_status_t *st, char *buf, size_t len)
              "\"imu\":{\"present\":%s,\"ax\":%d,\"ay\":%d,\"az\":%d,\"gx\":%d,\"gy\":%d,\"gz\":%d,"
              "\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f,"
              "\"q0\":%.6f,\"q1\":%.6f,\"q2\":%.6f,\"q3\":%.6f,\"err\":\"%s\"},"
-             "\"wifi\":{\"ap\":%s,\"sta\":%s,\"time_synced\":%s,\"clients\":%d,\"ap_ssid\":\"%s\",\"sta_ssid\":\"%s\",\"ip\":\"%s\",\"err\":\"%s\"}"
+             "\"wifi\":{\"ap\":%s,\"sta\":%s,\"time_synced\":%s,\"clients\":%d,\"ap_ssid\":\"%s\",\"sta_ssid\":\"%s\",\"ip\":\"%s\","
+             "\"op_active\":%s,\"op_ok\":%s,\"op_connected\":%s,\"op_time_synced\":%s,\"op_error\":\"%s\",\"err\":\"%s\"}"
              "}",
              boolstr(st->recording_active),
              esp_err_to_name(st->last_record_error),
@@ -136,6 +151,8 @@ static void status_to_json(const day_device_status_t *st, char *buf, size_t len)
              esp_err_to_name(st->imu.last_error),
              boolstr(st->wifi.ap_running), boolstr(st->wifi.sta_connected), boolstr(st->wifi.time_synced),
              st->wifi.ap_clients, st->wifi.ap_ssid, st->wifi.sta_ssid, st->wifi.ip_addr,
+             boolstr(s_wifi_op_active), boolstr(s_wifi_op_last_error == ESP_OK),
+             boolstr(s_wifi_op_connected), boolstr(s_wifi_op_time_synced), esp_err_to_name(s_wifi_op_last_error),
              esp_err_to_name(st->wifi.last_error));
 }
 
@@ -442,47 +459,59 @@ static esp_err_t wifi_connect_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     json_string(body, "password", pass, sizeof(pass));
-    ret = day_wifi_save_credentials_and_connect(s_cb.config, ssid, pass);
-    if (ret == ESP_OK) {
-        time_t now = 0;
-        time(&now);
-        if (now > 1609459200) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(day_rtc_write_time(now));
-        }
+    if (s_wifi_op_active) {
+        json_send(req, "{\"ok\":false,\"busy\":true,\"error\":\"ESP_ERR_INVALID_STATE\"}");
+        return ESP_OK;
     }
-    day_wifi_status_t wifi = day_wifi_get_status();
-    char json[180];
-    snprintf(json, sizeof(json),
-             "{\"ok\":%s,\"connected\":%s,\"time_synced\":%s,\"error\":\"%s\"}",
-             boolstr(ret == ESP_OK),
-             boolstr(wifi.sta_connected),
-             boolstr(wifi.time_synced),
-             esp_err_to_name(ret));
-    json_send(req, json);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_restore_portal_ap_only());
+    wifi_op_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+    ctx->connect = true;
+    strlcpy(ctx->ssid, ssid, sizeof(ctx->ssid));
+    strlcpy(ctx->password, pass, sizeof(ctx->password));
+    s_wifi_op_active = true;
+    s_wifi_op_last_error = ESP_ERR_INVALID_STATE;
+    s_wifi_op_connected = false;
+    s_wifi_op_time_synced = false;
+    BaseType_t ok = xTaskCreate(wifi_op_task, "wifi_op", 4096, ctx, 5, NULL);
+    if (ok != pdPASS) {
+        s_wifi_op_active = false;
+        free(ctx);
+        json_send(req, "{\"ok\":false,\"error\":\"ESP_ERR_NO_MEM\"}");
+        return ESP_OK;
+    }
+    json_send(req, "{\"ok\":true,\"started\":true}");
+    httpd_sess_trigger_close(req->handle, httpd_req_to_sockfd(req));
     return ESP_OK;
 }
 
 static esp_err_t time_sync_handler(httpd_req_t *req)
 {
-    esp_err_t ret = day_wifi_sync_time(s_cb.config);
-    if (ret == ESP_OK) {
-        time_t now = 0;
-        time(&now);
-        if (now > 1609459200) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(day_rtc_write_time(now));
-        }
+    if (s_wifi_op_active) {
+        json_send(req, "{\"ok\":false,\"busy\":true,\"error\":\"ESP_ERR_INVALID_STATE\"}");
+        return ESP_OK;
     }
-    day_wifi_status_t wifi = day_wifi_get_status();
-    char json[180];
-    snprintf(json, sizeof(json),
-             "{\"ok\":%s,\"connected\":%s,\"time_synced\":%s,\"error\":\"%s\"}",
-             boolstr(ret == ESP_OK),
-             boolstr(wifi.sta_connected),
-             boolstr(wifi.time_synced),
-             esp_err_to_name(ret));
-    json_send(req, json);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_restore_portal_ap_only());
+    wifi_op_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+    ctx->connect = false;
+    s_wifi_op_active = true;
+    s_wifi_op_last_error = ESP_ERR_INVALID_STATE;
+    s_wifi_op_connected = false;
+    s_wifi_op_time_synced = false;
+    BaseType_t ok = xTaskCreate(wifi_op_task, "wifi_op", 4096, ctx, 5, NULL);
+    if (ok != pdPASS) {
+        s_wifi_op_active = false;
+        free(ctx);
+        json_send(req, "{\"ok\":false,\"error\":\"ESP_ERR_NO_MEM\"}");
+        return ESP_OK;
+    }
+    json_send(req, "{\"ok\":true,\"started\":true}");
+    httpd_sess_trigger_close(req->handle, httpd_req_to_sockfd(req));
     return ESP_OK;
 }
 
@@ -501,6 +530,36 @@ static void record_request_task(void *arg)
     esp_err_t ret = s_cb.record_once ? s_cb.record_once() : ESP_ERR_NOT_SUPPORTED;
     ESP_LOGI(TAG, "web record request finished: %s", esp_err_to_name(ret));
     s_record_request_active = false;
+    vTaskDelete(NULL);
+}
+
+static void wifi_op_task(void *arg)
+{
+    wifi_op_ctx_t *ctx = arg;
+    close_ws_clients();
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    esp_err_t ret = ESP_ERR_INVALID_ARG;
+    if (ctx) {
+        ret = ctx->connect ? day_wifi_save_credentials_and_connect(s_cb.config, ctx->ssid, ctx->password)
+                           : day_wifi_sync_time(s_cb.config);
+    }
+    if (ret == ESP_OK) {
+        time_t now = 0;
+        time(&now);
+        if (now > 1609459200) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(day_rtc_write_time(now));
+        }
+    }
+    day_wifi_status_t wifi = day_wifi_get_status();
+    s_wifi_op_connected = wifi.sta_connected;
+    s_wifi_op_time_synced = wifi.time_synced;
+    s_wifi_op_last_error = ret;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_restore_portal_ap_only());
+    ESP_LOGI(TAG, "wifi op finished connect=%s ret=%s synced=%s",
+             boolstr(ctx && ctx->connect), esp_err_to_name(ret), boolstr(s_wifi_op_time_synced));
+    s_wifi_op_active = false;
+    free(ctx);
     vTaskDelete(NULL);
 }
 
@@ -542,6 +601,21 @@ static void remove_ws_fd(int fd)
     for (size_t i = 0; i < sizeof(s_ws_clients) / sizeof(s_ws_clients[0]); ++i) {
         if (s_ws_clients[i] == fd) {
             remove_ws_client(i);
+        }
+    }
+}
+
+static void close_ws_clients(void)
+{
+    s_ws_send_pending = false;
+    if (!s_server) {
+        return;
+    }
+    for (size_t i = 0; i < sizeof(s_ws_clients) / sizeof(s_ws_clients[0]); ++i) {
+        int fd = s_ws_clients[i];
+        s_ws_clients[i] = -1;
+        if (fd >= 0) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_sess_trigger_close(s_server, fd));
         }
     }
 }
