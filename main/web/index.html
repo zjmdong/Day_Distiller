@@ -495,6 +495,9 @@
         liveRxCount = 0;
         liveHzWindowMs = now;
       }
+      if (!previewActive) {
+        $("previewState").textContent = liveHz > 0 ? `实时遥测 ${liveHz.toFixed(0)} Hz` : "实时遥测接收中";
+      }
       if (currentStatus) {
         currentStatus.recording = s.recording;
         if (s.camera) Object.assign(currentStatus.camera, s.camera);
@@ -709,6 +712,10 @@
     function connectWs() {
       try {
         ws = new WebSocket(`ws://${location.host}/ws/telemetry`);
+        ws.onopen = () => {
+          if (!previewActive) $("previewState").textContent = "实时遥测连接中";
+          try { ws.send("hello"); } catch(e) {}
+        };
         ws.onmessage = e => {
           const data = JSON.parse(e.data);
           data.live ? applyLive(data) : applyStatus(data);

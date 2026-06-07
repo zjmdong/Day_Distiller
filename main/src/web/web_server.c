@@ -16,9 +16,6 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "lwip/sockets.h"
-#include "lwip/tcp.h"
-#include "sys/time.h"
 #include <time.h>
 
 extern const char web_index_html_start[] asm("_binary_index_html_start");
@@ -508,8 +505,21 @@ static void record_request_task(void *arg)
     vTaskDelete(NULL);
 }
 
+static bool is_ws_client(int fd)
+{
+    for (size_t i = 0; i < sizeof(s_ws_clients) / sizeof(s_ws_clients[0]); ++i) {
+        if (s_ws_clients[i] == fd) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void add_ws_client(int fd)
 {
+    if (is_ws_client(fd)) {
+        return;
+    }
     /* Keep only the newest live dashboard. Hidden captive-portal tabs otherwise
      * keep stale sockets that can block high-rate telemetry sends.
      */
@@ -517,21 +527,8 @@ static void add_ws_client(int fd)
         s_ws_clients[i] = -1;
     }
     s_ws_clients[0] = fd;
-}
-
-static void configure_ws_socket(int fd)
-{
-    int nodelay = 1;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
-        ESP_LOGW(TAG, "TCP_NODELAY failed fd=%d errno=%d", fd, errno);
-    }
-    struct timeval send_timeout = {
-        .tv_sec = 0,
-        .tv_usec = 80000,
-    };
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout)) < 0) {
-        ESP_LOGW(TAG, "SO_SNDTIMEO failed fd=%d errno=%d", fd, errno);
-    }
+    s_ws_send_pending = false;
+    ESP_LOGI(TAG, "telemetry websocket client fd=%d", fd);
 }
 
 static void remove_ws_client(size_t index)
@@ -563,9 +560,10 @@ static bool has_ws_clients(void)
 static esp_err_t ws_handler(httpd_req_t *req)
 {
     int fd = httpd_req_to_sockfd(req);
+    if (fd < 0) {
+        return ESP_FAIL;
+    }
     add_ws_client(fd);
-    s_ws_send_pending = false;
-    configure_ws_socket(fd);
     if (req->method == HTTP_GET) {
         return ESP_OK;
     }
@@ -573,10 +571,18 @@ static esp_err_t ws_handler(httpd_req_t *req)
         .type = HTTPD_WS_TYPE_TEXT,
     };
     esp_err_t ret = httpd_ws_recv_frame(req, &pkt, 0);
-    if (ret == ESP_OK && pkt.len > 0) {
-        uint8_t drain[32];
+    if (ret != ESP_OK) {
+        remove_ws_fd(fd);
+        return ESP_OK;
+    }
+    if (pkt.len > 0) {
+        uint8_t drain[64];
         pkt.payload = drain;
-        httpd_ws_recv_frame(req, &pkt, sizeof(drain));
+        ret = httpd_ws_recv_frame(req, &pkt, sizeof(drain));
+        if (ret != ESP_OK) {
+            remove_ws_fd(fd);
+            return ESP_OK;
+        }
     }
     return ESP_OK;
 }
@@ -615,10 +621,10 @@ static void telemetry_task(void *arg)
             if (day_imu_read(&sample) == ESP_OK) {
                 (void)sample;
             }
-            int16_t audio_samples[64];
+            int16_t audio_samples[32];
             size_t got = 0;
             if (day_audio_start(s_cb.config->audio_sample_rate_hz) == ESP_OK) {
-                esp_err_t ret = day_audio_read_pcm16(audio_samples, 64, &got, 8);
+                esp_err_t ret = day_audio_read_pcm16(audio_samples, 32, &got, 2);
                 if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) {
                     ESP_LOGD(TAG, "live audio sample failed: %s", esp_err_to_name(ret));
                 }
