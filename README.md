@@ -32,7 +32,16 @@ Double-click `RunClient.bat`, or run:
 ```
 
 The first launch creates `.venv` and installs Python dependencies. This can
-take a few minutes.
+take a few minutes. The script tries Python 3.11 from the system first, then
+falls back to the ESP-IDF Python environment installed on this machine.
+
+If Windows reports `No suitable Python runtime found`, install Python 3.11 or
+point the script at an existing Python runtime:
+
+```powershell
+$env:DAY_DISTILLER_PYTHON="D:\ESP-IDF\.espressif\python_env\idf6.0_py3.11_env\Scripts\python.exe"
+.\RunClient.bat
+```
 
 ## Test
 
