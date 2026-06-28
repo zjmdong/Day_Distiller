@@ -1,5 +1,11 @@
 menu "Day Distiller"
 
+    config DAY_USB_LINK_ENABLED
+        bool "Enable USB Link maintenance interface"
+        default y
+        help
+            Enables the TinyUSB CDC protocol interface and optional USB MSC TF-card exposure mode.
+
     config ESP_ENABLE_DHCP_CAPTIVEPORTAL
         bool "Advertise captive portal URL in DHCP option 114"
         default y

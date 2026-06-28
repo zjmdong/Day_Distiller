@@ -15,6 +15,7 @@
 #include "recorder.h"
 #include "rtc_clock.h"
 #include "storage_service.h"
+#include "usb_link.h"
 #include "web_server.h"
 #include "wifi_portal.h"
 #include "esp_log.h"
@@ -182,6 +183,13 @@ static bool is_automatic_wakeup(uint32_t wakeup_causes)
 
 void day_app_run(void)
 {
+    if (day_usb_link_should_run_msc_mode()) {
+        day_usb_link_run_msc_mode();
+        return;
+    }
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_usb_link_start_serial_mode());
+
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(day_config_load(&s_config));
     apply_runtime_config(&s_config);
@@ -228,8 +236,15 @@ void day_app_run(void)
         ESP_LOGW(TAG, "battery below threshold, skipping record");
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_LOW_BATTERY));
         vTaskDelay(pdMS_TO_TICKS(1200));
-    } else if (s_config.auto_record_enabled) {
+    } else if (s_config.auto_record_enabled && !day_usb_link_maintenance_active()) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(record_once_cb());
+    }
+
+    if (day_usb_link_maintenance_active()) {
+        ESP_LOGI(TAG, "USB Link maintenance active; staying awake");
+        while (day_usb_link_maintenance_active()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
     }
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_power_enter_deep_sleep(&s_config));
