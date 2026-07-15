@@ -1,112 +1,58 @@
-# Day Distiller Windows Client
+# Day Distiller Windows Client v2
 
-Day Distiller USB Link Windows upper-computer client.
+Day Distiller 的 Windows 上位机与“AI 每日蒸馏”工作流。当前版本直接兼容协议 v1 固件，不要求先升级设备。
 
-This branch intentionally contains only the host client. Firmware changes live
-on the `usb-link-main` branch.
+## 已实现
 
-## Features
+- 五页 PySide6 应用：设备、今日记录、蒸馏进度、报告历史、设置。
+- 现有固件 `HELLO`、`GET_STATUS`、只读/读写 MSC、`PING` 和安全弹出。
+- 按日期导入 `REC_XXXX_YYMMDD_HHMMSS`，复制后进行大小与 SHA-256 双重校验。
+- SQLite 可恢复任务状态机；失败记录错误与恢复阶段。
+- FFprobe/FFmpeg 媒体验证、0.5/2.5/4.5 秒关键帧与场景变化补帧。
+- IMU 特征、启发式活动/携带形态分类，以及可加载的 scikit-learn 模型。
+- OpenAI 结构化逐片理解、全天综合、音频转写和无文字漫画生图。
+- 确定性 Mock AI 与本地 `.eml` outbox，可在没有 API Key、SMTP 或设备时验收。
+- 同版 HTML/PDF、SMTP、确定性 Message-ID、发送回执和邮件成功后的精确设备清理。
+- 日报修改、地点记忆、重新生成和手动再次发送。
 
-- Scan serial ports for the Day Distiller protocol CDC interface.
-- Perform `HELLO`, `GET_STATUS`, `ENTER_MSC`, and `EXIT_MSC`.
-- Detect newly mounted removable drives on Windows.
-- Best-effort safe eject through the Windows Shell COM API.
-- PySide6 UI for connection state, TF card status, access mode, entering MSC,
-  ejecting, and exiting back to serial mode.
-
-## Install
+## 快速开始
 
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -U pip
 python -m pip install -e .[dev]
-```
-
-## Run
-
-Double-click `RunClient.bat`, or run:
-
-```powershell
 .\scripts\run.ps1
 ```
 
-The first launch creates `.venv` and installs Python dependencies. This can
-take a few minutes. The script tries Python 3.11 from the system first, then
-falls back to the ESP-IDF Python environment installed on this machine.
+首次验收建议在“蒸馏进度”选择“离线 Mock”，在“今日记录”选择一个虚拟 TF 卡目录。Mock 不发送任何素材到云端，邮件写入 `%LOCALAPPDATA%\DayDistillerV2\mock_outbox`。
 
-If Windows reports `No suitable Python runtime found`, install Python 3.11 or
-point the script at an existing Python runtime:
+真实模式请依次阅读：
+
+- [OpenAI 配置](docs/openai-setup.md)
+- [SMTP 配置](docs/smtp-setup.md)
+- [漫画参考形象](docs/avatar-setup.md)
+- [IMU 数据采集与训练](docs/imu-data-collection.md)
+- [USB、TF 卡与 FFmpeg 排障](docs/usb-ffmpeg-troubleshooting.md)
+
+不要在聊天、配置文件、截图或 Git 中提交 API Key 和应用密码；只在应用“设置”页填写。
+
+## 当前设备的一键流程
+
+1. 连接设备，应用执行 `HELLO` 和 `GET_STATUS`。
+2. 以只读模式进入 MSC，导入所选日期并生成 `import_manifest.json`。
+3. 校验本地文件，安全弹出并退出 MSC；生成期间每 30 秒发送一次 `PING`。
+4. 完成本地分析、云端生成、HTML/PDF 与邮件发送。
+5. 只有 SMTP 明确接受邮件后，才重新以读写模式挂载。
+6. 删除前重新核对目录、文件集合、大小和 SHA-256，只删除本次清单中的目录。
+7. 清理失败会留下 `pending_cleanup`，可在“报告历史”重试，不影响日报。
+
+## 测试与构建
 
 ```powershell
-$env:DAY_DISTILLER_PYTHON="D:\ESP-IDF\.espressif\python_env\idf6.0_py3.11_env\Scripts\python.exe"
-.\RunClient.bat
-```
-
-## Test
-
-```powershell
-python -m unittest discover -s tests
-```
-
-## Build EXE
-
-Double-click `BuildExe.bat`, or run:
-
-```powershell
+.\.venv\Scripts\python.exe -m pytest -q
 .\scripts\build.ps1
 ```
 
-The packaged application is written to:
+生成的程序位于 `dist\DayDistillerClient\DayDistillerClient.exe`。FFmpeg 不随程序再分发，需从 PATH 自动发现或在设置页指定。
 
-```text
-dist\DayDistillerClient\DayDistillerClient.exe
-```
-
-After packaging, the EXE can be launched directly on this Windows machine.
-
-## Device Connection
-
-1. Flash firmware from the `usb-link-main` branch to the device.
-2. Insert a TF card. FAT32 is recommended.
-3. Connect the device to the PC with a USB data cable.
-4. Wait for Windows to enumerate the serial device. In normal mode the firmware
-   exposes a log/debug CDC interface and a USB Link protocol CDC interface.
-5. Launch the client and click `Auto Find`. If auto find fails, select the COM
-   port manually and click `Connect`.
-
-## Basic Workflow
-
-1. Confirm the UI shows `Connected` and `mode=serial`.
-2. Choose `Read / Write` or `Read Only`.
-3. Click `Enter U Disk`.
-4. The device reboots. The serial port disconnects briefly, then Windows should
-   show a new removable drive.
-5. Use the drive in Windows Explorer to read or copy files from the TF card.
-6. When finished, click `Eject + Exit` in the client. This safely ejects the
-   drive and sends `EXIT_MSC` so the device returns to serial mode.
-
-Use `Force Exit` only when Windows has already ejected the drive or when the
-drive did not mount and there is no file copy in progress.
-
-## Notes
-
-- Do not unplug the device or force exit while Windows is writing files.
-- During MSC mode, the USB serial ports briefly disappear and reappear.
-- In MSC mode the firmware exposes protocol CDC + mass storage. The normal log
-  CDC is restored after returning to serial mode.
-- If Windows does not show a drive letter, click `Refresh`, wait a few seconds,
-  and try `Auto Find` again. A damaged or unsupported TF filesystem may still
-  require formatting or card replacement.
-
-## Protocol
-
-The client implements USB Link protocol version 1:
-
-- SLIP framed binary header plus JSON payload.
-- CRC32 over header and payload.
-- Command CDC is the second CDC interface in serial mode and the only CDC
-  interface in MSC mode.
-- `ENTER_MSC` reboots the device into CDC + MSC mode.
-- `EXIT_MSC` should be sent only after the Windows volume is safely ejected,
-  unless the user explicitly forces exit.
+应用数据默认位于 `%LOCALAPPDATA%\DayDistillerV2`，可通过 `DAY_DISTILLER_DATA_DIR` 改到测试目录。原始导入素材与成品长期保留，由用户手动清理。
