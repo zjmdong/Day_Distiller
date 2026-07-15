@@ -321,6 +321,11 @@ class DistillationPipeline:
         evidence = [self._evidence_from_json(item) for item in self.database.list_scene_evidence(job_id)]
         if not evidence:
             raise RuntimeError("任务没有已保存的场景证据")
+        for item in evidence:
+            remembered = self.database.match_place(item.visual_signature) if item.visual_signature else None
+            if remembered:
+                item.location_candidate = remembered
+                item.location_confidence = 1.0
         report = self._generate_report(job_id, job.target_date, evidence, avatar_references or [])
         rendered = self.renderer.render(report, self.paths.reports / job.target_date.isoformat() / job_id)
         self.database.save_report(report, rendered.html_path, rendered.pdf_path)

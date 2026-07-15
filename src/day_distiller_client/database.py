@@ -278,6 +278,22 @@ class JobDatabase:
                 (evidence.record_id, json.dumps(evidence.to_json_dict(), ensure_ascii=False), _utc_now()),
             )
 
+    def update_scene_correction(self, record_id: str, summary: str, location: str | None) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT evidence_json FROM scene_evidence WHERE record_id = ?", (record_id,)
+            ).fetchone()
+            if row is None:
+                return
+            value = json.loads(row["evidence_json"])
+            value["summary"] = summary
+            value["location_candidate"] = location
+            value["location_confidence"] = 1.0 if location else 0.0
+            connection.execute(
+                "UPDATE scene_evidence SET evidence_json = ?, updated_at = ? WHERE record_id = ?",
+                (json.dumps(value, ensure_ascii=False), _utc_now(), record_id),
+            )
+
     def save_report(self, report: DayReport, html_path: Path | None = None, pdf_path: Path | None = None) -> None:
         with self.connect() as connection:
             connection.execute(

@@ -331,6 +331,7 @@ class MainWindow:
         self.smtp_sender_edit = QLineEdit()
         self.smtp_recipient_edit = QLineEdit()
         self.ffmpeg_edit = QLineEdit()
+        self.motion_model_edit = QLineEdit()
         self.avatar_edit = QLineEdit()
         avatar_browse = QPushButton("选择头像")
         avatar_browse.clicked.connect(
@@ -352,6 +353,7 @@ class MainWindow:
         form.addRow("发件地址", self.smtp_sender_edit)
         form.addRow("收件地址", self.smtp_recipient_edit)
         form.addRow("FFmpeg bin 目录或 ffmpeg.exe", self.ffmpeg_edit)
+        form.addRow("可选 IMU 模型 .joblib", self.motion_model_edit)
         form.addRow("漫画参考形象", avatar_row)
         layout.addLayout(form)
         save = QPushButton("保存设置")
@@ -581,6 +583,7 @@ class MainWindow:
             description = table.item(index, 2).text().strip() if table.item(index, 2) else ""
             item["location"] = location or None
             item["summary"] = description
+            self.database.update_scene_correction(str(item.get("record_id", "")), description, location or None)
             signature = str(item.get("visual_signature", ""))
             if location and signature:
                 self.database.remember_place(location, signature, report.report_date)
@@ -628,6 +631,7 @@ class MainWindow:
                 "recipient": self.smtp_recipient_edit.text().strip(),
             },
             "ffmpeg": self.ffmpeg_edit.text().strip(),
+            "motion_model": self.motion_model_edit.text().strip(),
             "avatar": self.avatar_edit.text().strip(),
         }
         self.database.set_setting("desktop_v2", settings)
@@ -669,6 +673,7 @@ class MainWindow:
         self.smtp_sender_edit.setText(smtp.get("sender", ""))
         self.smtp_recipient_edit.setText(smtp.get("recipient", ""))
         self.ffmpeg_edit.setText(settings.get("ffmpeg", ""))
+        self.motion_model_edit.setText(settings.get("motion_model", ""))
         self.avatar_edit.setText(settings.get("avatar", ""))
 
     def _create_pipeline(self, provider_mode: str) -> DistillationPipeline:
@@ -709,6 +714,7 @@ class MainWindow:
             ai,
             mail,
             media_preprocessor=MediaPreprocessor(ffmpeg, ffprobe),
+            motion_model_path=Path(settings["motion_model"]) if settings.get("motion_model") else None,
             progress=lambda stage, progress, message: self.events.put(
                 ("progress", (stage, progress, message), None)
             ),

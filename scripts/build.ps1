@@ -18,7 +18,10 @@ $SpecPath = Join-Path $BuildPath "spec"
   --distpath $DistPath `
   --workpath $BuildPath `
   --specpath $SpecPath `
-  --collect-all PySide6 `
+  --hidden-import keyring.backends.Windows `
+  --hidden-import openai `
+  --hidden-import sklearn.ensemble._forest `
+  --hidden-import sklearn.tree._classes `
   $Entry
 
 Write-Host ""
