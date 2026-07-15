@@ -254,6 +254,20 @@ class JobDatabase:
                 "SELECT * FROM records WHERE job_id = ? ORDER BY captured_at", (job_id,)
             ).fetchall()
 
+    def list_scene_evidence(self, job_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT scene_evidence.evidence_json
+                FROM scene_evidence
+                JOIN records ON records.id = scene_evidence.record_id
+                WHERE records.job_id = ?
+                ORDER BY records.captured_at
+                """,
+                (job_id,),
+            ).fetchall()
+        return [json.loads(row["evidence_json"]) for row in rows]
+
     def save_scene_evidence(self, evidence: SceneEvidence) -> None:
         with self.connect() as connection:
             connection.execute(
@@ -281,6 +295,15 @@ class JobDatabase:
                     report.created_at.isoformat(),
                 ),
             )
+            if html_path:
+                connection.execute(
+                    "UPDATE jobs SET report_path = ?, updated_at = ? WHERE id = ?",
+                    (str(html_path), _utc_now(), report.job_id),
+                )
+
+    def get_report(self, job_id: str) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute("SELECT * FROM reports WHERE job_id = ?", (job_id,)).fetchone()
 
     def save_delivery(self, job_id: str, message_id: str, accepted: bool, response: str) -> None:
         with self.connect() as connection:
@@ -288,6 +311,24 @@ class JobDatabase:
                 "INSERT INTO delivery_receipts VALUES (?,?,?,?,?,?)",
                 (str(uuid.uuid4()), job_id, message_id, int(accepted), response, _utc_now()),
             )
+
+    def accepted_delivery(self, job_id: str, message_id: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM delivery_receipts WHERE job_id = ? AND message_id = ? AND accepted = 1 LIMIT 1",
+                (job_id, message_id),
+            ).fetchone()
+        return row is not None
+
+    def list_cleanup_tasks(self, state: str | None = None) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM cleanup_tasks"
+        parameters: tuple[Any, ...] = ()
+        if state is not None:
+            sql += " WHERE state = ?"
+            parameters = (state,)
+        sql += " ORDER BY updated_at"
+        with self.connect() as connection:
+            return connection.execute(sql, parameters).fetchall()
 
     def set_cleanup_state(self, job_id: str, state: str, error: str | None = None) -> None:
         with self.connect() as connection:
@@ -329,4 +370,3 @@ class JobDatabase:
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
-

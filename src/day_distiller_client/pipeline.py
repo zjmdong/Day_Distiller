@@ -1,0 +1,339 @@
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Callable
+
+from .database import JobDatabase
+from .domain import CaptureRecord, ComicPanel, DayReport, EvidenceClaim, FileDigest, JobStage, SceneEvidence
+from .imu_analysis import analyze_imu
+from .legacy_import import (
+    ImportVerificationError,
+    delete_verified_source_records,
+    import_legacy_day,
+    sha256_file,
+)
+from .media import MediaPreprocessor, PreprocessedMedia
+from .paths import AppPaths
+from .providers.base import ImageProvider, MailProvider, StoryProvider, TranscriptionProvider
+from .reporting import RenderedReport, ReportRenderer
+
+
+ProgressCallback = Callable[[JobStage, float, str], None]
+
+
+@dataclass(frozen=True)
+class PipelineResult:
+    job_id: str
+    report: DayReport
+    rendered: RenderedReport
+    cleanup_state: str
+
+
+class DistillationPipeline:
+    def __init__(
+        self,
+        paths: AppPaths,
+        database: JobDatabase,
+        story_provider: StoryProvider,
+        transcription_provider: TranscriptionProvider,
+        image_provider: ImageProvider,
+        mail_provider: MailProvider,
+        media_preprocessor: MediaPreprocessor | None = None,
+        report_renderer: ReportRenderer | None = None,
+        motion_model_path: Path | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> None:
+        self.paths = paths.ensure()
+        self.database = database
+        self.story_provider = story_provider
+        self.transcription_provider = transcription_provider
+        self.image_provider = image_provider
+        self.mail_provider = mail_provider
+        self.media = media_preprocessor or MediaPreprocessor()
+        self.renderer = report_renderer or ReportRenderer()
+        self.motion_model_path = motion_model_path
+        self.progress = progress
+
+    def import_legacy(
+        self,
+        source_root: Path,
+        target_date: date,
+        device_id: str = "legacy-device",
+        provider_mode: str = "mock",
+    ) -> str:
+        job = self.database.create_job(target_date, provider_mode)
+        try:
+            records, manifest_path = import_legacy_day(
+                source_root,
+                target_date,
+                self.paths.imports,
+                job.id,
+                device_id,
+                progress=lambda done, total, text: self._notify(
+                    JobStage.IMPORTING, done / max(1, total), text
+                ),
+            )
+            if not records:
+                raise ImportVerificationError(f"{target_date.isoformat()} 没有找到可导入的记录")
+            for record in records:
+                self.database.upsert_record(job.id, record)
+            self.database.set_manifest_path(job.id, manifest_path)
+            self.database.set_stage(job.id, JobStage.VALIDATING, 0.1)
+            return job.id
+        except Exception as exc:
+            self.database.fail_job(job.id, str(exc))
+            raise
+
+    def process(
+        self,
+        job_id: str,
+        cleanup_source_root: Path | None = None,
+        avatar_references: list[Path] | None = None,
+    ) -> PipelineResult:
+        job = self.database.get_job(job_id)
+        if job.stage == JobStage.FAILED:
+            job = self.database.retry_job(job_id)
+        if job.stage == JobStage.COMPLETED:
+            raise ValueError("job is already completed")
+        try:
+            records = self._records(job_id)
+            self._validate_local(records)
+            self._advance(job_id, JobStage.VALIDATING, JobStage.PREPROCESSING, 0.15, "本地哈希校验完成")
+
+            preprocessed: dict[str, PreprocessedMedia] = {}
+            for index, record in enumerate(records, start=1):
+                preprocessed[record.record_id] = self.media.preprocess_record(record, self.paths.cache / job_id / "frames")
+                self._notify(JobStage.PREPROCESSING, index / len(records), f"已预处理 {record.record_name}")
+            self._advance(job_id, JobStage.PREPROCESSING, JobStage.ANALYZING, 0.3, "媒体预处理完成")
+
+            evidence = self._analyze(records, preprocessed)
+            self._advance(job_id, JobStage.ANALYZING, JobStage.GENERATING, 0.55, "逐片证据分析完成")
+
+            report = self._generate_report(job_id, job.target_date, evidence, avatar_references or [])
+            self.database.save_report(report)
+            self._advance(job_id, JobStage.GENERATING, JobStage.RENDERING, 0.72, "漫画生成完成")
+
+            rendered = self.renderer.render(report, self.paths.reports / job.target_date.isoformat() / job_id)
+            self.database.save_report(report, rendered.html_path, rendered.pdf_path)
+            self._advance(job_id, JobStage.RENDERING, JobStage.EMAILING, 0.84, "HTML 与 PDF 排版完成")
+
+            message_id = f"<day-distiller-{job_id}@local>"
+            if not self.database.accepted_delivery(job_id, message_id):
+                delivery = self.mail_provider.send(
+                    report.title,
+                    rendered.plain_text,
+                    rendered.email_html,
+                    rendered.pdf_path,
+                    rendered.inline_images,
+                    message_id,
+                )
+                self.database.save_delivery(job_id, delivery.message_id, delivery.accepted, delivery.response)
+                if not delivery.accepted:
+                    raise RuntimeError(f"邮件服务器未接受日报：{delivery.response}")
+            self._advance(job_id, JobStage.EMAILING, JobStage.CLEANUP, 0.94, "邮件服务器已接受日报")
+
+            cleanup_state = self._cleanup(job_id, cleanup_source_root)
+            self._advance(job_id, JobStage.CLEANUP, JobStage.COMPLETED, 1.0, "每日蒸馏完成")
+            return PipelineResult(job_id, report, rendered, cleanup_state)
+        except Exception as exc:
+            if self.database.get_job(job_id).stage != JobStage.COMPLETED:
+                self.database.fail_job(job_id, str(exc))
+            raise
+
+    def _records(self, job_id: str) -> list[CaptureRecord]:
+        records: list[CaptureRecord] = []
+        for row in self.database.list_records(job_id):
+            files = [FileDigest(**item) for item in json.loads(row["files_json"])]
+            records.append(
+                CaptureRecord(
+                    record_id=row["id"],
+                    record_name=row["record_name"],
+                    captured_at=datetime.fromisoformat(row["captured_at"]),
+                    source_dir=Path(row["source_dir"]),
+                    local_dir=Path(row["local_dir"]),
+                    video_path=Path(row["video_path"]) if row["video_path"] else None,
+                    audio_path=Path(row["audio_path"]) if row["audio_path"] else None,
+                    imu_path=Path(row["imu_path"]) if row["imu_path"] else None,
+                    meta_path=Path(row["meta_path"]) if row["meta_path"] else None,
+                    schema_version=int(row["schema_version"]),
+                    valid=bool(row["valid"]),
+                    validation_error=row["validation_error"],
+                    files=files,
+                )
+            )
+        if not records:
+            raise RuntimeError("任务没有可处理的记录")
+        return records
+
+    @staticmethod
+    def _validate_local(records: list[CaptureRecord]) -> None:
+        for record in records:
+            for digest in record.files:
+                path = (record.local_dir / digest.relative_path).resolve()
+                if not path.is_relative_to(record.local_dir.resolve()) or not path.is_file():
+                    raise ImportVerificationError(f"本地导入文件丢失：{record.record_name}/{digest.relative_path}")
+                if path.stat().st_size != digest.size or sha256_file(path) != digest.sha256:
+                    raise ImportVerificationError(f"本地导入文件校验失败：{record.record_name}/{digest.relative_path}")
+
+    def _analyze(
+        self, records: list[CaptureRecord], preprocessed: dict[str, PreprocessedMedia]
+    ) -> list[SceneEvidence]:
+        values: list[SceneEvidence] = []
+        for index, record in enumerate(records, start=1):
+            media = preprocessed[record.record_id]
+            motion = None
+            if record.imu_path:
+                try:
+                    motion = analyze_imu(record.imu_path, self.motion_model_path)
+                except Exception:
+                    motion = None
+            transcript = self.transcription_provider.transcribe(record.audio_path) if record.audio_path else ""
+            analysis = self.story_provider.analyze_scene(
+                record.record_id, record.captured_at, media.frames, transcript, motion
+            )
+            motion_value = 0.2
+            if motion:
+                motion_value = motion.activity_confidence * (0.25 if motion.activity == "stationary" else 1.0)
+            importance = max(
+                0.0,
+                min(
+                    1.0,
+                    0.30 * analysis.semantic_significance
+                    + 0.20 * analysis.novelty
+                    + 0.15 * motion_value
+                    + 0.15 * analysis.audio_value
+                    + 0.10 * analysis.memory_relevance
+                    + 0.10 * analysis.media_quality,
+                ),
+            )
+            evidence = SceneEvidence(
+                record_id=record.record_id,
+                captured_at=record.captured_at,
+                summary=analysis.summary,
+                transcript=transcript,
+                location_candidate=analysis.location_candidate,
+                location_confidence=analysis.location_confidence,
+                visual_activity=analysis.visual_activity,
+                visual_activity_confidence=analysis.visual_activity_confidence,
+                motion=motion,
+                importance=importance,
+                claims=[EvidenceClaim(**claim.model_dump()) for claim in analysis.claims],
+                privacy_flags=analysis.privacy_flags,
+                frame_paths=media.frames,
+            )
+            self.database.save_scene_evidence(evidence)
+            values.append(evidence)
+            self._notify(JobStage.ANALYZING, index / len(records), f"已分析 {record.record_name}")
+        return values
+
+    def _generate_report(
+        self, job_id: str, report_date: date, evidence: list[SceneEvidence], avatar_references: list[Path]
+    ) -> DayReport:
+        scene_payloads = [
+            {
+                "record_id": item.record_id,
+                "captured_at": item.captured_at.isoformat(),
+                "time_label": item.captured_at.strftime("%H:%M"),
+                "summary": item.summary,
+                "transcript": item.transcript,
+                "location_candidate": item.location_candidate,
+                "location_confidence": item.location_confidence,
+                "visual_activity": item.visual_activity,
+                "visual_activity_confidence": item.visual_activity_confidence,
+                "motion": item.motion.activity if item.motion else "unknown",
+                "motion_confidence": item.motion.activity_confidence if item.motion else 0,
+                "importance": item.importance,
+                "claims": [claim.__dict__ for claim in item.claims],
+            }
+            for item in evidence
+        ]
+        synthesis = self.story_provider.synthesize_day(report_date, scene_payloads)
+        panel_dir = self.paths.reports / report_date.isoformat() / job_id / "panels"
+        panels: list[ComicPanel] = []
+        for index, plan in enumerate(synthesis.panels, start=1):
+            destination = panel_dir / f"panel_{index:02d}.jpg"
+            self.image_provider.generate_panel(plan.image_prompt, destination, avatar_references)
+            panels.append(
+                ComicPanel(
+                    record_ids=plan.record_ids,
+                    time_label=plan.time_label,
+                    caption=plan.caption,
+                    image_prompt=plan.image_prompt,
+                    image_path=str(destination),
+                )
+            )
+            self._notify(JobStage.GENERATING, index / len(synthesis.panels), f"已生成漫画第 {index} 格")
+        timeline = [
+            {
+                "record_id": item.record_id,
+                "time_label": item.captured_at.strftime("%H:%M"),
+                "captured_at": item.captured_at.isoformat(),
+                "summary": item.summary,
+                "confidence": max(
+                    item.visual_activity_confidence,
+                    item.motion.activity_confidence if item.motion else 0,
+                ),
+                "importance": item.importance,
+            }
+            for item in evidence
+        ]
+        settings = getattr(self.story_provider, "settings", None)
+        model_versions = {
+            "scene": getattr(settings, "scene_model", "mock-v1"),
+            "daily": getattr(settings, "daily_model", "mock-v1"),
+            "transcription": getattr(settings, "transcription_model", "mock-v1"),
+            "image": getattr(settings, "image_model", "mock-v1"),
+            "motion": "heuristic-v1" if not self.motion_model_path else self.motion_model_path.name,
+        }
+        return DayReport(
+            report_id=str(uuid.uuid4()),
+            job_id=job_id,
+            report_date=report_date,
+            title=synthesis.title,
+            one_sentence_summary=synthesis.one_sentence_summary,
+            narrative=synthesis.narrative,
+            timeline=timeline,
+            panels=panels,
+            model_versions=model_versions,
+        )
+
+    def _cleanup(self, job_id: str, source_root: Path | None) -> str:
+        job = self.database.get_job(job_id)
+        if not job.manifest_path:
+            self.database.set_cleanup_state(job_id, "pending_cleanup", "导入清单路径缺失")
+            return "pending_cleanup"
+        if source_root is None:
+            self.database.set_cleanup_state(job_id, "pending_cleanup", "等待设备重新以读写模式连接")
+            return "pending_cleanup"
+        try:
+            delete_verified_source_records(source_root, Path(job.manifest_path))
+        except Exception as exc:
+            self.database.set_cleanup_state(job_id, "pending_cleanup", str(exc))
+            return "pending_cleanup"
+        self.database.set_cleanup_state(job_id, "completed")
+        return "completed"
+
+    def _advance(
+        self,
+        job_id: str,
+        expected: JobStage,
+        next_stage: JobStage,
+        progress: float,
+        message: str,
+    ) -> None:
+        current = self.database.get_job(job_id).stage
+        if current == expected:
+            self.database.set_stage(job_id, next_stage, progress)
+        elif current != next_stage and current != JobStage.COMPLETED:
+            # Retried jobs may recompute prerequisite artifacts before reaching their resume stage.
+            if current.value not in {stage.value for stage in JobStage}:
+                raise RuntimeError(f"未知任务状态：{current}")
+        self._notify(next_stage, progress, message)
+
+    def _notify(self, stage: JobStage, progress: float, message: str) -> None:
+        if self.progress:
+            self.progress(stage, progress, message)
