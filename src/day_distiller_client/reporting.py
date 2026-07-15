@@ -3,9 +3,10 @@ from __future__ import annotations
 import html
 import os
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 
-from .domain import DayReport
+from .domain import ComicPanel, DayReport
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,7 @@ class ReportRenderer:
         timeline_rows = "".join(
             "<tr>"
             f"<td>{html.escape(str(item.get('time_label', '')))}</td>"
+            f"<td>{html.escape(str(item.get('location', '') or ''))}</td>"
             f"<td>{html.escape(str(item.get('summary', '')))}</td>"
             f"<td>{float(item.get('confidence', 0)):.0%}</td>"
             "</tr>"
@@ -80,7 +82,7 @@ table {{ width:100%; border-collapse:collapse; background:white; }} th,td {{ pad
 <header><h1>{html.escape(report.title)}</h1><div class="summary">{html.escape(report.one_sentence_summary)}</div></header>
 <h2>今日漫画</h2>{''.join(panel_blocks)}
 <h2>一天小结</h2><p>{narrative}</p>
-<h2>完整记录时间线</h2><table><thead><tr><th>时间</th><th>片段</th><th>证据置信度</th></tr></thead><tbody>{timeline_rows}</tbody></table>
+<h2>完整记录时间线</h2><table><thead><tr><th>时间</th><th>地点</th><th>片段</th><th>证据置信度</th></tr></thead><tbody>{timeline_rows}</tbody></table>
 <p class="notice">本报告只描述设备实际记录到的短片段；谨慎措辞表示证据不足，不代表采样间隔内持续发生。</p>
 </main></body></html>"""
 
@@ -111,3 +113,18 @@ table {{ width:100%; border-collapse:collapse; background:white; }} th,td {{ pad
         document.print_(writer)
         if not destination.is_file() or destination.stat().st_size == 0:
             raise RuntimeError("PDF rendering did not produce an output file")
+
+
+def day_report_from_json(value: dict[str, object]) -> DayReport:
+    return DayReport(
+        report_id=str(value["report_id"]),
+        job_id=str(value["job_id"]),
+        report_date=date.fromisoformat(str(value["report_date"])),
+        title=str(value["title"]),
+        one_sentence_summary=str(value["one_sentence_summary"]),
+        narrative=str(value["narrative"]),
+        timeline=list(value.get("timeline", [])),
+        panels=[ComicPanel(**panel) for panel in value.get("panels", [])],
+        model_versions=dict(value.get("model_versions", {})),
+        created_at=datetime.fromisoformat(str(value["created_at"])),
+    )

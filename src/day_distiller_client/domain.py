@@ -96,6 +96,7 @@ class SceneEvidence:
     claims: list[EvidenceClaim] = field(default_factory=list)
     privacy_flags: list[str] = field(default_factory=list)
     frame_paths: list[Path] = field(default_factory=list)
+    visual_signature: str | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -131,4 +132,3 @@ class DayReport:
         value["report_date"] = self.report_date.isoformat()
         value["created_at"] = self.created_at.isoformat()
         return value
-

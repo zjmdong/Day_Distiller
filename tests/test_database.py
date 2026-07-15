@@ -41,7 +41,11 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.db.get_setting("models"), {"vision": "example"})
         self.assertEqual(self.db.get_setting("missing", 42), 42)
 
+    def test_verified_place_memory_matches_nearby_visual_signature(self) -> None:
+        self.db.remember_place("常去的餐厅", "00000000000000ff", date(2026, 7, 15))
+        self.assertEqual(self.db.match_place("00000000000000fe"), "常去的餐厅")
+        self.assertIsNone(self.db.match_place("ffffffffffffff00"))
+
 
 if __name__ == "__main__":
     unittest.main()
-

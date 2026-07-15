@@ -330,6 +330,45 @@ class JobDatabase:
         with self.connect() as connection:
             return connection.execute(sql, parameters).fetchall()
 
+    def remember_place(self, label: str, signature: str, visit_date: date) -> None:
+        if not label.strip() or not signature:
+            return
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id,visit_dates_json FROM place_memories WHERE signature = ?", (signature,)
+            ).fetchone()
+            visits = set(json.loads(row["visit_dates_json"])) if row else set()
+            visits.add(visit_date.isoformat())
+            if row:
+                connection.execute(
+                    "UPDATE place_memories SET label=?,visit_dates_json=?,user_verified=1,updated_at=? WHERE id=?",
+                    (label.strip(), json.dumps(sorted(visits)), _utc_now(), row["id"]),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO place_memories VALUES (?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), label.strip(), signature, json.dumps(sorted(visits)), 1, _utc_now()),
+                )
+
+    def match_place(self, signature: str, max_hamming_distance: int = 8) -> str | None:
+        try:
+            candidate = int(signature, 16)
+        except ValueError:
+            return None
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT label,signature FROM place_memories WHERE user_verified = 1"
+            ).fetchall()
+        best: tuple[int, str] | None = None
+        for row in rows:
+            try:
+                distance = (candidate ^ int(row["signature"], 16)).bit_count()
+            except ValueError:
+                continue
+            if distance <= max_hamming_distance and (best is None or distance < best[0]):
+                best = (distance, str(row["label"]))
+        return best[1] if best else None
+
     def set_cleanup_state(self, job_id: str, state: str, error: str | None = None) -> None:
         with self.connect() as connection:
             connection.execute(

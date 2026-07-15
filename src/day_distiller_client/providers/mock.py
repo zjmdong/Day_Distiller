@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import mimetypes
 from datetime import date, datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -123,8 +124,18 @@ class MockMailProvider:
         message["Message-ID"] = message_id
         message.set_content(plain_text)
         message.add_alternative(html, subtype="html")
+        html_part = message.get_payload()[-1]
+        for content_id, image_path in inline_images.items():
+            mime, _encoding = mimetypes.guess_type(image_path.name)
+            maintype, subtype = (mime or "image/jpeg").split("/", 1)
+            html_part.add_related(
+                image_path.read_bytes(),
+                maintype=maintype,
+                subtype=subtype,
+                cid=f"<{content_id}>",
+                filename=image_path.name,
+            )
         message.add_attachment(pdf_path.read_bytes(), maintype="application", subtype="pdf", filename=pdf_path.name)
         destination = self.outbox / f"{message_id.strip('<>').replace('@', '_')}.eml"
         destination.write_bytes(message.as_bytes())
         return DeliveryResult(True, message_id, f"mock accepted: {destination}")
-

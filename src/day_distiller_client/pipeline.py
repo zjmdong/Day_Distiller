@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass
@@ -16,13 +17,14 @@ from .legacy_import import (
     import_legacy_day,
     sha256_file,
 )
-from .media import MediaPreprocessor, PreprocessedMedia
+from .media import MediaPreprocessor, PreprocessedMedia, image_average_hash
 from .paths import AppPaths
 from .providers.base import ImageProvider, MailProvider, StoryProvider, TranscriptionProvider
-from .reporting import RenderedReport, ReportRenderer
+from .reporting import RenderedReport, ReportRenderer, day_report_from_json
 
 
 ProgressCallback = Callable[[JobStage, float, str], None]
+CleanupHandler = Callable[[str, Path], None]
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,7 @@ class DistillationPipeline:
         job_id: str,
         cleanup_source_root: Path | None = None,
         avatar_references: list[Path] | None = None,
+        cleanup_handler: CleanupHandler | None = None,
     ) -> PipelineResult:
         job = self.database.get_job(job_id)
         if job.stage == JobStage.FAILED:
@@ -136,7 +139,7 @@ class DistillationPipeline:
                     raise RuntimeError(f"邮件服务器未接受日报：{delivery.response}")
             self._advance(job_id, JobStage.EMAILING, JobStage.CLEANUP, 0.94, "邮件服务器已接受日报")
 
-            cleanup_state = self._cleanup(job_id, cleanup_source_root)
+            cleanup_state = self._cleanup(job_id, cleanup_source_root, cleanup_handler)
             self._advance(job_id, JobStage.CLEANUP, JobStage.COMPLETED, 1.0, "每日蒸馏完成")
             return PipelineResult(job_id, report, rendered, cleanup_state)
         except Exception as exc:
@@ -195,6 +198,13 @@ class DistillationPipeline:
             analysis = self.story_provider.analyze_scene(
                 record.record_id, record.captured_at, media.frames, transcript, motion
             )
+            visual_signature = f"{image_average_hash(media.frames[0]):016x}" if media.frames else None
+            remembered_place = self.database.match_place(visual_signature) if visual_signature else None
+            location_candidate = analysis.location_candidate
+            location_confidence = analysis.location_confidence
+            if remembered_place and location_confidence < 0.8:
+                location_candidate = remembered_place
+                location_confidence = 0.75
             motion_value = 0.2
             if motion:
                 motion_value = motion.activity_confidence * (0.25 if motion.activity == "stationary" else 1.0)
@@ -215,8 +225,8 @@ class DistillationPipeline:
                 captured_at=record.captured_at,
                 summary=analysis.summary,
                 transcript=transcript,
-                location_candidate=analysis.location_candidate,
-                location_confidence=analysis.location_confidence,
+                location_candidate=location_candidate,
+                location_confidence=location_confidence,
                 visual_activity=analysis.visual_activity,
                 visual_activity_confidence=analysis.visual_activity_confidence,
                 motion=motion,
@@ -224,6 +234,7 @@ class DistillationPipeline:
                 claims=[EvidenceClaim(**claim.model_dump()) for claim in analysis.claims],
                 privacy_flags=analysis.privacy_flags,
                 frame_paths=media.frames,
+                visual_signature=visual_signature,
             )
             self.database.save_scene_evidence(evidence)
             values.append(evidence)
@@ -247,6 +258,7 @@ class DistillationPipeline:
                 "motion": item.motion.activity if item.motion else "unknown",
                 "motion_confidence": item.motion.activity_confidence if item.motion else 0,
                 "importance": item.importance,
+                "visual_signature": item.visual_signature,
                 "claims": [claim.__dict__ for claim in item.claims],
             }
             for item in evidence
@@ -273,6 +285,9 @@ class DistillationPipeline:
                 "time_label": item.captured_at.strftime("%H:%M"),
                 "captured_at": item.captured_at.isoformat(),
                 "summary": item.summary,
+                "location": item.location_candidate if item.location_confidence >= 0.6 else None,
+                "location_confidence": item.location_confidence,
+                "visual_signature": item.visual_signature,
                 "confidence": max(
                     item.visual_activity_confidence,
                     item.motion.activity_confidence if item.motion else 0,
@@ -301,16 +316,82 @@ class DistillationPipeline:
             model_versions=model_versions,
         )
 
-    def _cleanup(self, job_id: str, source_root: Path | None) -> str:
+    def regenerate(self, job_id: str, avatar_references: list[Path] | None = None) -> tuple[DayReport, RenderedReport]:
+        job = self.database.get_job(job_id)
+        evidence = [self._evidence_from_json(item) for item in self.database.list_scene_evidence(job_id)]
+        if not evidence:
+            raise RuntimeError("任务没有已保存的场景证据")
+        report = self._generate_report(job_id, job.target_date, evidence, avatar_references or [])
+        rendered = self.renderer.render(report, self.paths.reports / job.target_date.isoformat() / job_id)
+        self.database.save_report(report, rendered.html_path, rendered.pdf_path)
+        return report, rendered
+
+    def resend(self, job_id: str) -> RenderedReport:
+        row = self.database.get_report(job_id)
+        if row is None:
+            raise RuntimeError("任务没有可发送的日报")
+        report_json = json.loads(row["report_json"])
+        report = day_report_from_json(report_json)
+        rendered = self.renderer.render(report, self.paths.reports / report.report_date.isoformat() / job_id)
+        revision = hashlib.sha256(json.dumps(report_json, sort_keys=True).encode()).hexdigest()[:12]
+        message_id = f"<day-distiller-{job_id}-manual-{revision}@local>"
+        delivery = self.mail_provider.send(
+            report.title,
+            rendered.plain_text,
+            rendered.email_html,
+            rendered.pdf_path,
+            rendered.inline_images,
+            message_id,
+        )
+        self.database.save_delivery(job_id, delivery.message_id, delivery.accepted, delivery.response)
+        if not delivery.accepted:
+            raise RuntimeError(f"邮件服务器未接受日报：{delivery.response}")
+        return rendered
+
+    @staticmethod
+    def _evidence_from_json(value: dict[str, object]) -> SceneEvidence:
+        motion_value = value.get("motion")
+        motion = None
+        if isinstance(motion_value, dict):
+            from .domain import MotionAssessment
+
+            motion = MotionAssessment(**motion_value)
+        return SceneEvidence(
+            record_id=str(value["record_id"]),
+            captured_at=datetime.fromisoformat(str(value["captured_at"])),
+            summary=str(value.get("summary", "")),
+            transcript=str(value.get("transcript", "")),
+            location_candidate=str(value["location_candidate"]) if value.get("location_candidate") else None,
+            location_confidence=float(value.get("location_confidence", 0)),
+            visual_activity=str(value.get("visual_activity", "unknown")),
+            visual_activity_confidence=float(value.get("visual_activity_confidence", 0)),
+            motion=motion,
+            importance=float(value.get("importance", 0)),
+            claims=[EvidenceClaim(**item) for item in value.get("claims", [])],
+            privacy_flags=list(value.get("privacy_flags", [])),
+            frame_paths=[Path(path) for path in value.get("frame_paths", [])],
+            visual_signature=str(value["visual_signature"]) if value.get("visual_signature") else None,
+        )
+
+    def _cleanup(
+        self,
+        job_id: str,
+        source_root: Path | None,
+        cleanup_handler: CleanupHandler | None,
+    ) -> str:
         job = self.database.get_job(job_id)
         if not job.manifest_path:
             self.database.set_cleanup_state(job_id, "pending_cleanup", "导入清单路径缺失")
             return "pending_cleanup"
-        if source_root is None:
+        if source_root is None and cleanup_handler is None:
             self.database.set_cleanup_state(job_id, "pending_cleanup", "等待设备重新以读写模式连接")
             return "pending_cleanup"
         try:
-            delete_verified_source_records(source_root, Path(job.manifest_path))
+            if cleanup_handler:
+                cleanup_handler(job_id, Path(job.manifest_path))
+            else:
+                assert source_root is not None
+                delete_verified_source_records(source_root, Path(job.manifest_path))
         except Exception as exc:
             self.database.set_cleanup_state(job_id, "pending_cleanup", str(exc))
             return "pending_cleanup"
