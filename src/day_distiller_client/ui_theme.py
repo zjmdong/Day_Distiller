@@ -6,6 +6,10 @@ QMainWindow, QWidget#appRoot, QWidget#pageStack, QScrollArea, QScrollArea > QWid
     background: #000000;
     color: #ffffff;
 }
+QStackedWidget#homeWorkflow, QStackedWidget#settingsStack {
+    background: #000000;
+    border: 0;
+}
 QWidget {
     color: #ffffff;
     font-family: "Inter", "Segoe UI Variable", "Microsoft YaHei UI", sans-serif;
@@ -36,6 +40,55 @@ QLabel#pageSubtitle {
     color: #a6a6a6;
     font-size: 14px;
 }
+QLabel#heroTitle {
+    color: #ffffff;
+    font-size: 42px;
+    font-weight: 650;
+}
+QLabel#heroSubtitle, QLabel#workflowSubtitle {
+    color: #8f8f8f;
+    font-size: 15px;
+}
+QLabel#workflowTitle {
+    color: #ffffff;
+    font-size: 34px;
+    font-weight: 650;
+}
+QLabel#privacyFootnote {
+    color: #5f5f5f;
+    font-size: 11px;
+}
+QLabel[stepBadge="true"] {
+    background: #0b1820;
+    color: #4db7ff;
+    border: 1px solid #153a52;
+    border-radius: 13px;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QLabel#workflowStatusText {
+    color: #ffffff;
+    font-size: 18px;
+    font-weight: 600;
+}
+QLabel#successIconSmall, QLabel#successIconLarge {
+    background: #0b2a1b;
+    color: #4bd481;
+    border: 1px solid #205f3b;
+    border-radius: 19px;
+    font-size: 23px;
+    font-weight: 700;
+}
+QLabel#successIconLarge {
+    border-radius: 43px;
+    font-size: 46px;
+}
+QLabel#etaLabel {
+    color: #8f8f8f;
+    min-width: 145px;
+    padding-left: 10px;
+}
 QLabel[chip="true"] {
     background: #0b0b0b;
     color: #a6a6a6;
@@ -53,6 +106,27 @@ QFrame#sideBar {
     background: #000000;
     border: 0;
     border-right: 1px solid #171717;
+}
+QFrame#workflowStatusCard {
+    background: #080808;
+    border: 1px solid #242424;
+    border-radius: 16px;
+}
+QFrame#modelCard {
+    background: #080808;
+    border: 1px solid #222222;
+    border-radius: 13px;
+    padding: 13px;
+}
+QLabel#modelName, QLabel#recipientValue {
+    color: #ffffff;
+    font-size: 15px;
+    font-weight: 600;
+}
+QFrame#stylePreviewHolder {
+    background: #050505;
+    border: 1px solid #242424;
+    border-radius: 12px;
 }
 QListWidget#sideNav {
     background: #000000;
@@ -165,6 +239,25 @@ QPushButton[role="primary"]:hover, QPushButton[role="accent"]:hover, QPushButton
     background: #1aa3ff;
     border-color: #1aa3ff;
 }
+QPushButton#heroStartButton {
+    border-radius: 33px;
+    font-size: 20px;
+    font-weight: 650;
+}
+QPushButton[role="link"] {
+    min-height: 28px;
+    background: transparent;
+    color: #737373;
+    border: 0;
+    border-radius: 4px;
+    padding: 2px 7px;
+    text-decoration: underline;
+}
+QPushButton[role="link"]:hover {
+    background: transparent;
+    color: #b5b5b5;
+    border: 0;
+}
 QCheckBox { color: #a6a6a6; spacing: 8px; }
 QCheckBox::indicator {
     width: 17px;
@@ -178,19 +271,22 @@ QCheckBox::indicator:checked {
     border-color: #0099ff;
 }
 QProgressBar {
-    min-height: 8px;
-    max-height: 8px;
+    min-height: 22px;
+    max-height: 22px;
     background: #151515;
-    border: 0;
-    border-radius: 4px;
+    border: 1px solid #242424;
+    border-radius: 11px;
     text-align: center;
-    color: transparent;
+    color: #d8d8d8;
+    font-size: 11px;
+    font-weight: 600;
 }
 QProgressBar::chunk {
-    border-radius: 4px;
+    border-radius: 10px;
     background: #0099ff;
 }
-QListWidget#contentList, QListWidget#historyList {
+QListWidget#contentList, QListWidget#historyList, QListWidget#guidedRecordsList,
+QListWidget#developerHistoryList {
     background: #050505;
     color: #ffffff;
     border: 1px solid #202020;
@@ -198,7 +294,8 @@ QListWidget#contentList, QListWidget#historyList {
     padding: 8px;
     outline: 0;
 }
-QListWidget#contentList::item, QListWidget#historyList::item {
+QListWidget#contentList::item, QListWidget#historyList::item,
+QListWidget#guidedRecordsList::item, QListWidget#developerHistoryList::item {
     background: #090909;
     color: #d7d7d7;
     border: 1px solid #202020;
@@ -207,10 +304,34 @@ QListWidget#contentList::item, QListWidget#historyList::item {
     margin: 4px;
     padding: 4px 12px;
 }
-QListWidget#contentList::item:selected, QListWidget#historyList::item:selected {
+QListWidget#contentList::item:selected, QListWidget#historyList::item:selected,
+QListWidget#guidedRecordsList::item:selected, QListWidget#developerHistoryList::item:selected {
     background: #0d2230;
     color: #ffffff;
     border-color: #0099ff;
+}
+QPlainTextEdit#guidedLiveProgress {
+    color: #858585;
+    background: #050505;
+    border: 1px solid #202020;
+    padding: 14px;
+}
+QTabWidget#manualDebugTabs::pane {
+    background: #000000;
+    border: 1px solid #202020;
+    border-radius: 10px;
+}
+QTabWidget#manualDebugTabs QTabBar::tab {
+    background: #090909;
+    color: #8f8f8f;
+    border: 1px solid #202020;
+    padding: 9px 22px;
+    margin-right: 4px;
+}
+QTabWidget#manualDebugTabs QTabBar::tab:selected {
+    background: #102333;
+    color: #ffffff;
+    border-color: #1b5579;
 }
 QHeaderView::section {
     background: #101010;

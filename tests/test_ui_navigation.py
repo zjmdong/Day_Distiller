@@ -1,12 +1,14 @@
 import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QLabel
 
-from day_distiller_client.app import NavigationStack
+from day_distiller_client.app import MainWindow, NavigationStack
 from day_distiller_client.ui_theme import APP_STYLESHEET
 
 
@@ -39,6 +41,23 @@ class NavigationStackTests(unittest.TestCase):
         self.assertIn("#0099ff", APP_STYLESHEET.lower())
         self.assertNotIn("#6c5ce7", APP_STYLESHEET.lower())
         self.assertNotIn("#ff6b8a", APP_STYLESHEET.lower())
+
+    def test_production_navigation_and_nested_workflows(self) -> None:
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            os.environ, {"DAY_DISTILLER_DATA_DIR": root}
+        ), patch("day_distiller_client.app.CredentialStore") as credentials:
+            credentials.return_value.get.return_value = None
+            window = MainWindow()
+            labels = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+            self.assertEqual(labels, ["开始", "回忆", "形象与风格", "设置"])
+            self.assertNotIn("设备", labels)
+            self.assertNotIn("记录", labels)
+            self.assertNotIn("生成", labels)
+            self.assertEqual(window.home_stack.count(), 5)
+            self.assertEqual(window.settings_stack.count(), 4)
+            self.assertEqual(window.art_style_combo.itemText(0), "扁平色块波普")
+            self.assertNotIn("醒目", window.art_style_combo.itemText(0))
+            window.window.close()
 
 
 if __name__ == "__main__":

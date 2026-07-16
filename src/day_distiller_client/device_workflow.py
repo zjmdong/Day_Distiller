@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Callable
@@ -13,6 +14,14 @@ from .windows import drive_letters, safe_eject, wait_for_new_drive
 
 
 StatusCallback = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class SyncedDay:
+    """A verified local copy that is ready for the cloud distillation stages."""
+
+    job_id: str
+    record_names: tuple[str, ...]
 
 
 class LegacyDeviceWorkflow:
@@ -36,6 +45,21 @@ class LegacyDeviceWorkflow:
         provider_mode: str = "mock",
         avatar_references: list[Path] | None = None,
     ) -> PipelineResult:
+        synced = self.sync_day(target_date, device_id=device_id, provider_mode=provider_mode)
+        return self.process_synced(synced.job_id, avatar_references=avatar_references)
+
+    def sync_day(
+        self,
+        target_date: date,
+        device_id: str = "legacy-device",
+        provider_mode: str = "mock",
+    ) -> SyncedDay:
+        """Mount read-only, import and verify one day, then safely leave MSC.
+
+        This deliberately stops before AI processing so the production UI can
+        show the user exactly what was copied and offer a short cancel/resync
+        window before billable providers are called.
+        """
         self._emit("正在发现设备并执行 HELLO / GET_STATUS")
         port, hello = self._wait_for_device()
         capabilities = set(hello.get("capabilities", [])) if isinstance(hello.get("capabilities"), list) else set()
@@ -59,6 +83,17 @@ class LegacyDeviceWorkflow:
             safe_eject(drive.letter)
             self._exit_msc()
 
+        record_names = tuple(
+            str(row["record_name"]) for row in self.pipeline.database.list_records(job_id)
+        )
+        return SyncedDay(job_id=job_id, record_names=record_names)
+
+    def process_synced(
+        self,
+        job_id: str,
+        avatar_references: list[Path] | None = None,
+    ) -> PipelineResult:
+        """Run analysis, generation, delivery and verified device cleanup."""
         serial_port, _status = self._wait_for_device()
         self._keepalive = MaintenanceKeepAlive(lambda: UsbLinkDevice(serial_port.device), interval_seconds=30)
         self._keepalive.start()

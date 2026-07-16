@@ -23,7 +23,7 @@ from .art_styles import (
 from .credentials import CredentialName, CredentialStore
 from .database import JobDatabase
 from .device import PortCandidate, UsbLinkDevice, find_device, list_serial_ports
-from .device_workflow import LegacyDeviceWorkflow
+from .device_workflow import LegacyDeviceWorkflow, SyncedDay
 from .domain import JobStage
 from .legacy_import import available_record_dates, normalize_source_root, scan_record_directories
 from .media import MediaPreprocessor
@@ -42,7 +42,7 @@ from .providers import (
     SmtpSettings,
 )
 from .reporting import ReportRenderer, day_report_from_json
-from .resources import bundled_ffmpeg_paths
+from .resources import bundled_ffmpeg_paths, resource_path
 from .windows import drive_letters, list_removable_drives, safe_eject, wait_for_new_drive
 from .ui_theme import APP_STYLESHEET
 
@@ -89,6 +89,71 @@ class Worker:
                 self._done((name, None, exc))
 
         threading.Thread(target=target, name=f"day-distiller-{name}", daemon=True).start()
+
+
+class Spinner:
+    """Small native Qt spinner used by the guided workflow and style preview."""
+
+    def __init__(self, parent=None, diameter: int = 34, color: str = "#0099ff") -> None:
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QWidget
+
+        self.widget = QWidget(parent)
+        self.widget.setFixedSize(diameter, diameter)
+        self.widget.paintEvent = self._paint_event
+        self._angle = 0
+        self._color = color
+        self._timer = QTimer(self.widget)
+        self._timer.setInterval(45)
+        self._timer.timeout.connect(self._advance)
+
+    def _advance(self) -> None:
+        self._angle = (self._angle + 24) % 360
+        self.widget.update()
+
+    def _paint_event(self, _event) -> None:
+        from PySide6.QtCore import QRectF, Qt
+        from PySide6.QtGui import QColor, QPainter, QPen
+
+        painter = QPainter(self.widget)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(self._color), 3.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        inset = 4.5
+        rect = QRectF(inset, inset, self.widget.width() - inset * 2, self.widget.height() - inset * 2)
+        painter.drawArc(rect, int((90 - self._angle) * 16), int(-285 * 16))
+
+    def start(self) -> None:
+        self.widget.show()
+        self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self.widget.hide()
+
+
+class ClickableImageLabel:
+    """A QLabel facade with a clicked signal without introducing custom QSS types."""
+
+    def __init__(self, text: str = "") -> None:
+        from PySide6.QtCore import QObject, Signal
+        from PySide6.QtWidgets import QLabel
+
+        class ClickRelay(QObject):
+            clicked = Signal()
+
+        self.widget = QLabel(text)
+        self._relay = ClickRelay(self.widget)
+        self.clicked = self._relay.clicked
+        self.widget.mouseReleaseEvent = self._mouse_release
+
+    def _mouse_release(self, event) -> None:
+        from PySide6.QtCore import Qt
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        event.accept()
 
 
 class NavigationStack:
@@ -159,7 +224,7 @@ def main() -> int:
     from PySide6.QtWidgets import QApplication
 
     application = QApplication([])
-    application.setApplicationName("Day Distiller v2")
+    application.setApplicationName("Day Distiller")
     application.setStyle("Fusion")
     installed_fonts = set(QFontDatabase.families())
     ui_family = next(
@@ -179,10 +244,14 @@ def main() -> int:
 class MainWindow:
     def __init__(self) -> None:
         from PySide6.QtCore import QTimer
+        from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QMainWindow
 
         self.window = QMainWindow()
-        self.window.setWindowTitle("Day Distiller · 把今天变成一张值得收藏的海报")
+        self.window.setWindowTitle("Day Distiller")
+        icon_path = resource_path("assets", "day-distiller.svg")
+        if icon_path.is_file():
+            self.window.setWindowIcon(QIcon(str(icon_path)))
         self.window.resize(1280, 820)
         self.window.setMinimumSize(1060, 700)
         self.window.setStyleSheet(APP_STYLESHEET)
@@ -198,6 +267,20 @@ class MainWindow:
         self.scanned_source_root: Path | None = None
         self.scanned_target_date: date | None = None
         self.scanned_record_count = 0
+        self.guided_discovery_inflight = False
+        self.guided_sync_workflow: LegacyDeviceWorkflow | None = None
+        self.guided_synced_day: SyncedDay | None = None
+        self.guided_countdown = 0
+        self.guided_started_at = 0.0
+        self.guided_phase = "idle"
+        self.style_preview_path: Path | None = None
+
+        self.discovery_timer = QTimer()
+        self.discovery_timer.setInterval(1000)
+        self.discovery_timer.timeout.connect(self._guided_discovery_tick)
+        self.sync_countdown_timer = QTimer()
+        self.sync_countdown_timer.setInterval(1000)
+        self.sync_countdown_timer.timeout.connect(self._guided_countdown_tick)
 
         self._build_ui()
         self._load_cloud_settings()
@@ -219,12 +302,9 @@ class MainWindow:
 
         self.tabs = NavigationStack()
         self.tabs.addTab(self._guide_page(), "开始")
-        self.tabs.addTab(self._device_page(), "设备")
-        self.tabs.addTab(self._records_page(), "记录")
-        self.tabs.addTab(self._distillation_page(), "生成")
         self.tabs.addTab(self._history_page(), "回忆")
         self.tabs.addTab(self._avatar_page(), "形象与风格")
-        self.tabs.addTab(self._settings_page_v2(), "设置")
+        self.tabs.addTab(self._settings_hub_page(), "设置")
 
         root = QWidget()
         root.setObjectName("appRoot")
@@ -246,14 +326,16 @@ class MainWindow:
         brand_box.addWidget(brand_subtitle)
         header_layout.addLayout(brand_box)
         header_layout.addStretch(1)
-        cost_chip = QLabel("1K 海报 · 低于 100 万像素")
-        cost_chip.setProperty("chip", True)
-        header_layout.addWidget(cost_chip)
         root_layout.addWidget(header)
         root_layout.addWidget(self.tabs.widget, 1)
         self.window.setCentralWidget(root)
 
         def repaint_after_navigation(_index: int) -> None:
+            item = self.tabs.navigation.item(_index)
+            if item and item.text() == "回忆":
+                self.refresh_history()
+            if item and item.text() == "设置":
+                self.settings_stack.setCurrentIndex(0)
             # On Windows, a stacked-page switch can leave unchanged child widgets
             # waiting for the next native paint event. Repaint the complete visible
             # tree so the persistent header/sidebar never appear temporarily blank.
@@ -293,65 +375,200 @@ class MainWindow:
 
     def _guide_page(self):
         from PySide6.QtCore import Qt
-        from PySide6.QtWidgets import QGroupBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+        from PySide6.QtWidgets import (
+            QFrame,
+            QHBoxLayout,
+            QLabel,
+            QListWidget,
+            QPlainTextEdit,
+            QProgressBar,
+            QPushButton,
+            QStackedWidget,
+            QVBoxLayout,
+            QWidget,
+        )
 
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(34, 28, 34, 28)
-        layout.setSpacing(18)
-        layout.addWidget(
-            self._page_header(
-                "今天，值得被好好记住",
-                "连接设备、选择当天记录，然后让 AI 从所有素材中找到真正重要的 2–3 个 Moments。",
-            )
-        )
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.home_stack = QStackedWidget()
+        self.home_stack.setObjectName("homeWorkflow")
+        layout.addWidget(self.home_stack)
 
-        steps = QHBoxLayout()
-        steps.setSpacing(14)
-        for number, title, copy in (
-            ("1", "连接设备", "回家后唤醒设备并连接电脑。"),
-            ("2", "确认记录", "扫描今天，快速确认素材数量。"),
-            ("3", "生成海报", "一键筛选、分析、创作并发送。"),
-        ):
-            card = QGroupBox()
-            card_layout = QVBoxLayout(card)
-            badge = QLabel(number)
-            badge.setFixedSize(38, 38)
-            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            badge.setStyleSheet(
-                "background:#111111; color:white; border:1px solid #2b2b2b; "
-                "border-radius:19px; font-size:17px; font-weight:600;"
-            )
-            heading = QLabel(title)
-            heading.setStyleSheet("font-size:18px; font-weight:700;")
-            description = QLabel(copy)
-            description.setProperty("muted", True)
-            description.setWordWrap(True)
-            card_layout.addWidget(badge)
-            card_layout.addWidget(heading)
-            card_layout.addWidget(description)
-            card_layout.addStretch(1)
-            steps.addWidget(card, 1)
-        layout.addLayout(steps)
+        def centered_page() -> tuple[QWidget, QVBoxLayout]:
+            widget = QWidget()
+            box = QVBoxLayout(widget)
+            box.setContentsMargins(54, 34, 54, 28)
+            box.setSpacing(16)
+            return widget, box
 
-        action_row = QHBoxLayout()
-        begin = self._mark_button(QPushButton("开始整理今天"))
-        begin.clicked.connect(lambda: self._select_tab("记录"))
-        go_settings = QPushButton("首次使用？完成配置")
-        go_settings.clicked.connect(lambda: self.tabs.setCurrentIndex(self.tabs.count() - 1))
-        action_row.addWidget(begin)
-        action_row.addWidget(go_settings)
-        action_row.addStretch(1)
-        layout.addLayout(action_row)
+        def step_label(text: str) -> QLabel:
+            label = QLabel(text)
+            label.setProperty("stepBadge", True)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setFixedWidth(92)
+            label.setFixedHeight(28)
+            return label
 
-        privacy = QLabel(
-            "隐私与费用  ·  IMU 与地点记忆只在本机处理；只有关键帧、音频和必要证据会按流程发送给已配置模型。"
-            "最终海报固定为 864×1152（约 99.5 万像素）。FFmpeg 与 IMU 模型已经内置。"
-        )
+        landing, landing_layout = centered_page()
+        landing_layout.addStretch(2)
+        hero = QLabel("让今天，成为值得收藏的一张海报")
+        hero.setObjectName("heroTitle")
+        hero.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hero.setWordWrap(True)
+        hero_copy = QLabel("连接设备后，Day Distiller 会自动同步、理解、创作并发送。")
+        hero_copy.setObjectName("heroSubtitle")
+        hero_copy.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        begin = self._mark_button(QPushButton("开始"))
+        begin.setObjectName("heroStartButton")
+        begin.setFixedSize(320, 66)
+        begin.clicked.connect(self.start_guided_workflow)
+        start_row = QHBoxLayout()
+        start_row.addStretch(1)
+        start_row.addWidget(begin)
+        start_row.addStretch(1)
+        landing_layout.addWidget(hero)
+        landing_layout.addWidget(hero_copy)
+        landing_layout.addSpacing(22)
+        landing_layout.addLayout(start_row)
+        landing_layout.addStretch(3)
+        first_use = QPushButton("首次使用？先完成配置")
+        first_use.setProperty("role", "link")
+        first_use.clicked.connect(lambda: self._select_tab("设置"))
+        first_use_row = QHBoxLayout()
+        first_use_row.addStretch(1)
+        first_use_row.addWidget(first_use)
+        first_use_row.addStretch(1)
+        landing_layout.addLayout(first_use_row)
+        privacy = QLabel("隐私与费用：IMU 与地点记忆在本地处理；仅必要的关键帧、音频与证据会发送至已配置服务。")
+        privacy.setObjectName("privacyFootnote")
+        privacy.setAlignment(Qt.AlignmentFlag.AlignCenter)
         privacy.setWordWrap(True)
-        privacy.setProperty("muted", True)
-        layout.addWidget(privacy)
-        layout.addStretch(1)
+        landing_layout.addWidget(privacy)
+        self.home_stack.addWidget(landing)
+
+        connect_page, connect_layout = centered_page()
+        connect_layout.addWidget(step_label("步骤 1 / 3"), alignment=Qt.AlignmentFlag.AlignHCenter)
+        connect_title = QLabel("连接设备")
+        connect_title.setObjectName("workflowTitle")
+        connect_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        connect_copy = QLabel("请重启 Day Distiller 设备，并使用 USB 连接至电脑。")
+        connect_copy.setObjectName("workflowSubtitle")
+        connect_copy.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        connect_layout.addWidget(connect_title)
+        connect_layout.addWidget(connect_copy)
+        connect_layout.addSpacing(26)
+        status_card = QFrame()
+        status_card.setObjectName("workflowStatusCard")
+        status_row = QHBoxLayout(status_card)
+        status_row.setContentsMargins(24, 22, 24, 22)
+        self.connect_spinner = Spinner(status_card, 34)
+        self.connect_success_icon = QLabel("✓")
+        self.connect_success_icon.setObjectName("successIconSmall")
+        self.connect_success_icon.setFixedSize(38, 38)
+        self.connect_success_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.connect_success_icon.hide()
+        self.guided_connection_status = QLabel("正在寻找设备")
+        self.guided_connection_status.setObjectName("workflowStatusText")
+        status_row.addStretch(1)
+        status_row.addWidget(self.connect_spinner.widget)
+        status_row.addWidget(self.connect_success_icon)
+        status_row.addSpacing(10)
+        status_row.addWidget(self.guided_connection_status)
+        status_row.addStretch(1)
+        status_card.setMaximumWidth(580)
+        connect_layout.addWidget(status_card, alignment=Qt.AlignmentFlag.AlignHCenter)
+        connect_layout.addStretch(1)
+        self.home_stack.addWidget(connect_page)
+
+        sync_page, sync_layout = centered_page()
+        sync_layout.addWidget(step_label("步骤 2 / 3"), alignment=Qt.AlignmentFlag.AlignHCenter)
+        sync_title = QLabel("正在同步数据")
+        sync_title.setObjectName("workflowTitle")
+        sync_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.guided_sync_subtitle = QLabel("正在安全读取设备内今天的记录，请稍等。")
+        self.guided_sync_subtitle.setObjectName("workflowSubtitle")
+        self.guided_sync_subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sync_layout.addWidget(sync_title)
+        sync_layout.addWidget(self.guided_sync_subtitle)
+        self.guided_sync_progress = QProgressBar()
+        self.guided_sync_progress.setRange(0, 100)
+        self.guided_sync_progress.setValue(0)
+        self.guided_sync_progress.setFormat("%p%")
+        sync_layout.addWidget(self.guided_sync_progress)
+        self.guided_records_list = QListWidget()
+        self.guided_records_list.setObjectName("guidedRecordsList")
+        self.guided_records_list.setMinimumHeight(250)
+        self.guided_records_list.hide()
+        sync_layout.addWidget(self.guided_records_list, 1)
+        self.guided_sync_actions = QWidget()
+        sync_actions = QHBoxLayout(self.guided_sync_actions)
+        sync_actions.setContentsMargins(0, 0, 0, 0)
+        self.guided_resync_button = QPushButton("重新同步")
+        self.guided_start_distill_button = self._mark_button(QPushButton("开始蒸馏（3s）"))
+        self.guided_resync_button.clicked.connect(self._guided_start_sync)
+        self.guided_start_distill_button.clicked.connect(self._guided_start_distillation)
+        sync_actions.addStretch(1)
+        sync_actions.addWidget(self.guided_resync_button)
+        sync_actions.addWidget(self.guided_start_distill_button)
+        sync_actions.addStretch(1)
+        self.guided_sync_actions.hide()
+        sync_layout.addWidget(self.guided_sync_actions)
+        self.home_stack.addWidget(sync_page)
+
+        distill_page, distill_layout = centered_page()
+        distill_layout.addWidget(step_label("步骤 3 / 3"), alignment=Qt.AlignmentFlag.AlignHCenter)
+        distill_title = QLabel("蒸馏进行中")
+        distill_title.setObjectName("workflowTitle")
+        distill_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        distill_copy = QLabel("去喝杯茶吧，很快就好。")
+        distill_copy.setObjectName("workflowSubtitle")
+        distill_copy.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        distill_layout.addWidget(distill_title)
+        distill_layout.addWidget(distill_copy)
+        progress_row = QHBoxLayout()
+        self.guided_distill_progress = QProgressBar()
+        self.guided_distill_progress.setRange(0, 100)
+        self.guided_distill_progress.setValue(0)
+        self.guided_distill_progress.setFormat("%p%")
+        self.guided_eta_label = QLabel("正在估算剩余时间")
+        self.guided_eta_label.setObjectName("etaLabel")
+        progress_row.addWidget(self.guided_distill_progress, 1)
+        progress_row.addWidget(self.guided_eta_label)
+        distill_layout.addLayout(progress_row)
+        self.guided_live_progress = QPlainTextEdit()
+        self.guided_live_progress.setObjectName("guidedLiveProgress")
+        self.guided_live_progress.setReadOnly(True)
+        self.guided_live_progress.setPlaceholderText("实时进度会显示在这里")
+        distill_layout.addWidget(self.guided_live_progress, 1)
+        self.home_stack.addWidget(distill_page)
+
+        complete_page, complete_layout = centered_page()
+        complete_layout.addStretch(1)
+        done_icon = QLabel("✓")
+        done_icon.setObjectName("successIconLarge")
+        done_icon.setFixedSize(86, 86)
+        done_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        done_title = QLabel("蒸馏已完成")
+        done_title.setObjectName("workflowTitle")
+        done_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.guided_complete_email = QLabel("已发送至指定邮箱")
+        self.guided_complete_email.setObjectName("workflowSubtitle")
+        self.guided_complete_email.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        finish = self._mark_button(QPushButton("完成"))
+        finish.setFixedSize(260, 54)
+        finish.clicked.connect(self._finish_guided_workflow)
+        finish_row = QHBoxLayout()
+        finish_row.addStretch(1)
+        finish_row.addWidget(finish)
+        finish_row.addStretch(1)
+        complete_layout.addWidget(done_icon, alignment=Qt.AlignmentFlag.AlignHCenter)
+        complete_layout.addWidget(done_title)
+        complete_layout.addWidget(self.guided_complete_email)
+        complete_layout.addSpacing(22)
+        complete_layout.addLayout(finish_row)
+        complete_layout.addStretch(2)
+        self.home_stack.addWidget(complete_page)
         return page
 
     def _avatar_page(self):
@@ -359,12 +576,14 @@ class MainWindow:
         from PySide6.QtWidgets import (
             QComboBox,
             QFileDialog,
+            QFrame,
             QGroupBox,
             QHBoxLayout,
             QLabel,
             QLineEdit,
             QPlainTextEdit,
             QPushButton,
+            QStackedLayout,
             QVBoxLayout,
             QWidget,
         )
@@ -398,6 +617,8 @@ class MainWindow:
         self.avatar_description_edit.setMaximumHeight(92)
         choose = QPushButton("选择参考形象")
         choose.clicked.connect(lambda: self._choose_avatar(QFileDialog))
+        clear_avatar = QPushButton("清空参考形象")
+        clear_avatar.clicked.connect(self.clear_avatar_profile)
         save = self._mark_button(QPushButton("保存形象与风格"))
         save.clicked.connect(self.save_avatar_profile)
         avatar_layout.addWidget(self.avatar_preview, 1)
@@ -405,6 +626,7 @@ class MainWindow:
         avatar_layout.addWidget(self.avatar_description_edit)
         avatar_actions = QHBoxLayout()
         avatar_actions.addWidget(choose)
+        avatar_actions.addWidget(clear_avatar)
         avatar_actions.addWidget(save)
         avatar_layout.addLayout(avatar_actions)
         columns.addWidget(avatar_card, 1)
@@ -413,8 +635,8 @@ class MainWindow:
         style_layout = QVBoxLayout(style_card)
         self.art_style_combo = QComboBox()
         for style in ART_STYLES:
-            self.art_style_combo.addItem(f"{style.name}  ·  {style.tagline}", style.id)
-        self.art_style_combo.addItem("自定义风格  ·  用自己的 200 字提示词", CUSTOM_ART_STYLE_ID)
+            self.art_style_combo.addItem(style.name, style.id)
+        self.art_style_combo.addItem("自定义风格", CUSTOM_ART_STYLE_ID)
         self.art_style_combo.currentIndexChanged.connect(self._on_art_style_changed)
         self.art_style_description = QLabel()
         self.art_style_description.setWordWrap(True)
@@ -429,23 +651,43 @@ class MainWindow:
         self.custom_style_counter.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.custom_style_counter.setProperty("muted", True)
 
-        history_label = QLabel("用一条成功记录测试当前风格")
+        history_label = QLabel("使用一条成功回忆预览当前风格")
         history_label.setStyleSheet("font-weight:650; margin-top:8px;")
         self.style_test_job_combo = QComboBox()
         self.style_test_job_combo.setPlaceholderText("选择历史日报")
         self.style_test_button = self._mark_button(
-            QPushButton("只生成一张风格试片（调用 1 次 Seedream）"), "accent"
+            QPushButton("预览当前风格"), "accent"
         )
         self.style_test_button.clicked.connect(self.test_current_art_style)
         self.style_test_status = QLabel("不会重新分析视频、音频或 IMU，也不会发送邮件。")
         self.style_test_status.setProperty("muted", True)
         self.style_test_status.setWordWrap(True)
-        self.style_preview = QLabel("新风格试片会显示在这里")
+        preview_holder = QFrame()
+        preview_holder.setObjectName("stylePreviewHolder")
+        preview_stack = QStackedLayout(preview_holder)
+        preview_stack.setStackingMode(QStackedLayout.StackingMode.StackAll)
+        clickable_preview = ClickableImageLabel("新风格预览会显示在这里")
+        self.style_preview = clickable_preview.widget
         self.style_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.style_preview.setMinimumHeight(240)
-        self.style_preview.setStyleSheet(
-            "border:1px solid #242424; border-radius:12px; background:#050505; color:#777777;"
-        )
+        self.style_preview.setCursor(Qt.CursorShape.PointingHandCursor)
+        clickable_preview.clicked.connect(self.open_style_preview)
+        preview_stack.addWidget(self.style_preview)
+        spinner_layer = QWidget()
+        spinner_layout = QVBoxLayout(spinner_layer)
+        spinner_layout.addStretch(1)
+        self.style_preview_spinner = Spinner(spinner_layer, 44)
+        spinner_layout.addWidget(self.style_preview_spinner.widget, alignment=Qt.AlignmentFlag.AlignCenter)
+        spinner_layout.addStretch(1)
+        preview_stack.addWidget(spinner_layer)
+        spinner_layer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.style_preview_spinner_layer = spinner_layer
+        self.style_preview_spinner.stop()
+        spinner_layer.hide()
+        self.style_download_button = QPushButton("下载图片")
+        self.style_download_button.setProperty("role", "link")
+        self.style_download_button.clicked.connect(self.download_style_preview)
+        self.style_download_button.hide()
         style_layout.addWidget(self.art_style_combo)
         style_layout.addWidget(self.art_style_description)
         style_layout.addWidget(self.custom_style_edit)
@@ -454,13 +696,99 @@ class MainWindow:
         style_layout.addWidget(self.style_test_job_combo)
         style_layout.addWidget(self.style_test_button)
         style_layout.addWidget(self.style_test_status)
-        style_layout.addWidget(self.style_preview, 1)
+        style_layout.addWidget(preview_holder, 1)
+        style_layout.addWidget(self.style_download_button, alignment=Qt.AlignmentFlag.AlignRight)
         columns.addWidget(style_card, 1)
         layout.addLayout(columns, 1)
         self._on_art_style_changed()
         return page
 
-    def _settings_page_v2(self):
+    def _settings_hub_page(self):
+        from PySide6.QtWidgets import QStackedWidget, QVBoxLayout, QWidget
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_stack = QStackedWidget()
+        self.settings_stack.setObjectName("settingsStack")
+        self.settings_stack.addWidget(self._simple_settings_page())
+        self.settings_stack.addWidget(self._developer_settings_page())
+        self.settings_stack.addWidget(self._developer_history_page())
+        self.settings_stack.addWidget(self._manual_debug_page())
+        layout.addWidget(self.settings_stack)
+        return page
+
+    def _simple_settings_page(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import (
+            QFrame,
+            QGridLayout,
+            QGroupBox,
+            QHBoxLayout,
+            QLabel,
+            QLineEdit,
+            QPushButton,
+            QVBoxLayout,
+            QWidget,
+        )
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 24, 30, 28)
+        layout.setSpacing(18)
+        layout.addWidget(self._page_header("设置", "查看当前服务分工，并设置日报的默认收件地址。"))
+
+        model_grid = QGridLayout()
+        model_grid.setSpacing(12)
+        self.model_summary_labels: dict[str, QLabel] = {}
+        for index, (key, task, default) in enumerate(
+            (
+                ("scene", "关键帧理解", "qwen3.7-plus"),
+                ("omni", "音视频与 OCR", "qwen3.5-omni-plus"),
+                ("daily", "日报编排", "deepseek-v4-pro"),
+                ("image", "海报生成", "doubao-seedream-5-0-pro"),
+            )
+        ):
+            card = QFrame()
+            card.setObjectName("modelCard")
+            card_layout = QVBoxLayout(card)
+            task_label = QLabel(task)
+            task_label.setProperty("muted", True)
+            model_label = QLabel(default)
+            model_label.setObjectName("modelName")
+            model_label.setWordWrap(True)
+            card_layout.addWidget(task_label)
+            card_layout.addWidget(model_label)
+            self.model_summary_labels[key] = model_label
+            model_grid.addWidget(card, 0, index)
+        layout.addLayout(model_grid)
+
+        mail_group = QGroupBox("日报收件地址")
+        mail_layout = QVBoxLayout(mail_group)
+        current_row = QHBoxLayout()
+        current_row.addWidget(QLabel("当前收件地址"))
+        self.current_recipient_label = QLabel("尚未设置")
+        self.current_recipient_label.setObjectName("recipientValue")
+        current_row.addWidget(self.current_recipient_label, 1)
+        mail_layout.addLayout(current_row)
+        edit_row = QHBoxLayout()
+        self.simple_recipient_edit = QLineEdit()
+        self.simple_recipient_edit.setPlaceholderText("name@example.com")
+        self.save_recipient_button = self._mark_button(QPushButton("保存收件地址"))
+        self.save_recipient_button.clicked.connect(self.save_recipient_setting)
+        edit_row.addWidget(self.simple_recipient_edit, 1)
+        edit_row.addWidget(self.save_recipient_button)
+        mail_layout.addLayout(edit_row)
+        layout.addWidget(mail_group)
+        layout.addStretch(1)
+
+        developer_link = QPushButton("进入开发者设置")
+        developer_link.setProperty("role", "link")
+        developer_link.clicked.connect(lambda: self.settings_stack.setCurrentIndex(1))
+        layout.addWidget(developer_link, alignment=Qt.AlignmentFlag.AlignHCenter)
+        return page
+
+    def _developer_settings_page(self):
         from PySide6.QtWidgets import (
             QComboBox,
             QFormLayout,
@@ -481,7 +809,7 @@ class MainWindow:
         layout.setSpacing(14)
         layout.addWidget(
             self._page_header(
-                "服务设置",
+                "开发者设置",
                 "只需首次填写。密钥保存在 Windows 凭据管理器，并按你的要求在此页明文显示。",
             )
         )
@@ -569,7 +897,91 @@ class MainWindow:
         bottom.addStretch(1)
         bottom.addWidget(self.data_usage_label)
         layout.addLayout(bottom)
+        developer_routes = QHBoxLayout()
+        back = QPushButton("返回设置")
+        back.setProperty("role", "link")
+        generation_records = QPushButton("生成记录")
+        manual_debug = QPushButton("手动调试")
+        back.clicked.connect(lambda: self.settings_stack.setCurrentIndex(0))
+        generation_records.clicked.connect(lambda: self.settings_stack.setCurrentIndex(2))
+        manual_debug.clicked.connect(lambda: self.settings_stack.setCurrentIndex(3))
+        developer_routes.addWidget(back)
+        developer_routes.addStretch(1)
+        developer_routes.addWidget(generation_records)
+        developer_routes.addWidget(manual_debug)
+        layout.addLayout(developer_routes)
         self.refresh_data_usage()
+        return page
+
+    def _developer_history_page(self):
+        from PySide6.QtWidgets import QHBoxLayout, QListWidget, QPushButton, QVBoxLayout, QWidget
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 24, 30, 28)
+        layout.setSpacing(14)
+        layout.addWidget(
+            self._page_header(
+                "生成记录",
+                "完整任务记录与恢复工具。普通用户的“回忆”页只展示已经成功完成的内容。",
+            )
+        )
+        row = QHBoxLayout()
+        back = QPushButton("返回开发者设置")
+        back.setProperty("role", "link")
+        refresh = QPushButton("刷新")
+        self.dev_open_report_button = self._mark_button(QPushButton("打开日报"))
+        self.edit_report_button = QPushButton("修改地点与文字")
+        self.regenerate_button = QPushButton("重新编排并生成")
+        self.dev_resend_button = QPushButton("手动再次发送")
+        self.retry_job_button = QPushButton("重试失败任务")
+        self.retry_cleanup_button = QPushButton("重试设备清理")
+        back.clicked.connect(lambda: self.settings_stack.setCurrentIndex(1))
+        for widget in (
+            back,
+            refresh,
+            self.dev_open_report_button,
+            self.edit_report_button,
+            self.regenerate_button,
+            self.dev_resend_button,
+            self.retry_job_button,
+            self.retry_cleanup_button,
+        ):
+            row.addWidget(widget)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.history_list = QListWidget()
+        self.history_list.setObjectName("developerHistoryList")
+        layout.addWidget(self.history_list, 1)
+        refresh.clicked.connect(self.refresh_history)
+        self.dev_open_report_button.clicked.connect(self.open_selected_report)
+        self.edit_report_button.clicked.connect(self.edit_selected_report)
+        self.regenerate_button.clicked.connect(self.regenerate_selected_report)
+        self.dev_resend_button.clicked.connect(self.resend_selected_report)
+        self.retry_job_button.clicked.connect(self.retry_selected_job)
+        self.retry_cleanup_button.clicked.connect(self.retry_selected_cleanup)
+        self.history_list.itemDoubleClicked.connect(lambda _item: self.open_selected_report())
+        return page
+
+    def _manual_debug_page(self):
+        from PySide6.QtWidgets import QHBoxLayout, QPushButton, QTabWidget, QVBoxLayout, QWidget
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 20, 24, 24)
+        top = QHBoxLayout()
+        back = QPushButton("返回开发者设置")
+        back.setProperty("role", "link")
+        back.clicked.connect(lambda: self.settings_stack.setCurrentIndex(1))
+        top.addWidget(back)
+        top.addStretch(1)
+        layout.addLayout(top)
+        debug_tabs = QTabWidget()
+        debug_tabs.setObjectName("manualDebugTabs")
+        debug_tabs.addTab(self._device_page(), "设备")
+        debug_tabs.addTab(self._records_page(), "记录")
+        debug_tabs.addTab(self._distillation_page(), "生成")
+        layout.addWidget(debug_tabs, 1)
         return page
 
     @staticmethod
@@ -766,40 +1178,22 @@ class MainWindow:
         layout = QVBoxLayout(page)
         layout.setContentsMargins(30, 24, 30, 28)
         layout.setSpacing(14)
-        layout.addWidget(
-            self._page_header("我的回忆", "打开、微调或再次发送已经完成的日报；失败任务也可以从这里恢复。")
-        )
+        layout.addWidget(self._page_header("我的回忆", "这里保存着已经完成的每日蒸馏。双击即可打开回看。"))
         row = QHBoxLayout()
-        refresh = QPushButton("刷新")
-        self.open_report_button = self._mark_button(QPushButton("打开日报"))
-        self.edit_report_button = QPushButton("修改地点与文字")
-        self.regenerate_button = QPushButton("重新编排并生成")
-        self.resend_button = QPushButton("手动再次发送")
-        self.retry_job_button = QPushButton("重试失败任务")
-        self.retry_cleanup_button = QPushButton("重试设备清理")
-        for widget in (
-            refresh,
-            self.open_report_button,
-            self.edit_report_button,
-            self.regenerate_button,
-            self.resend_button,
-            self.retry_job_button,
-            self.retry_cleanup_button,
-        ):
+        self.open_report_button = self._mark_button(QPushButton("打开回忆"))
+        self.resend_button = QPushButton("再次发送")
+        self.resend_other_button = QPushButton("发送到其他邮箱")
+        for widget in (self.open_report_button, self.resend_button, self.resend_other_button):
             row.addWidget(widget)
         row.addStretch(1)
         layout.addLayout(row)
-        self.history_list = QListWidget()
-        self.history_list.setObjectName("historyList")
-        layout.addWidget(self.history_list, 1)
-        refresh.clicked.connect(self.refresh_history)
-        self.open_report_button.clicked.connect(self.open_selected_report)
-        self.edit_report_button.clicked.connect(self.edit_selected_report)
-        self.regenerate_button.clicked.connect(self.regenerate_selected_report)
-        self.resend_button.clicked.connect(self.resend_selected_report)
-        self.retry_job_button.clicked.connect(self.retry_selected_job)
-        self.retry_cleanup_button.clicked.connect(self.retry_selected_cleanup)
-        self.history_list.itemDoubleClicked.connect(lambda _item: self.open_selected_report())
+        self.memory_list = QListWidget()
+        self.memory_list.setObjectName("historyList")
+        layout.addWidget(self.memory_list, 1)
+        self.open_report_button.clicked.connect(lambda: self.open_selected_report(self.memory_list))
+        self.resend_button.clicked.connect(lambda: self.resend_selected_report(self.memory_list))
+        self.resend_other_button.clicked.connect(self.resend_selected_to_other_email)
+        self.memory_list.itemDoubleClicked.connect(lambda _item: self.open_selected_report(self.memory_list))
         return page
 
     def _settings_page(self):
@@ -973,6 +1367,129 @@ class MainWindow:
         except Exception as exc:
             self.records_hint.setText(f"扫描失败：{exc}")
 
+    def start_guided_workflow(self) -> None:
+        """Enter the production one-click flow and begin 1 Hz device discovery."""
+        self.sync_countdown_timer.stop()
+        self.guided_phase = "discovering"
+        self.guided_discovery_inflight = False
+        self.guided_sync_workflow = None
+        self.guided_synced_day = None
+        self.connect_success_icon.hide()
+        self.connect_spinner.start()
+        self.guided_connection_status.setText("正在寻找设备")
+        self.home_stack.setCurrentIndex(1)
+        self.discovery_timer.start()
+        self._guided_discovery_tick()
+
+    def _guided_discovery_tick(self) -> None:
+        if self.guided_phase != "discovering" or self.guided_discovery_inflight:
+            return
+        self.guided_discovery_inflight = True
+        self.worker.run("guided_discover", find_device)
+
+    def _guided_start_sync(self) -> None:
+        self.discovery_timer.stop()
+        self.sync_countdown_timer.stop()
+        self.guided_phase = "syncing"
+        self.home_stack.setCurrentIndex(2)
+        self.guided_sync_progress.setValue(2)
+        self.guided_sync_subtitle.setText("正在切换设备状态并安全读取今天的记录，请稍等。")
+        self.guided_records_list.clear()
+        self.guided_records_list.hide()
+        self.guided_sync_actions.hide()
+
+        provider_mode = str(self.provider_combo.currentData() or "mainland")
+        target = date.today()
+        self.target_date.setDate(target)
+
+        def work():
+            # Import itself does not call cloud providers. Keeping a deterministic
+            # provider here lets synchronization succeed before API credentials
+            # are needed; the selected provider is persisted on the job.
+            pipeline = self._create_pipeline("mock")
+            workflow = LegacyDeviceWorkflow(
+                pipeline,
+                status=lambda message: self.events.put(("guided_message", message, None)),
+            )
+            synced = workflow.sync_day(target, provider_mode=provider_mode)
+            return workflow, synced
+
+        self.worker.run("guided_sync", work)
+
+    def _guided_countdown_tick(self) -> None:
+        self.guided_countdown -= 1
+        if self.guided_countdown <= 0:
+            self.sync_countdown_timer.stop()
+            self._guided_start_distillation()
+            return
+        self.guided_start_distill_button.setText(f"开始蒸馏（{self.guided_countdown}s）")
+
+    def _guided_start_distillation(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        self.sync_countdown_timer.stop()
+        if self.guided_synced_day is None:
+            QMessageBox.information(self.window, "尚未同步", "请先等待设备记录同步完成。")
+            return
+        self.guided_phase = "distilling"
+        self._set_busy(True)
+        self.home_stack.setCurrentIndex(3)
+        self.guided_distill_progress.setValue(1)
+        self.guided_live_progress.clear()
+        self.guided_live_progress.appendPlainText("本地数据已校验，正在准备分析…")
+        self.guided_eta_label.setText("正在估算剩余时间")
+        self.guided_started_at = time.monotonic()
+        synced = self.guided_synced_day
+        provider_mode = self.database.get_job(synced.job_id).provider_mode
+
+        def work():
+            pipeline = self._create_pipeline(provider_mode)
+            workflow = LegacyDeviceWorkflow(
+                pipeline,
+                status=lambda message: self.events.put(("guided_message", message, None)),
+            )
+            self.guided_sync_workflow = workflow
+            return workflow.process_synced(
+                synced.job_id, avatar_references=self._avatar_references()
+            )
+
+        self.worker.run("guided_distill", work)
+
+    def _guided_progress_value(self, stage: JobStage, progress: float) -> int:
+        ranges = {
+            JobStage.VALIDATING: (3, 8),
+            JobStage.PREPROCESSING: (8, 34),
+            JobStage.ANALYZING: (34, 64),
+            JobStage.GENERATING: (64, 82),
+            JobStage.RENDERING: (82, 89),
+            JobStage.EMAILING: (89, 95),
+            JobStage.CLEANUP: (95, 99),
+            JobStage.COMPLETED: (100, 100),
+        }
+        low, high = ranges.get(stage, (1, 99))
+        return max(low, min(high, round(low + (high - low) * max(0.0, min(1.0, progress)))))
+
+    def _update_guided_eta(self, percent: int) -> None:
+        if percent < 3 or not self.guided_started_at:
+            self.guided_eta_label.setText("正在估算剩余时间")
+            return
+        elapsed = max(1.0, time.monotonic() - self.guided_started_at)
+        remaining = elapsed * (100 - percent) / max(1, percent)
+        if remaining >= 90:
+            text = f"预计剩余 {max(2, round(remaining / 60))} 分钟"
+        else:
+            text = f"预计剩余 {max(1, round(remaining))} 秒"
+        self.guided_eta_label.setText(text)
+
+    def _finish_guided_workflow(self) -> None:
+        self.discovery_timer.stop()
+        self.sync_countdown_timer.stop()
+        self.guided_phase = "idle"
+        self.guided_sync_workflow = None
+        self.guided_synced_day = None
+        self.home_stack.setCurrentIndex(0)
+        self._select_tab("开始")
+
     def start_folder_distillation(self) -> None:
         from PySide6.QtWidgets import QMessageBox
 
@@ -1073,6 +1590,7 @@ class MainWindow:
         from PySide6.QtCore import Qt
 
         self.history_list.clear()
+        self.memory_list.clear()
         if hasattr(self, "style_test_job_combo"):
             self.style_test_job_combo.clear()
         for job in self.database.list_jobs():
@@ -1088,18 +1606,28 @@ class MainWindow:
                 item_text += f"  ·  {job.error}"
             self.history_list.addItem(item_text)
             self.history_list.item(self.history_list.count() - 1).setData(Qt.ItemDataRole.UserRole, job.id)
-            if report_row is not None and hasattr(self, "style_test_job_combo"):
+            if job.stage == JobStage.COMPLETED and report_row is not None:
+                memory_text = f"{job.target_date.isoformat()}  ·  {report_title or '今日回忆'}"
+                self.memory_list.addItem(memory_text)
+                self.memory_list.item(self.memory_list.count() - 1).setData(
+                    Qt.ItemDataRole.UserRole, job.id
+                )
+            if (
+                job.stage == JobStage.COMPLETED
+                and report_row is not None
+                and hasattr(self, "style_test_job_combo")
+            ):
                 self.style_test_job_combo.addItem(
                     f"{job.target_date.isoformat()}  ·  {report_title or '已完成日报'}", job.id
                 )
         if hasattr(self, "data_usage_label"):
             self.refresh_data_usage()
 
-    def open_selected_report(self) -> None:
+    def open_selected_report(self, list_widget=None) -> None:
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QDesktopServices
 
-        job_id = self._selected_job_id()
+        job_id = self._selected_job_id(list_widget)
         if not job_id:
             return
         job = self.database.get_job(job_id)
@@ -1183,13 +1711,32 @@ class MainWindow:
             lambda: self._create_pipeline(provider_mode).regenerate(job_id, self._avatar_references()),
         )
 
-    def resend_selected_report(self) -> None:
-        job_id = self._selected_job_id()
+    def resend_selected_report(self, list_widget=None, recipient: str | None = None) -> None:
+        job_id = self._selected_job_id(list_widget)
         if not job_id:
             return
         provider_mode = self.database.get_job(job_id).provider_mode
         self._set_busy(True)
-        self._start("manual_resend", lambda: self._create_pipeline(provider_mode).resend(job_id))
+        self._start(
+            "manual_resend",
+            lambda: self._create_pipeline(provider_mode, recipient_override=recipient).resend(job_id),
+        )
+
+    def resend_selected_to_other_email(self) -> None:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+        job_id = self._selected_job_id(self.memory_list)
+        if not job_id:
+            QMessageBox.information(self.window, "选择回忆", "请先选择一条已经完成的回忆。")
+            return
+        value, accepted = QInputDialog.getText(self.window, "发送到其他邮箱", "收件人邮箱")
+        recipient = value.strip()
+        if not accepted:
+            return
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", recipient):
+            QMessageBox.warning(self.window, "邮箱格式无效", "请输入完整的收件人邮箱地址。")
+            return
+        self.resend_selected_report(self.memory_list, recipient)
 
     def save_settings(self) -> None:
         from PySide6.QtWidgets import QMessageBox
@@ -1340,7 +1887,21 @@ class MainWindow:
         )
         if selected:
             self.avatar_edit.setText(selected)
+            self.avatar_edit.setCursorPosition(0)
             self._update_avatar_preview(Path(selected))
+
+    def clear_avatar_profile(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        settings = self.database.get_setting("desktop_v2", {})
+        settings["avatar"] = ""
+        settings["avatar_description"] = ""
+        self.database.set_setting("desktop_v2", settings)
+        self.avatar_edit.clear()
+        self.avatar_description_edit.clear()
+        self.avatar_preview.clear()
+        self.avatar_preview.setText("未设置参考形象，生成时由模型自主决定")
+        QMessageBox.information(self.window, "参考形象", "参考形象设置已清空。")
 
     def save_avatar_profile(self) -> None:
         from PIL import Image
@@ -1379,6 +1940,7 @@ class MainWindow:
             self.database.set_setting("desktop_v2", settings)
             if destination is not None:
                 self.avatar_edit.setText(str(destination))
+                self.avatar_edit.setCursorPosition(0)
                 self._update_avatar_preview(destination)
         except Exception as exc:
             QMessageBox.warning(self.window, "参考形象保存失败", str(exc))
@@ -1448,6 +2010,9 @@ class MainWindow:
             return
         self._set_busy(True)
         self.style_test_status.setText(f"正在用“{style_name}”生成 1K 试片…")
+        self.style_preview_spinner_layer.show()
+        self.style_preview_spinner.start()
+        self.style_download_button.hide()
         self._start(
             "style_test",
             lambda: self._create_style_test_pipeline().regenerate_poster_only(
@@ -1462,9 +2027,12 @@ class MainWindow:
         from PySide6.QtGui import QPixmap
 
         pixmap = QPixmap(str(path))
+        self.style_preview_spinner.stop()
+        self.style_preview_spinner_layer.hide()
         if pixmap.isNull():
             self.style_preview.setText("图片已经生成，但预览加载失败")
             return
+        self.style_preview_path = path
         self.style_preview.setPixmap(
             pixmap.scaled(
                 self.style_preview.size(),
@@ -1472,6 +2040,49 @@ class MainWindow:
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+        self.style_download_button.show()
+
+    def open_style_preview(self) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtWidgets import QDialog, QLabel, QScrollArea, QVBoxLayout
+
+        path = self.style_preview_path
+        if not path or not path.is_file():
+            return
+        dialog = QDialog(self.window)
+        dialog.setWindowTitle("风格预览")
+        dialog.resize(840, 900)
+        layout = QVBoxLayout(dialog)
+        image = QLabel()
+        image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        image.setPixmap(QPixmap(str(path)))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(image)
+        layout.addWidget(scroll)
+        dialog.exec()
+
+    def download_style_preview(self) -> None:
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+        source = self.style_preview_path
+        if not source or not source.is_file():
+            return
+        destination, _ = QFileDialog.getSaveFileName(
+            self.window,
+            "保存风格预览",
+            source.name,
+            "Images (*.jpg *.jpeg *.png *.webp)",
+        )
+        if not destination:
+            return
+        try:
+            shutil.copy2(source, Path(destination))
+        except Exception as exc:
+            QMessageBox.warning(self.window, "保存失败", str(exc))
+            return
+        QMessageBox.information(self.window, "已保存", f"图片已保存到：{destination}")
 
     def _update_avatar_preview(self, path: Path) -> None:
         from PySide6.QtCore import Qt
@@ -1529,6 +2140,7 @@ class MainWindow:
             }
         )
         self.database.set_setting("desktop_v2", settings)
+        self._refresh_simple_settings_summary(settings)
         try:
             for field, credential in (
                 (self.api_key_edit, CredentialName.QWEN_API_KEY),
@@ -1542,6 +2154,36 @@ class MainWindow:
             QMessageBox.warning(self.window, "凭据保存失败", str(exc))
             return
         QMessageBox.information(self.window, "设置", "模型、Endpoint和Resend设置已保存。")
+
+    def save_recipient_setting(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        recipient = self.simple_recipient_edit.text().strip()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", recipient):
+            QMessageBox.warning(self.window, "邮箱格式无效", "请输入完整的日报收件邮箱。")
+            return
+        settings = self.database.get_setting("desktop_v2", {})
+        resend = dict(settings.get("resend", {}))
+        resend["recipient"] = recipient
+        settings["resend"] = resend
+        self.database.set_setting("desktop_v2", settings)
+        self.resend_recipient_edit.setText(recipient)
+        self._refresh_simple_settings_summary(settings)
+        QMessageBox.information(self.window, "收件地址", "日报收件地址已保存。")
+
+    def _refresh_simple_settings_summary(self, settings: dict[str, Any]) -> None:
+        models = settings.get("models", {})
+        for key, label in self.model_summary_labels.items():
+            defaults = {
+                "scene": "qwen3.7-plus",
+                "omni": "qwen3.5-omni-plus",
+                "daily": "deepseek-v4-pro",
+                "image": "doubao-seedream-5-0-pro",
+            }
+            label.setText(str(models.get(key, defaults[key])))
+        recipient = str(settings.get("resend", {}).get("recipient", "")).strip()
+        self.current_recipient_label.setText(recipient or "尚未设置")
+        self.simple_recipient_edit.setText(recipient)
 
     def _load_cloud_settings(self) -> None:
         settings = self.database.get_setting("desktop_v2", {})
@@ -1565,6 +2207,7 @@ class MainWindow:
             self.resend_security_combo.setCurrentIndex(index)
         self.resend_sender_edit.setText(resend.get("sender", ""))
         self.resend_recipient_edit.setText(resend.get("recipient", ""))
+        self._refresh_simple_settings_summary(settings)
         for field, credential in (
             (self.api_key_edit, CredentialName.QWEN_API_KEY),
             (self.deepseek_key_edit, CredentialName.DEEPSEEK_API_KEY),
@@ -1577,6 +2220,7 @@ class MainWindow:
     def _load_avatar_profile(self) -> None:
         settings = self.database.get_setting("desktop_v2", {})
         self.avatar_edit.setText(settings.get("avatar", ""))
+        self.avatar_edit.setCursorPosition(0)
         self.avatar_description_edit.setPlainText(settings.get("avatar_description", ""))
         path = Path(self.avatar_edit.text()) if self.avatar_edit.text() else None
         if path and path.is_file():
@@ -1587,7 +2231,9 @@ class MainWindow:
         self.custom_style_edit.setPlainText(settings.get("custom_art_style_prompt", ""))
         self._on_art_style_changed()
 
-    def _create_pipeline(self, provider_mode: str) -> DistillationPipeline:
+    def _create_pipeline(
+        self, provider_mode: str, recipient_override: str | None = None
+    ) -> DistillationPipeline:
         settings = self.database.get_setting("desktop_v2", {})
         models = settings.get("models", {})
         endpoints = settings.get("endpoints", {})
@@ -1640,7 +2286,7 @@ class MainWindow:
                     security=resend.get("security", "ssl"),
                     username="resend",
                     sender=resend.get("sender", ""),
-                    recipient=resend.get("recipient", ""),
+                    recipient=recipient_override or resend.get("recipient", ""),
                 ),
                 resend_key,
             )
@@ -1705,10 +2351,11 @@ class MainWindow:
         value = self.target_date.date()
         return date(value.year(), value.month(), value.day())
 
-    def _selected_job_id(self) -> str | None:
+    def _selected_job_id(self, list_widget=None) -> str | None:
         from PySide6.QtCore import Qt
 
-        item = self.history_list.currentItem()
+        source = list_widget or self.history_list
+        item = source.currentItem()
         return str(item.data(Qt.ItemDataRole.UserRole)) if item else None
 
     def _select_tab(self, title: str) -> None:
@@ -1741,20 +2388,51 @@ class MainWindow:
                 return
             if name == "progress":
                 stage, progress, message = result
+                if self.guided_phase == "syncing" and stage == JobStage.IMPORTING:
+                    self.guided_sync_progress.setValue(max(5, min(94, round(progress * 94))))
+                    self.guided_sync_subtitle.setText(message)
+                elif self.guided_phase == "distilling":
+                    value = self._guided_progress_value(stage, progress)
+                    self.guided_distill_progress.setValue(value)
+                    self._update_guided_eta(value)
+                    self.guided_live_progress.appendPlainText(f"{stage.value}  ·  {message}")
                 self.stage_label.setText(f"{stage.value} · {message}")
                 self.progress_bar.setValue(round(progress * 1000))
                 self.distill_log.appendPlainText(f"[{stage.value}] {message}")
+                continue
+            if name == "guided_message":
+                if self.guided_phase == "syncing":
+                    self.guided_sync_subtitle.setText(str(result))
+                elif self.guided_phase == "distilling":
+                    self.guided_live_progress.appendPlainText(str(result))
                 continue
             if name == "progress_message":
                 self.distill_log.appendPlainText(str(result))
                 continue
             if error:
-                if name in {"distill", "cleanup_retry", "manual_regenerate", "manual_resend"}:
+                if name == "guided_discover":
+                    self.guided_discovery_inflight = False
+                    self.guided_connection_status.setText("正在寻找设备")
+                elif name == "guided_sync":
+                    self.guided_phase = "sync_error"
+                    self.guided_sync_subtitle.setText(f"同步失败：{error}")
+                    self.guided_sync_actions.show()
+                    self.guided_start_distill_button.hide()
+                    self.guided_resync_button.setText("重新同步")
+                elif name == "guided_distill":
+                    self.guided_phase = "distill_error"
+                    self.guided_live_progress.appendPlainText(f"蒸馏失败：{error}")
+                    self.guided_eta_label.setText("任务未完成")
+                    self._set_busy(False)
+                    self.refresh_history()
+                elif name in {"distill", "cleanup_retry", "manual_regenerate", "manual_resend"}:
                     self.stage_label.setText(f"失败 · {error}")
                     self.distill_log.appendPlainText(f"{name} 失败：{error}")
                     self._set_busy(False)
                     self.refresh_history()
                 elif name == "style_test":
+                    self.style_preview_spinner.stop()
+                    self.style_preview_spinner_layer.hide()
                     self.style_test_status.setText(f"生成失败：{error}")
                     self._set_busy(False)
                 else:
@@ -1763,7 +2441,54 @@ class MainWindow:
             self._handle_result(name, result)
 
     def _handle_result(self, name: str, result: Any) -> None:
-        if name == "auto_find":
+        if name == "guided_discover":
+            from PySide6.QtCore import QTimer
+
+            self.guided_discovery_inflight = False
+            if not result:
+                return
+            port, status = result
+            self.discovery_timer.stop()
+            self.refresh_ports()
+            self._select_port(port.device)
+            self._apply_status(status)
+            self.connect_spinner.stop()
+            self.connect_success_icon.show()
+            self.guided_connection_status.setText("设备已连接")
+            QTimer.singleShot(700, self._guided_start_sync)
+        elif name == "guided_sync":
+            workflow, synced = result
+            self.guided_sync_workflow = workflow
+            self.guided_synced_day = synced
+            self.guided_phase = "synced"
+            self.guided_sync_progress.setValue(100)
+            self.guided_records_list.clear()
+            for record_name in synced.record_names:
+                self.guided_records_list.addItem(record_name)
+            self.guided_records_list.show()
+            count = len(synced.record_names)
+            self.guided_sync_subtitle.setText(f"已同步 {count} 条数据，将在 3 秒后自动开始蒸馏。")
+            self.guided_start_distill_button.show()
+            self.guided_resync_button.setText("重新同步")
+            self.guided_sync_actions.show()
+            self.guided_countdown = 3
+            self.guided_start_distill_button.setText("开始蒸馏（3s）")
+            self.sync_countdown_timer.start()
+        elif name == "guided_distill":
+            self.guided_phase = "completed"
+            self.guided_distill_progress.setValue(100)
+            self.guided_eta_label.setText("已完成")
+            self.guided_live_progress.appendPlainText("每日蒸馏完成，邮件服务器已接受。")
+            recipient = str(
+                self.database.get_setting("desktop_v2", {}).get("resend", {}).get("recipient", "")
+            ).strip()
+            self.guided_complete_email.setText(
+                f"已发送至指定邮箱：{recipient}" if recipient else "邮件已发送至指定收件地址"
+            )
+            self.home_stack.setCurrentIndex(4)
+            self._set_busy(False)
+            self.refresh_history()
+        elif name == "auto_find":
             if not result:
                 self._device_log("没有找到 Day Distiller 协议串口。")
                 return
@@ -1860,6 +2585,8 @@ class MainWindow:
         self.edit_report_button.setDisabled(busy)
         self.regenerate_button.setDisabled(busy)
         self.resend_button.setDisabled(busy)
+        self.resend_other_button.setDisabled(busy)
+        self.dev_resend_button.setDisabled(busy)
         if hasattr(self, "style_test_button"):
             self.style_test_button.setDisabled(busy)
 
