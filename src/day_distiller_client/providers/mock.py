@@ -9,21 +9,25 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from ..domain import MotionAssessment
-from .base import ClaimOutput, DailySynthesis, DeliveryResult, PanelPlan, SceneAnalysis
+from .base import BatchAnalysis, ClaimOutput, DailySynthesis, DeliveryResult, PanelPlan, SceneAnalysis
 
 
 class MockAIProvider:
     """Deterministic offline provider used for development and acceptance tests."""
 
-    def transcribe(self, audio_path: Path) -> str:
-        return ""
+    def analyze_batch(self, frame_paths: list[Path], audio_path: Path | None) -> BatchAnalysis:
+        return BatchAnalysis(
+            transcript="",
+            frame_scores=[1.0 - index * 0.05 for index, _ in enumerate(frame_paths)],
+            media_quality=0.8 if frame_paths else 0.2,
+        )
 
     def analyze_scene(
         self,
         record_id: str,
         captured_at: datetime,
         frame_paths: list[Path],
-        transcript: str,
+        batch: BatchAnalysis,
         motion: MotionAssessment | None,
     ) -> SceneAnalysis:
         activity = motion.activity if motion else "unknown"
@@ -45,7 +49,7 @@ class MockAIProvider:
             visual_activity_confidence=confidence,
             semantic_significance=min(1.0, 0.45 + confidence * 0.3),
             novelty=0.5,
-            audio_value=0.2 if transcript else 0,
+            audio_value=0.2 if batch.transcript or batch.ambient_sounds else 0,
             memory_relevance=0,
             media_quality=0.8 if frame_paths else 0.2,
             claims=[
@@ -57,6 +61,9 @@ class MockAIProvider:
                 )
             ],
             privacy_flags=[],
+            ocr_text=batch.ocr_text,
+            ambient_sounds=batch.ambient_sounds,
+            selected_frame_indices=list(range(min(3, len(frame_paths)))),
         )
 
     def synthesize_day(self, report_date: date, scenes: list[dict[str, object]]) -> DailySynthesis:

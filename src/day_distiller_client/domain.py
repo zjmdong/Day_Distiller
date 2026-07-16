@@ -97,6 +97,8 @@ class SceneEvidence:
     privacy_flags: list[str] = field(default_factory=list)
     frame_paths: list[Path] = field(default_factory=list)
     visual_signature: str | None = None
+    ambient_sounds: list[str] = field(default_factory=list)
+    ocr_text: list[str] = field(default_factory=list)
 
     def to_json_dict(self) -> dict[str, Any]:
         value = asdict(self)

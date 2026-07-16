@@ -8,6 +8,9 @@ SERVICE_NAME = "DayDistillerV2"
 
 class CredentialName(StrEnum):
     OPENAI_API_KEY = "openai_api_key"
+    QWEN_API_KEY = "qwen_api_key"
+    DEEPSEEK_API_KEY = "deepseek_api_key"
+    VOLCENGINE_API_KEY = "volcengine_api_key"
     SMTP_PASSWORD = "smtp_password"
 
 
@@ -35,4 +38,3 @@ class CredentialStore:
             keyring.delete_password(self.service_name, str(name))
         except PasswordDeleteError:
             pass
-

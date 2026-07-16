@@ -7,6 +7,14 @@ from .base import (
     TranscriptionProvider,
 )
 from .mock import MockAIProvider, MockMailProvider
+from .mainland import (
+    DeepSeekSettings,
+    DeepSeekStoryProvider,
+    QwenEvidenceProvider,
+    QwenSettings,
+    SeedreamImageProvider,
+    SeedreamSettings,
+)
 from .openai_provider import ModelSettings, OpenAIProvider
 from .smtp_provider import SmtpMailProvider, SmtpSettings
 
@@ -16,6 +24,12 @@ __all__ = [
     "MailProvider",
     "MockAIProvider",
     "MockMailProvider",
+    "QwenEvidenceProvider",
+    "QwenSettings",
+    "DeepSeekStoryProvider",
+    "DeepSeekSettings",
+    "SeedreamImageProvider",
+    "SeedreamSettings",
     "ModelSettings",
     "OpenAIProvider",
     "SceneAnalysis",
@@ -24,4 +38,3 @@ __all__ = [
     "StoryProvider",
     "TranscriptionProvider",
 ]
-

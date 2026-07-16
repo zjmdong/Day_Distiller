@@ -55,6 +55,7 @@ class PipelineTests(unittest.TestCase):
                 mock,
                 mock,
                 mock,
+                mock,
                 MockMailProvider(root / "outbox"),
             )
 
@@ -87,7 +88,7 @@ class PipelineTests(unittest.TestCase):
             database = JobDatabase(paths.database)
             mock = MockAIProvider()
             pipeline = DistillationPipeline(
-                paths, database, mock, mock, mock, MockMailProvider(root / "outbox")
+                paths, database, mock, mock, mock, mock, MockMailProvider(root / "outbox")
             )
 
             job_id = pipeline.import_legacy(source, date(2026, 7, 15))
@@ -107,7 +108,7 @@ class PipelineTests(unittest.TestCase):
             database = JobDatabase(paths.database)
             mock = MockAIProvider()
             pipeline = DistillationPipeline(
-                paths, database, mock, mock, mock, _RejectingMailProvider()
+                paths, database, mock, mock, mock, mock, _RejectingMailProvider()
             )
             cleanup_calls = []
             job_id = pipeline.import_legacy(source, date(2026, 7, 15))

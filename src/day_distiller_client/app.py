@@ -18,10 +18,14 @@ from .media import MediaPreprocessor
 from .paths import AppPaths
 from .pipeline import DistillationPipeline
 from .providers import (
+    DeepSeekSettings,
+    DeepSeekStoryProvider,
     MockAIProvider,
     MockMailProvider,
-    ModelSettings,
-    OpenAIProvider,
+    QwenEvidenceProvider,
+    QwenSettings,
+    SeedreamImageProvider,
+    SeedreamSettings,
     SmtpMailProvider,
     SmtpSettings,
 )
@@ -224,7 +228,7 @@ class MainWindow:
         top = QHBoxLayout()
         self.provider_combo = QComboBox()
         self.provider_combo.addItem("离线 Mock（零云端调用）", "mock")
-        self.provider_combo.addItem("OpenAI + SMTP", "openai")
+        self.provider_combo.addItem("中国大陆模型工作流 + SMTP", "mainland")
         self.delete_virtual_source = QCheckBox("邮件成功后删除所选虚拟卡记录")
         self.start_folder_button = QPushButton("从文件夹开始蒸馏")
         self.start_device_button = QPushButton("从当前设备一键蒸馏")
@@ -312,11 +316,15 @@ class MainWindow:
         form = QFormLayout()
         self.api_key_edit = QLineEdit()
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.deepseek_key_edit = QLineEdit()
+        self.deepseek_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.volcengine_key_edit = QLineEdit()
+        self.volcengine_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key_edit.setPlaceholderText("留空则保留已保存的 Key")
-        self.scene_model_edit = QLineEdit("gpt-5.6-terra")
-        self.daily_model_edit = QLineEdit("gpt-5.6-sol")
-        self.transcription_model_edit = QLineEdit("gpt-4o-transcribe")
-        self.image_model_edit = QLineEdit("gpt-image-2")
+        self.scene_model_edit = QLineEdit("qwen3.7-plus")
+        self.omni_model_edit = QLineEdit("qwen3.5-omni-plus")
+        self.daily_model_edit = QLineEdit("deepseek-v4-pro")
+        self.image_model_edit = QLineEdit("doubao-seedream-5-0-pro")
         self.smtp_host_edit = QLineEdit()
         self.smtp_port_edit = QSpinBox()
         self.smtp_port_edit.setRange(1, 65535)
@@ -340,10 +348,12 @@ class MainWindow:
         avatar_row = QHBoxLayout()
         avatar_row.addWidget(self.avatar_edit)
         avatar_row.addWidget(avatar_browse)
-        form.addRow("OpenAI API Key", self.api_key_edit)
+        form.addRow("阿里云百炼 API Key", self.api_key_edit)
+        form.addRow("DeepSeek API Key", self.deepseek_key_edit)
+        form.addRow("Volcengine API Key", self.volcengine_key_edit)
         form.addRow("逐片理解模型", self.scene_model_edit)
+        form.addRow("批量音视频/OCR模型", self.omni_model_edit)
         form.addRow("全天综合模型", self.daily_model_edit)
-        form.addRow("音频转写模型", self.transcription_model_edit)
         form.addRow("漫画生图模型", self.image_model_edit)
         form.addRow("SMTP 主机", self.smtp_host_edit)
         form.addRow("SMTP 端口", self.smtp_port_edit)
@@ -618,8 +628,8 @@ class MainWindow:
         settings = {
             "models": {
                 "scene": self.scene_model_edit.text().strip(),
+                "omni": self.omni_model_edit.text().strip(),
                 "daily": self.daily_model_edit.text().strip(),
-                "transcription": self.transcription_model_edit.text().strip(),
                 "image": self.image_model_edit.text().strip(),
             },
             "smtp": {
@@ -636,9 +646,14 @@ class MainWindow:
         }
         self.database.set_setting("desktop_v2", settings)
         try:
-            if self.api_key_edit.text():
-                self.credentials.set(CredentialName.OPENAI_API_KEY, self.api_key_edit.text())
-                self.api_key_edit.clear()
+            for field, credential in (
+                (self.api_key_edit, CredentialName.QWEN_API_KEY),
+                (self.deepseek_key_edit, CredentialName.DEEPSEEK_API_KEY),
+                (self.volcengine_key_edit, CredentialName.VOLCENGINE_API_KEY),
+            ):
+                if field.text():
+                    self.credentials.set(credential, field.text())
+                    field.clear()
             if self.smtp_password_edit.text():
                 self.credentials.set(CredentialName.SMTP_PASSWORD, self.smtp_password_edit.text())
                 self.smtp_password_edit.clear()
@@ -662,8 +677,8 @@ class MainWindow:
         models = settings.get("models", {})
         smtp = settings.get("smtp", {})
         self.scene_model_edit.setText(models.get("scene", self.scene_model_edit.text()))
+        self.omni_model_edit.setText(models.get("omni", self.omni_model_edit.text()))
         self.daily_model_edit.setText(models.get("daily", self.daily_model_edit.text()))
-        self.transcription_model_edit.setText(models.get("transcription", self.transcription_model_edit.text()))
         self.image_model_edit.setText(models.get("image", self.image_model_edit.text()))
         self.smtp_host_edit.setText(smtp.get("host", ""))
         self.smtp_port_edit.setValue(int(smtp.get("port", 465)))
@@ -680,19 +695,32 @@ class MainWindow:
         settings = self.database.get_setting("desktop_v2", {})
         models = settings.get("models", {})
         if provider_mode == "mock":
-            ai = MockAIProvider()
+            scene = story = batch = image = MockAIProvider()
             mail = MockMailProvider(self.paths.root / "mock_outbox")
         else:
-            api_key = self.credentials.get(CredentialName.OPENAI_API_KEY)
-            if not api_key:
+            qwen_key = self.credentials.get(CredentialName.QWEN_API_KEY)
+            deepseek_key = self.credentials.get(CredentialName.DEEPSEEK_API_KEY)
+            volcengine_key = self.credentials.get(CredentialName.VOLCENGINE_API_KEY)
+            if not all((qwen_key, deepseek_key, volcengine_key)):
                 raise RuntimeError("请先在设置页保存 OpenAI API Key")
-            model_settings = ModelSettings(
-                scene_model=models.get("scene", "gpt-5.6-terra"),
-                daily_model=models.get("daily", "gpt-5.6-sol"),
-                transcription_model=models.get("transcription", "gpt-4o-transcribe"),
-                image_model=models.get("image", "gpt-image-2"),
+            scene = QwenEvidenceProvider(
+                api_key=qwen_key,
+                settings=QwenSettings(
+                    keyframe_model=models.get("scene", "qwen3.7-plus"),
+                    omni_model=models.get("omni", "qwen3.5-omni-plus"),
+                ),
             )
-            ai = OpenAIProvider(api_key=api_key, settings=model_settings)
+            batch = scene
+            story = DeepSeekStoryProvider(
+                api_key=deepseek_key,
+                settings=DeepSeekSettings(daily_model=models.get("daily", "deepseek-v4-pro")),
+            )
+            image = SeedreamImageProvider(
+                api_key=volcengine_key,
+                settings=SeedreamSettings(
+                    image_model=models.get("image", "doubao-seedream-5-0-pro")
+                ),
+            )
             smtp = settings.get("smtp", {})
             smtp_settings = SmtpSettings(
                 host=smtp.get("host", ""),
@@ -709,9 +737,10 @@ class MainWindow:
         return DistillationPipeline(
             self.paths,
             self.database,
-            ai,
-            ai,
-            ai,
+            scene,
+            story,
+            batch,
+            image,
             mail,
             media_preprocessor=MediaPreprocessor(ffmpeg, ffprobe),
             motion_model_path=Path(settings["motion_model"]) if settings.get("motion_model") else None,

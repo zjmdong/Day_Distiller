@@ -30,6 +30,21 @@ class SceneAnalysis(BaseModel):
     media_quality: float = Field(ge=0, le=1)
     claims: list[ClaimOutput]
     privacy_flags: list[str]
+    ocr_text: list[str] = Field(default_factory=list)
+    ambient_sounds: list[str] = Field(default_factory=list)
+    selected_frame_indices: list[int] = Field(default_factory=list)
+
+
+class BatchAnalysis(BaseModel):
+    """Evidence extracted once by the omni model before key-frame review."""
+
+    transcript: str = ""
+    ambient_sounds: list[str] = Field(default_factory=list)
+    ocr_text: list[str] = Field(default_factory=list)
+    visual_observations: list[str] = Field(default_factory=list)
+    frame_scores: list[float] = Field(default_factory=list)
+    media_quality: float = Field(default=0, ge=0, le=1)
+    privacy_flags: list[str] = Field(default_factory=list)
 
 
 class PanelPlan(BaseModel):
@@ -53,20 +68,30 @@ class DeliveryResult:
     response: str
 
 
+class BatchMultimodalProvider(Protocol):
+    def analyze_batch(
+        self, frame_paths: list[Path], audio_path: Path | None
+    ) -> BatchAnalysis: ...
+
+
 class TranscriptionProvider(Protocol):
+    """Legacy compatibility protocol; new workflows should use BatchMultimodalProvider."""
+
     def transcribe(self, audio_path: Path) -> str: ...
 
 
-class StoryProvider(Protocol):
+class SceneProvider(Protocol):
     def analyze_scene(
         self,
         record_id: str,
         captured_at: datetime,
         frame_paths: list[Path],
-        transcript: str,
+        batch: BatchAnalysis,
         motion: MotionAssessment | None,
     ) -> SceneAnalysis: ...
 
+
+class StoryProvider(Protocol):
     def synthesize_day(self, report_date: date, scenes: list[dict[str, object]]) -> DailySynthesis: ...
 
 
@@ -89,4 +114,3 @@ class MailProvider(Protocol):
         inline_images: dict[str, Path],
         message_id: str,
     ) -> DeliveryResult: ...
-

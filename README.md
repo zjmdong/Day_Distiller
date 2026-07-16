@@ -10,7 +10,7 @@ Day Distiller 的 Windows 上位机与“AI 每日蒸馏”工作流。当前版
 - SQLite 可恢复任务状态机；失败记录错误与恢复阶段。
 - FFprobe/FFmpeg 媒体验证、0.5/2.5/4.5 秒关键帧与场景变化补帧。
 - IMU 特征、启发式活动/携带形态分类，以及可加载的 scikit-learn 模型。
-- OpenAI 结构化逐片理解、全天综合、音频转写和无文字漫画生图。
+- 中国大陆多模型工作流：Qwen 3.5 Omni Plus批量音视频/OCR、Qwen 3.7 Plus关键帧复核、DeepSeek V4 Pro全天编排、Seedream 5.0 Pro无文字漫画生图。
 - 确定性 Mock AI 与本地 `.eml` outbox，可在没有 API Key、SMTP 或设备时验收。
 - 同版 HTML/PDF、SMTP、确定性 Message-ID、发送回执和邮件成功后的精确设备清理。
 - 日报修改、地点记忆、重新生成和手动再次发送。
@@ -28,7 +28,7 @@ python -m pip install -e .[dev]
 
 真实模式请依次阅读：
 
-- [OpenAI 配置](docs/openai-setup.md)
+- [中国大陆模型配置](docs/mainland-model-setup.md)
 - [SMTP 配置](docs/smtp-setup.md)
 - [漫画参考形象](docs/avatar-setup.md)
 - [IMU 数据采集与训练](docs/imu-data-collection.md)

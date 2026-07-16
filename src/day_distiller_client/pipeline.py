@@ -19,7 +19,7 @@ from .legacy_import import (
 )
 from .media import MediaPreprocessor, PreprocessedMedia, image_average_hash
 from .paths import AppPaths
-from .providers.base import ImageProvider, MailProvider, StoryProvider, TranscriptionProvider
+from .providers.base import BatchMultimodalProvider, ImageProvider, MailProvider, SceneProvider, StoryProvider
 from .reporting import RenderedReport, ReportRenderer, day_report_from_json
 
 
@@ -40,8 +40,9 @@ class DistillationPipeline:
         self,
         paths: AppPaths,
         database: JobDatabase,
+        scene_provider: SceneProvider,
         story_provider: StoryProvider,
-        transcription_provider: TranscriptionProvider,
+        batch_provider: BatchMultimodalProvider,
         image_provider: ImageProvider,
         mail_provider: MailProvider,
         media_preprocessor: MediaPreprocessor | None = None,
@@ -51,8 +52,9 @@ class DistillationPipeline:
     ) -> None:
         self.paths = paths.ensure()
         self.database = database
+        self.scene_provider = scene_provider
         self.story_provider = story_provider
-        self.transcription_provider = transcription_provider
+        self.batch_provider = batch_provider
         self.image_provider = image_provider
         self.mail_provider = mail_provider
         self.media = media_preprocessor or MediaPreprocessor()
@@ -194,9 +196,10 @@ class DistillationPipeline:
                     motion = analyze_imu(record.imu_path, self.motion_model_path)
                 except Exception:
                     motion = None
-            transcript = self.transcription_provider.transcribe(record.audio_path) if record.audio_path else ""
-            analysis = self.story_provider.analyze_scene(
-                record.record_id, record.captured_at, media.frames, transcript, motion
+            batch = self.batch_provider.analyze_batch(media.frames, record.audio_path)
+            ranked_frames = _rank_frames(media.frames, batch.frame_scores)
+            analysis = self.scene_provider.analyze_scene(
+                record.record_id, record.captured_at, ranked_frames, batch, motion
             )
             visual_signature = f"{image_average_hash(media.frames[0]):016x}" if media.frames else None
             remembered_place = self.database.match_place(visual_signature) if visual_signature else None
@@ -224,7 +227,7 @@ class DistillationPipeline:
                 record_id=record.record_id,
                 captured_at=record.captured_at,
                 summary=analysis.summary,
-                transcript=transcript,
+                transcript=batch.transcript,
                 location_candidate=location_candidate,
                 location_confidence=location_confidence,
                 visual_activity=analysis.visual_activity,
@@ -235,6 +238,8 @@ class DistillationPipeline:
                 privacy_flags=analysis.privacy_flags,
                 frame_paths=media.frames,
                 visual_signature=visual_signature,
+                ambient_sounds=analysis.ambient_sounds or batch.ambient_sounds,
+                ocr_text=analysis.ocr_text or batch.ocr_text,
             )
             self.database.save_scene_evidence(evidence)
             values.append(evidence)
@@ -251,6 +256,8 @@ class DistillationPipeline:
                 "time_label": item.captured_at.strftime("%H:%M"),
                 "summary": item.summary,
                 "transcript": item.transcript,
+                "ambient_sounds": item.ambient_sounds,
+                "ocr_text": item.ocr_text,
                 "location_candidate": item.location_candidate,
                 "location_confidence": item.location_confidence,
                 "visual_activity": item.visual_activity,
@@ -296,12 +303,14 @@ class DistillationPipeline:
             }
             for item in evidence
         ]
-        settings = getattr(self.story_provider, "settings", None)
+        scene_settings = getattr(self.scene_provider, "settings", None)
+        daily_settings = getattr(self.story_provider, "settings", None)
+        image_settings = getattr(self.image_provider, "settings", None)
         model_versions = {
-            "scene": getattr(settings, "scene_model", "mock-v1"),
-            "daily": getattr(settings, "daily_model", "mock-v1"),
-            "transcription": getattr(settings, "transcription_model", "mock-v1"),
-            "image": getattr(settings, "image_model", "mock-v1"),
+            "keyframe_vision": getattr(scene_settings, "keyframe_model", "mock-v1"),
+            "batch_omni": getattr(scene_settings, "omni_model", "mock-v1"),
+            "daily": getattr(daily_settings, "daily_model", "mock-v1"),
+            "image": getattr(image_settings, "image_model", "mock-v1"),
             "motion": "heuristic-v1" if not self.motion_model_path else self.motion_model_path.name,
         }
         return DayReport(
@@ -376,6 +385,8 @@ class DistillationPipeline:
             privacy_flags=list(value.get("privacy_flags", [])),
             frame_paths=[Path(path) for path in value.get("frame_paths", [])],
             visual_signature=str(value["visual_signature"]) if value.get("visual_signature") else None,
+            ambient_sounds=list(value.get("ambient_sounds", [])),
+            ocr_text=list(value.get("ocr_text", [])),
         )
 
     def _cleanup(
@@ -423,3 +434,11 @@ class DistillationPipeline:
     def _notify(self, stage: JobStage, progress: float, message: str) -> None:
         if self.progress:
             self.progress(stage, progress, message)
+
+
+def _rank_frames(paths: list[Path], scores: list[float], limit: int = 6) -> list[Path]:
+    """Honor Omni's relevance ranking without losing deterministic fallback behavior."""
+    if len(scores) != len(paths):
+        return paths[:limit]
+    ranked = sorted(enumerate(paths), key=lambda item: (-scores[item[0]], item[0]))
+    return [path for _, path in ranked[:limit]]
