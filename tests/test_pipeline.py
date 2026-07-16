@@ -2,13 +2,16 @@ import json
 import math
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
+
+from PIL import Image, ImageDraw
 
 from day_distiller_client.database import JobDatabase
 from day_distiller_client.domain import JobStage
 from day_distiller_client.paths import AppPaths
-from day_distiller_client.pipeline import DistillationPipeline
+from day_distiller_client.pipeline import DistillationPipeline, _select_poster_reference_frames
 from day_distiller_client.providers.mock import MockAIProvider, MockMailProvider
 from day_distiller_client.providers.base import DeliveryResult
 
@@ -43,6 +46,37 @@ def _write_imu(path: Path) -> None:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_poster_frame_selection_honors_two_scene_plan_and_three_image_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            frames = []
+            for index in range(3):
+                frame = root / f"r{index + 1}.jpg"
+                image = Image.new("RGB", (64, 64), "black")
+                draw = ImageDraw.Draw(image)
+                if index == 0:
+                    draw.rectangle((0, 0, 31, 63), fill="white")
+                elif index == 1:
+                    draw.rectangle((0, 0, 63, 31), fill="white")
+                else:
+                    draw.polygon(((0, 0), (63, 0), (31, 63)), fill="white")
+                image.save(frame)
+                frames.append(frame)
+            evidence = [
+                SimpleNamespace(
+                    record_id=f"r{index + 1}",
+                    frame_paths=[frame],
+                    importance=1.0 - index * 0.1,
+                    captured_at=datetime(2026, 7, 16, 10 + index),
+                )
+                for index, frame in enumerate(frames)
+            ]
+
+            selected = _select_poster_reference_frames(["r1", "r2"], evidence)
+
+            self.assertEqual(selected, frames[:2])
+            self.assertLessEqual(len(selected), 3)
+
     def test_offline_end_to_end_keeps_source_when_cleanup_is_pending(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

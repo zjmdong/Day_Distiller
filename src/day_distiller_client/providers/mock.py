@@ -69,26 +69,24 @@ class MockAIProvider:
     def synthesize_day(self, report_date: date, scenes: list[dict[str, object]]) -> DailySynthesis:
         ordered = sorted(scenes, key=lambda item: str(item.get("captured_at", "")))
         ranked = sorted(ordered, key=lambda item: float(item.get("importance", 0)), reverse=True)
-        selected = ranked[: min(6, len(ranked))]
-        panels = [
-            PanelPlan(
-                record_ids=[str(scene["record_id"])],
-                time_label=str(scene.get("time_label", "")),
-                caption=str(scene.get("summary", "这一天的一个瞬间")),
-                image_prompt=(
-                    "温暖电影感日记漫画，第一人称生活记录，清晰线稿与柔和色彩，"
-                    f"表现这个场景：{scene.get('summary', '')}。画面中不要出现文字。"
-                ),
-            )
-            for scene in sorted(selected, key=lambda item: str(item.get("captured_at", "")))
-        ]
+        selected = ranked[: min(3, len(ranked))]
+        selected_ordered = sorted(selected, key=lambda item: str(item.get("captured_at", "")))
         summary = "今天留下了若干真实而安静的生活片段。" if ordered else "今天没有可用记录。"
         return DailySynthesis(
-            title=f"{report_date:%Y年%m月%d日} · 每日蒸馏",
+            title="值得收藏的平凡一天",
             one_sentence_summary=summary,
+            warm_message="今天也辛苦了，把这些小小的闪光收好，然后安心休息吧。",
             narrative="\n".join(str(item.get("summary", "")) for item in ordered),
-            panels=panels or [
-                PanelPlan(record_ids=[], time_label="今日", caption=summary, image_prompt="温暖日记漫画空镜，不要文字")
+            panels=[
+                PanelPlan(
+                    record_ids=[str(scene["record_id"]) for scene in selected_ordered],
+                    time_label="今日",
+                    caption="；".join(str(scene.get("summary", "这一刻")) for scene in selected_ordered) or summary,
+                    image_prompt=(
+                        "Fuse the selected real moments into one vertical 3:4 flat-vector memoir poster; "
+                        "use royal blue, coral orange, amber yellow and deep navy; no text."
+                    ),
+                )
             ],
         )
 
@@ -100,12 +98,12 @@ class MockAIProvider:
     ) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(prompt.encode("utf-8")).digest()
-        image = Image.new("RGB", (1024, 768), (digest[0], digest[1], digest[2]))
+        image = Image.new("RGB", (996, 1332), (digest[0], digest[1], digest[2]))
         draw = ImageDraw.Draw(image)
         for index in range(8):
             inset = 35 + index * 35
             color = (digest[(index * 3) % 32], digest[(index * 3 + 1) % 32], digest[(index * 3 + 2) % 32])
-            draw.rounded_rectangle((inset, inset, 1024 - inset, 768 - inset), radius=24, outline=color, width=8)
+            draw.rounded_rectangle((inset, inset, 996 - inset, 1332 - inset), radius=24, outline=color, width=8)
         image.save(destination, "JPEG", quality=90)
         return destination
 
@@ -140,6 +138,15 @@ class MockMailProvider:
                 maintype=maintype,
                 subtype=subtype,
                 cid=f"<{content_id}>",
+                disposition="inline",
+                filename=image_path.name,
+            )
+            related = html_part.get_payload()[-1]
+            related["Content-Location"] = image_path.name
+            message.add_attachment(
+                image_path.read_bytes(),
+                maintype=maintype,
+                subtype=subtype,
                 filename=image_path.name,
             )
         message.add_attachment(pdf_path.read_bytes(), maintype="application", subtype="pdf", filename=pdf_path.name)

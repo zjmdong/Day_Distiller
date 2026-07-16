@@ -105,7 +105,7 @@ class OpenAIProvider:
             {
                 "date": report_date.isoformat(),
                 "rules": {
-                    "panel_count": "4-8，默认6；记录少时允许更少",
+                    "output": "只规划一张3:4竖版海报，筛选2-3个最有意义的场景融合",
                     "no_gap_inference": True,
                     "no_face_identification": True,
                     "assert_threshold": 0.8,
@@ -123,7 +123,8 @@ class OpenAIProvider:
                 store=False,
                 reasoning={"effort": "high"},
                 instructions=(
-                    "你是每日生活报告编辑。只能使用输入证据，生成温暖但克制的中文日报和漫画分镜。"
+                    "你是每日生活报告编辑。只能使用输入证据，生成主题标题、一句暖心话，"
+                    "并规划一张融合2-3个精选瞬间的无文字竖版海报。"
                     "低置信度信息使用可能、看起来等措辞，低于0.6的推断省略。"
                 ),
                 input=prompt,
@@ -198,4 +199,3 @@ def _image_data_url(path: Path) -> str:
     mime = {".png": "image/png", ".webp": "image/webp"}.get(suffix, "image/jpeg")
     encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
     return f"data:{mime};base64,{encoded}"
-

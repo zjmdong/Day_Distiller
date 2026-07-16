@@ -32,7 +32,9 @@ class DeepSeekSettings:
 class SeedreamSettings:
     base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     image_model: str = "doubao-seedream-5-0-pro"
-    image_size: str = "2048x1536"
+    # 1328 x 1776 is a vertical 3:4-class canvas and contains 2,358,528
+    # pixels, staying below the 2.36M cost boundary requested for a poster.
+    image_size: str = "1328x1776"
     response_format: str = "b64_json"
     character_description: str = ""
 
@@ -155,12 +157,14 @@ class DeepSeekStoryProvider:
             {
                 "date": report_date.isoformat(),
                 "constraints": {
-                    "panel_count": "4-8, default 6",
+                    "output_type": "one vertical daily poster",
+                    "selected_scene_count": "2-3 when at least two usable scenes exist",
                     "do_not_infer_between_capture_intervals": True,
                     "no_face_identification": True,
                     "omit_claims_below_confidence": 0.6,
                     "use_cautious_language_below_confidence": 0.8,
                     "image_prompts_must_not_request_text": True,
+                    "poster_has_no_text": True,
                 },
                 "scene_evidence": scenes,
             },
@@ -209,25 +213,42 @@ class SeedreamImageProvider:
         destination: Path,
         reference_images: list[Path] | None = None,
     ) -> Path:
-        # Ark image endpoints differ by enabled model snapshot. Keep the endpoint/model
-        # configurable and use the common Images API. Reference images are represented
-        # in the prompt until the account's Seedream edit endpoint is configured.
-        reference_note = " Keep the same recurring protagonist and visual identity."
+        _validate_poster_image_size(self.settings.image_size)
+        references = [Path(path) for path in (reference_images or []) if Path(path).is_file()][:3]
+        reference_note = (
+            f" Use all {len(references)} supplied source frames as factual visual references."
+            if references
+            else ""
+        )
         if self.settings.character_description.strip():
-            reference_note += " Character description: " + self.settings.character_description.strip()
+            reference_note += (
+                " When the recurring protagonist is actually visible, use this non-biometric style note: "
+                + self.settings.character_description.strip()
+                + "."
+            )
         final_prompt = (
-            "Modern cinematic diary comic, warm restrained colors, one coherent panel. "
-            "No text, letters, subtitles, speech bubbles, watermark, or legible signage. "
+            "Create ONE finished vertical 3:4 daily-memory poster, not separate outputs. "
+            "Selectively fuse the referenced real moments into one cohesive editorial composition "
+            "with a clear visual hierarchy and seamless transitions between two or three scenes. "
+            "Art direction: bold contemporary flat-vector illustration, crisp simplified shapes, "
+            "confident clean contours, subtle gradients, saturated royal blue, warm coral-orange, "
+            "amber yellow and deep navy, expressive but tasteful, like a premium illustrated memoir. "
+            "Preserve the recognizable actions, environment and personal details supported by the "
+            "references, while artistically simplifying them. When the same protagonist appears in "
+            "multiple references, keep their visual identity consistent and make any repeated depiction "
+            "read clearly as a montage across moments, not as invented extra people. Do not invent extra events. "
+            "The poster must be pure image: absolutely no text, letters, numbers, captions, subtitles, "
+            "speech bubbles, logos, watermark, frames with written labels, or legible signage. "
             + prompt
-            + (reference_note if reference_images else "")
+            + reference_note
         )
 
         def request() -> Any:
             extra_body: dict[str, Any] = {
                 "watermark": False,
             }
-            if reference_images:
-                extra_body["image"] = [_data_url(Path(path)) for path in reference_images]
+            if references:
+                extra_body["image"] = [_data_url(path) for path in references]
             return self.client.images.generate(
                 model=self.settings.image_model,
                 prompt=final_prompt,
@@ -277,15 +298,22 @@ indices of frames that best represent the event. OCR is primarily Omni's respons
 confirmed OCR and only correct clear mistakes. Separate observation from inference, express evidence
 strength as confidence, never identify a person, and never infer continuity outside this clip."""
 
-_DAILY_PROMPT = """You are the evidence editor for a private Chinese daily diary. Resolve conflicts
-between visual, audio, OCR and IMU evidence; build an ordered event narrative and 4-8 comic panels.
+_DAILY_PROMPT = """You are the evidence editor and art director for a private Chinese daily diary.
+Review ALL supplied visual, audio, OCR and IMU evidence. Select only the 2-3 scenes that are most
+valuable, special, emotionally meaningful, visually distinctive, or representative of the day.
+Prefer distinct moments rather than near-duplicates. If only one usable scene exists, select it.
+Create one concise theme title that can serve unchanged as both the report title and email subject.
+Create one warm, specific, caring sentence addressed to the user, grounded in the selected events.
+Plan ONE vertical 3:4 poster that artistically fuses the selected moments into a cohesive image.
 Return exactly one JSON object without Markdown, using precisely this shape:
-{"title":"", "one_sentence_summary":"", "narrative":"",
+{"title":"", "one_sentence_summary":"", "warm_message":"", "narrative":"",
 "panels":[{"record_ids":["record UUID"], "time_label":"HH:MM",
-"caption":"Chinese caption", "image_prompt":"English visual prompt without any text"}]}.
+"caption":"brief Chinese description of the selected moments",
+"image_prompt":"English prompt describing one fused vertical poster without any text"}]}.
 Do not rename, omit, or add fields. record_ids must be a JSON array containing only record_id values
-present in the supplied scene evidence. Use warm but restrained Chinese. State only supported facts,
-use cautious wording for uncertain claims, omit weak guesses, and never request text inside images."""
+present in the supplied scene evidence, containing at most three distinct IDs. Return exactly one
+panels item. Use warm but restrained Chinese. State only supported facts, use cautious wording for
+uncertain claims, omit weak guesses, and never request text inside images."""
 
 
 def _data_url(path: Path) -> str:
@@ -408,11 +436,17 @@ def _normalize_daily_payload(
 ) -> dict[str, Any]:
     value = dict(payload)
     narrative = str(value.get("narrative") or value.get("description") or "").strip()
-    title = str(value.get("title") or f"{report_date.isoformat()} 每日蒸馏").strip()
+    title = str(value.get("title") or f"{report_date.isoformat()} 的一天").strip()
     summary = str(
         value.get("one_sentence_summary")
         or value.get("summary")
         or (narrative[:80] if narrative else "今天留下了几段值得回看的记录。")
+    ).strip()
+    warm_message = str(
+        value.get("warm_message")
+        or value.get("caring_message")
+        or value.get("message_to_user")
+        or "辛苦了，愿这些被记住的小片段，也能给今天画上一个温柔的句号。"
     ).strip()
     scene_by_id = {
         str(item.get("record_id")): item for item in scenes if item.get("record_id")
@@ -429,54 +463,95 @@ def _normalize_daily_payload(
             scene_by_time.setdefault(time_label, []).append(record_id)
 
     raw_panels = value.get("panels")
-    panels: list[dict[str, Any]] = []
-    for index, item in enumerate(raw_panels if isinstance(raw_panels, list) else []):
+    raw_items = raw_panels if isinstance(raw_panels, list) else []
+    selected_ids: list[str] = []
+    time_label = ""
+    captions: list[str] = []
+    image_prompts: list[str] = []
+    for item in raw_items:
         if not isinstance(item, dict):
             continue
-        time_label = str(item.get("time_label") or item.get("time") or "").strip()
+        item_time = str(item.get("time_label") or item.get("time") or "").strip()
+        time_label = time_label or item_time
         raw_ids = item.get("record_ids")
         if raw_ids is None:
             raw_ids = item.get("record_id") or item.get("evidence_ids")
-        record_ids = [record_id for record_id in _string_list(raw_ids) if record_id in scene_by_id]
-        if not record_ids and time_label:
-            record_ids = scene_by_time.get(time_label, [])
-        if not record_ids and scene_by_id:
-            record_ids = [list(scene_by_id)[min(index, len(scene_by_id) - 1)]]
-        caption = str(
-            item.get("caption") or item.get("title") or item.get("description") or "这一刻"
-        ).strip()
+        item_ids = [record_id for record_id in _string_list(raw_ids) if record_id in scene_by_id]
+        if not item_ids and item_time:
+            item_ids = scene_by_time.get(item_time, [])
+        for record_id in item_ids:
+            if record_id not in selected_ids and len(selected_ids) < 3:
+                selected_ids.append(record_id)
+        caption = str(item.get("caption") or item.get("title") or item.get("description") or "").strip()
+        if caption:
+            captions.append(caption)
         image_prompt = str(
-            item.get("image_prompt")
-            or item.get("visual_prompt")
-            or item.get("description")
-            or caption
+            item.get("image_prompt") or item.get("visual_prompt") or item.get("description") or ""
         ).strip()
-        panels.append(
-            {
-                "record_ids": record_ids,
-                "time_label": time_label or "--:--",
-                "caption": caption,
-                "image_prompt": image_prompt,
-            }
-        )
-        if len(panels) >= 8:
+        if image_prompt:
+            image_prompts.append(image_prompt)
+
+    # Repair missing or invalid model selections deterministically from the full
+    # evidence set. Importance is computed locally from multimodal evidence.
+    ranked_scenes = sorted(
+        scene_by_id.items(),
+        key=lambda pair: (-_score(pair[1].get("importance"), 0.0), str(pair[1].get("captured_at", ""))),
+    )
+    target_count = min(3, len(ranked_scenes))
+    if target_count > 1:
+        target_count = max(2, target_count)
+    for record_id, _scene in ranked_scenes:
+        if len(selected_ids) >= target_count:
             break
-    if not panels and scene_by_id:
-        for record_id, scene in list(scene_by_id.items())[:6]:
-            panels.append(
-                {
-                    "record_ids": [record_id],
-                    "time_label": str(scene.get("time_label") or "--:--"),
-                    "caption": str(scene.get("summary") or "这一刻"),
-                    "image_prompt": str(scene.get("summary") or "A quiet diary moment"),
-                }
-            )
+        if record_id not in selected_ids:
+            selected_ids.append(record_id)
+    selected_ids = selected_ids[:3]
+
+    selected_summaries = [
+        str(scene_by_id[record_id].get("summary") or "").strip()
+        for record_id in selected_ids
+        if record_id in scene_by_id
+    ]
+    caption = "；".join(captions[:3]) or "；".join(item for item in selected_summaries if item) or summary
+    image_prompt = " ".join(image_prompts[:3]).strip()
+    if not image_prompt:
+        image_prompt = (
+            "Fuse these selected real-life moments into one premium illustrated daily-memory poster: "
+            + "; ".join(item for item in selected_summaries if item)
+        )
+    panels = [
+        {
+            "record_ids": selected_ids,
+            "time_label": time_label or "今日",
+            "caption": caption,
+            "image_prompt": image_prompt,
+        }
+    ]
     return {
         "title": title,
         "one_sentence_summary": summary,
+        "warm_message": warm_message,
         "narrative": narrative or summary,
         "panels": panels,
     }
+
+
+def _validate_poster_image_size(value: str) -> tuple[int, int]:
+    candidate = value.strip().lower()
+    parts = candidate.split("x")
+    if len(parts) != 2:
+        raise ValueError("Poster size must be an explicit width x height pixel value")
+    try:
+        width, height = (int(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError("Poster size must be an explicit width x height pixel value") from exc
+    if width < 512 or height < 512 or width >= height:
+        raise ValueError("Poster size must be vertical")
+    if abs(width / height - 0.75) > 0.02:
+        raise ValueError("Poster size must use a 3:4 aspect ratio")
+    if width * height >= 2_360_000:
+        raise ValueError("Poster size must contain fewer than 2.36 million pixels")
+    return width, height
 
 
 def _retry(operation: Callable[[], T], attempts: int) -> T:

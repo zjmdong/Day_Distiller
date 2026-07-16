@@ -123,6 +123,7 @@ class DayReport:
     report_date: date
     title: str
     one_sentence_summary: str
+    warm_message: str
     narrative: str
     timeline: list[dict[str, Any]]
     panels: list[ComicPanel]

@@ -16,7 +16,7 @@
 
 ## 隐私与数据控制
 
-逐片图像理解使用本地抽出的多张关键帧；音频文件交给转写接口；漫画格使用图像生成接口。Responses API 请求显式设置 `store:false`，不会创建持久 Conversation，但 `store:false` 不等同于 Zero Data Retention。正式上线前请根据组织要求阅读 [数据控制说明](https://developers.openai.com/api/docs/guides/your-data)。图像输入和结构化输出实现分别遵循 [图像与视觉](https://developers.openai.com/api/docs/guides/images-vision) 和 [结构化输出](https://developers.openai.com/api/docs/guides/structured-outputs)。
+逐片图像理解使用本地抽出的多张关键帧；音频文件交给转写接口；最终只规划并生成一张融合2–3个精选瞬间的竖版海报。Responses API 请求显式设置 `store:false`，不会创建持久 Conversation，但 `store:false` 不等同于 Zero Data Retention。正式上线前请根据组织要求阅读 [数据控制说明](https://developers.openai.com/api/docs/guides/your-data)。图像输入和结构化输出实现分别遵循 [图像与视觉](https://developers.openai.com/api/docs/guides/images-vision) 和 [结构化输出](https://developers.openai.com/api/docs/guides/structured-outputs)。
 
 ## 第一次真实验收
 
@@ -28,4 +28,4 @@
 
 ## 成本控制
 
-默认每条记录最多发送六张关键帧，每天生成最多六格 Mock 规划、真实综合允许 4–8 格。减少记录数、改用较低图像质量或减少漫画格可降低用量。应用只显示估算，最终账单以 OpenAI Platform 为准。
+默认每条记录最多发送六张关键帧；全天综合只输出一个海报计划。应用只显示估算，最终账单以服务商账单为准。

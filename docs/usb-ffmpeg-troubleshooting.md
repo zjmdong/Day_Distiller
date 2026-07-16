@@ -24,7 +24,7 @@
 
 ## 数据目录与空间
 
-默认数据目录是 `%LOCALAPPDATA%\DayDistillerV2`：`imports` 保存原始导入，`cache` 保存关键帧，`reports` 保存漫画/HTML/PDF，`mock_outbox` 保存测试邮件。首版长期保留这些文件；空间不足时先关闭应用，备份需要的报告，再按日期手动删除旧的 `imports`、`cache` 和 `reports` 子目录。不要删除正在运行任务对应的目录或 SQLite 数据库。
+默认数据目录是 `%LOCALAPPDATA%\DayDistillerV2`：`imports` 保存原始导入，`cache` 保存关键帧，`reports` 保存单张海报/HTML/PDF，`mock_outbox` 保存测试邮件。首版长期保留这些文件；空间不足时先关闭应用，备份需要的报告，再按日期手动删除旧的 `imports`、`cache` 和 `reports` 子目录。不要删除正在运行任务对应的目录或 SQLite 数据库。
 
 测试时可临时指定：
 

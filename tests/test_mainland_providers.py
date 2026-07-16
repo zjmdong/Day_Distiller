@@ -12,6 +12,7 @@ from day_distiller_client.providers.mainland import (
     DeepSeekStoryProvider,
     QwenEvidenceProvider,
     SeedreamImageProvider,
+    SeedreamSettings,
     _normalize_batch_payload,
     _normalize_daily_payload,
     _parse_json_payload,
@@ -67,6 +68,7 @@ class MainlandProviderTests(unittest.TestCase):
             {
                 "date": "2026-07-16",
                 "narrative": "晚间记录。",
+                "warm_message": "早点休息，晚安。",
                 "panels": [
                     {
                         "time": "19:31",
@@ -81,6 +83,28 @@ class MainlandProviderTests(unittest.TestCase):
         self.assertEqual(payload["panels"][0]["record_ids"], ["r1"])
         self.assertEqual(payload["panels"][0]["caption"], "挥手")
         self.assertEqual(payload["one_sentence_summary"], "晚间记录。")
+        self.assertEqual(payload["warm_message"], "早点休息，晚安。")
+
+    def test_daily_normalizer_collapses_multiple_panels_to_one_three_scene_poster(self) -> None:
+        payload = _normalize_daily_payload(
+            {
+                "title": "特别的一天",
+                "panels": [
+                    {"record_ids": ["r1"], "caption": "早晨", "image_prompt": "morning"},
+                    {"record_ids": ["r2"], "caption": "午后", "image_prompt": "afternoon"},
+                    {"record_ids": ["r3", "r4"], "caption": "夜晚", "image_prompt": "night"},
+                ],
+            },
+            [
+                {"record_id": "r1", "importance": 0.7},
+                {"record_id": "r2", "importance": 0.9},
+                {"record_id": "r3", "importance": 0.8},
+                {"record_id": "r4", "importance": 0.6},
+            ],
+            date(2026, 7, 16),
+        )
+        self.assertEqual(len(payload["panels"]), 1)
+        self.assertEqual(payload["panels"][0]["record_ids"], ["r1", "r2", "r3"])
 
     def test_qwen_omni_then_keyframe_review(self) -> None:
         batch = {
@@ -138,6 +162,7 @@ class MainlandProviderTests(unittest.TestCase):
         daily = {
             "title": "一天",
             "one_sentence_summary": "记录了回家路上的片段。",
+            "warm_message": "走了一天，回家好好休息吧。",
             "narrative": "傍晚，你走在回家的路上。",
             "panels": [{"record_ids": ["r1"], "time_label": "18:00", "caption": "回家", "image_prompt": "walking home"}],
         }
@@ -155,14 +180,34 @@ class MainlandProviderTests(unittest.TestCase):
         )
         image_provider = SeedreamImageProvider(client=SimpleNamespace(images=images), max_attempts=1)
         with tempfile.TemporaryDirectory() as temporary:
-            output = image_provider.generate_panel("street", Path(temporary) / "panel.jpg")
+            root = Path(temporary)
+            references = []
+            for index in range(4):
+                reference = root / f"reference-{index}.jpg"
+                Image.new("RGB", (16, 16), (index * 40, 20, 90)).save(reference)
+                references.append(reference)
+            output = image_provider.generate_panel("street", root / "panel.jpg", references)
             result = story.synthesize_day(date(2026, 7, 16), [{"record_id": "r1"}])
             self.assertEqual(output.read_bytes(), image_bytes)
         self.assertEqual(result.title, "一天")
+        self.assertEqual(result.warm_message, "走了一天，回家好好休息吧。")
         self.assertEqual(chat.calls[0]["model"], "deepseek-v4-pro")
         self.assertEqual(chat.calls[0]["reasoning_effort"], "high")
         self.assertNotIn("sequential_image_generation", image_calls[0]["extra_body"])
         self.assertNotIn("stream", image_calls[0]["extra_body"])
+        self.assertEqual(image_calls[0]["size"], "1328x1776")
+        self.assertEqual(len(image_calls[0]["extra_body"]["image"]), 3)
+        self.assertIn("ONE finished vertical 3:4", image_calls[0]["prompt"])
+
+    def test_seedream_rejects_landscape_or_over_budget_size_before_calling_api(self) -> None:
+        provider = SeedreamImageProvider(
+            settings=SeedreamSettings(image_size="1536x2048"),
+            client=SimpleNamespace(images=SimpleNamespace(generate=lambda **_kwargs: None)),
+            max_attempts=1,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "2.36 million"):
+                provider.generate_panel("poster", Path(temporary) / "poster.jpg")
 
 
 if __name__ == "__main__":

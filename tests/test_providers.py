@@ -36,6 +36,7 @@ class _Responses:
             value = DailySynthesis(
                 title="测试日报",
                 one_sentence_summary="一天",
+                warm_message="今天辛苦了。",
                 narrative="事实",
                 panels=[PanelPlan(record_ids=["r1"], time_label="10:00", caption="桌面", image_prompt="桌面")],
             )

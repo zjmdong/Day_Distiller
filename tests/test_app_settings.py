@@ -16,10 +16,13 @@ class AppSettingsTests(unittest.TestCase):
             )
 
     def test_validates_seedream_size(self) -> None:
-        self.assertEqual(_validate_image_size("2048x1536"), "2048x1536")
-        self.assertEqual(_validate_image_size("2k"), "2K")
-        with self.assertRaisesRegex(ValueError, "漫画尺寸"):
-            _validate_image_size("16:9")
+        self.assertEqual(_validate_image_size("1328x1776"), "1328x1776")
+        with self.assertRaisesRegex(ValueError, "236万"):
+            _validate_image_size("1536x2048")
+        with self.assertRaisesRegex(ValueError, "宽x高"):
+            _validate_image_size("2k")
+        with self.assertRaisesRegex(ValueError, "3:4"):
+            _validate_image_size("1000x1600")
 
 
 if __name__ == "__main__":

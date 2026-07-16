@@ -69,4 +69,12 @@ class ResendSmtpProviderTests(unittest.TestCase):
         self.assertEqual(
             client.message["Resend-Idempotency-Key"], "day-distiller-job-example.local"
         )
-        self.assertEqual(len(list(client.message.iter_attachments())), 1)
+        attachment_names = {
+            part.get_filename() for part in client.message.iter_attachments()
+        }
+        self.assertEqual(attachment_names, {"daily.pdf", "panel.jpg"})
+        inline = next(
+            part for part in client.message.walk() if part.get("Content-ID") == "<panel-1>"
+        )
+        self.assertEqual(inline.get_content_disposition(), "inline")
+        self.assertEqual(inline["Content-Location"], "panel.jpg")

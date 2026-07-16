@@ -37,6 +37,9 @@ from .resources import bundled_ffmpeg_paths
 from .windows import drive_letters, list_removable_drives, safe_eject, wait_for_new_drive
 
 
+DEFAULT_POSTER_IMAGE_SIZE = "1328x1776"
+
+
 def _validate_base_url(value: str, provider: str) -> str:
     candidate = value.strip().rstrip("/")
     parsed = urlparse(candidate)
@@ -51,11 +54,16 @@ def _validate_base_url(value: str, provider: str) -> str:
 
 def _validate_image_size(value: str) -> str:
     candidate = value.strip().upper()
-    if candidate in {"1K", "2K", "4K"}:
-        return candidate
     match = re.fullmatch(r"(\d{3,5})X(\d{3,5})", candidate)
-    if not match or min(map(int, match.groups())) < 512:
-        raise ValueError("漫画尺寸应填写 2K，或像 2048x1536 这样的宽x高像素值")
+    if not match:
+        raise ValueError("海报尺寸应填写明确的宽x高像素值，例如 1328x1776")
+    width, height = map(int, match.groups())
+    if min(width, height) < 512 or width >= height:
+        raise ValueError("海报必须使用竖版尺寸")
+    if abs(width / height - 0.75) > 0.02:
+        raise ValueError("海报必须接近 3:4 竖版比例")
+    if width * height >= 2_360_000:
+        raise ValueError("海报总像素数必须少于236万，以控制 Seedream 生成成本")
     return candidate.lower()
 
 
@@ -148,7 +156,7 @@ class MainWindow:
             "<li>在“设备”确认连接，在“今日记录”选择日期。</li>"
             "<li>进入“蒸馏进度”，点击从设备开始蒸馏。</li>"
             "<li>邮件被 Resend 接受后，可在“报告历史”查看、修改或重新发送。</li></ol>"
-            "<p><b>隐私提示：</b>IMU和地点记忆留在本地；关键帧和音频发送到百炼，结构化证据发送给DeepSeek，参考形象和分镜发送到火山方舟。</p>"
+            "<p><b>隐私提示：</b>IMU和地点记忆留在本地；关键帧和音频发送到百炼，结构化证据发送给DeepSeek；最终筛选出的2–3张原始关键帧和无文字海报提示发送到火山方舟。</p>"
             "<p>FFmpeg和IMU分类器已内置，无需安装或配置。</p>"
         )
         guide.setWordWrap(True)
@@ -176,7 +184,7 @@ class MainWindow:
         layout = QVBoxLayout(page)
         intro = QLabel(
             "上传一张清晰、光线均匀、只有一名主体的正面或半身照片。"
-            "描述建议控制在20–100字，例如：短黑发、圆框眼镜、常穿深蓝夹克，漫画中保持温和自然的形象。"
+            "描述建议控制在20–100字，例如：短黑发、圆框眼镜、常穿深蓝夹克，海报中保持温和自然的形象。"
         )
         intro.setWordWrap(True)
         self.avatar_preview = QLabel("尚未选择参考形象")
@@ -186,7 +194,7 @@ class MainWindow:
         self.avatar_edit = QLineEdit()
         self.avatar_edit.setReadOnly(True)
         self.avatar_description_edit = QPlainTextEdit()
-        self.avatar_description_edit.setPlaceholderText("简短描述你的发型、衣着、配饰和希望保持的漫画特征")
+        self.avatar_description_edit.setPlaceholderText("简短描述你的发型、衣着、配饰和希望保持的海报角色特征")
         self.avatar_description_edit.setMaximumHeight(120)
         choose = QPushButton("选择参考形象")
         choose.clicked.connect(lambda: self._choose_avatar(QFileDialog))
@@ -238,7 +246,7 @@ class MainWindow:
         self.omni_model_edit = QLineEdit("qwen3.5-omni-plus")
         self.daily_model_edit = QLineEdit("deepseek-v4-pro")
         self.image_model_edit = QLineEdit("doubao-seedream-5-0-pro")
-        self.image_size_edit = QLineEdit("2048x1536")
+        self.image_size_edit = QLineEdit(DEFAULT_POSTER_IMAGE_SIZE)
         self.resend_sender_edit = QLineEdit()
         self.resend_recipient_edit = QLineEdit()
         form.addRow("百炼 Base URL", self.qwen_base_url_edit)
@@ -251,7 +259,7 @@ class MainWindow:
         form.addRow("火山方舟 Base URL", self.volcengine_base_url_edit)
         form.addRow("火山方舟 API Key", self.volcengine_key_edit)
         form.addRow("Seedream模型/Endpoint ID", self.image_model_edit)
-        form.addRow("漫画尺寸（4:3）", self.image_size_edit)
+        form.addRow("单张海报尺寸（3:4，<236万像素）", self.image_size_edit)
         form.addRow("Resend SMTP主机", self.resend_host_edit)
         form.addRow("Resend SMTP端口", self.resend_port_edit)
         form.addRow("Resend SMTP安全方式", self.resend_security_combo)
@@ -419,7 +427,7 @@ class MainWindow:
         self.stage_label = QLabel("等待开始")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1000)
-        self.usage_label = QLabel("Mock 模式估算用量为 0；真实模式的图像与模型调用量取决于当天记录数和漫画格数。")
+        self.usage_label = QLabel("Mock 模式估算用量为 0；真实模式只调用一次 Seedream，最多输入3张原始关键帧，输出单张3:4海报且少于236万像素。")
         self.usage_label.setWordWrap(True)
         self.distill_log = QPlainTextEdit()
         self.distill_log.setReadOnly(True)
@@ -440,7 +448,7 @@ class MainWindow:
         refresh = QPushButton("刷新")
         self.open_report_button = QPushButton("打开日报")
         self.edit_report_button = QPushButton("修改地点与文字")
-        self.regenerate_button = QPushButton("重新生成漫画")
+        self.regenerate_button = QPushButton("重新生成海报")
         self.resend_button = QPushButton("手动再次发送")
         self.retry_job_button = QPushButton("重试失败任务")
         self.retry_cleanup_button = QPushButton("重试设备清理")
@@ -531,7 +539,7 @@ class MainWindow:
         form.addRow("逐片理解模型", self.scene_model_edit)
         form.addRow("批量音视频/OCR模型", self.omni_model_edit)
         form.addRow("全天综合模型", self.daily_model_edit)
-        form.addRow("漫画生图模型", self.image_model_edit)
+        form.addRow("海报生图模型", self.image_model_edit)
         form.addRow("SMTP 主机", self.smtp_host_edit)
         form.addRow("SMTP 端口", self.smtp_port_edit)
         form.addRow("SMTP 安全", self.smtp_security_combo)
@@ -775,9 +783,11 @@ class MainWindow:
         form = QFormLayout()
         title = QLineEdit(report.title)
         summary = QLineEdit(report.one_sentence_summary)
+        warm_message = QLineEdit(report.warm_message)
         narrative = QPlainTextEdit(report.narrative)
         form.addRow("标题", title)
         form.addRow("一句话总结", summary)
+        form.addRow("给用户的暖心话", warm_message)
         form.addRow("一天小结", narrative)
         layout.addLayout(form)
         table = QTableWidget(len(report.timeline), 3)
@@ -796,6 +806,7 @@ class MainWindow:
             return
         report.title = title.text().strip() or report.title
         report.one_sentence_summary = summary.text().strip()
+        report.warm_message = warm_message.text().strip() or report.warm_message
         report.narrative = narrative.toPlainText().strip()
         for index, item in enumerate(report.timeline):
             location = table.item(index, 1).text().strip() if table.item(index, 1) else ""
@@ -1091,7 +1102,14 @@ class MainWindow:
         self.omni_model_edit.setText(models.get("omni", self.omni_model_edit.text()))
         self.daily_model_edit.setText(models.get("daily", self.daily_model_edit.text()))
         self.image_model_edit.setText(models.get("image", self.image_model_edit.text()))
-        self.image_size_edit.setText(models.get("image_size", self.image_size_edit.text()))
+        saved_image_size = models.get("image_size", DEFAULT_POSTER_IMAGE_SIZE)
+        try:
+            saved_image_size = _validate_image_size(saved_image_size)
+        except ValueError:
+            # Migrate the former 4:3 / 2K panel setting to the cost-capped
+            # vertical poster default without blocking existing installations.
+            saved_image_size = DEFAULT_POSTER_IMAGE_SIZE
+        self.image_size_edit.setText(saved_image_size)
         self.qwen_base_url_edit.setText(endpoints.get("qwen", self.qwen_base_url_edit.text()))
         self.deepseek_base_url_edit.setText(endpoints.get("deepseek", self.deepseek_base_url_edit.text()))
         self.volcengine_base_url_edit.setText(endpoints.get("volcengine", self.volcengine_base_url_edit.text()))
@@ -1130,7 +1148,12 @@ class MainWindow:
             _validate_base_url(endpoints.get("qwen", QwenSettings.base_url), "百炼")
             _validate_base_url(endpoints.get("deepseek", DeepSeekSettings.base_url), "DeepSeek")
             _validate_base_url(endpoints.get("volcengine", SeedreamSettings.base_url), "火山方舟")
-            _validate_image_size(models.get("image_size", "2048x1536"))
+            try:
+                poster_image_size = _validate_image_size(
+                    models.get("image_size", DEFAULT_POSTER_IMAGE_SIZE)
+                )
+            except ValueError:
+                poster_image_size = DEFAULT_POSTER_IMAGE_SIZE
             qwen_key = self.credentials.get(CredentialName.QWEN_API_KEY)
             deepseek_key = self.credentials.get(CredentialName.DEEPSEEK_API_KEY)
             volcengine_key = self.credentials.get(CredentialName.VOLCENGINE_API_KEY)
@@ -1158,7 +1181,7 @@ class MainWindow:
                 settings=SeedreamSettings(
                     base_url=endpoints.get("volcengine", SeedreamSettings.base_url),
                     image_model=models.get("image", "doubao-seedream-5-0-pro"),
-                    image_size=models.get("image_size", "2048x1536"),
+                    image_size=poster_image_size,
                     character_description=settings.get("avatar_description", ""),
                 ),
             )

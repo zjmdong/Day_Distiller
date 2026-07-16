@@ -63,6 +63,18 @@ class SmtpMailProvider:
                 maintype=maintype,
                 subtype=subtype,
                 cid=f"<{content_id}>",
+                disposition="inline",
+                filename=image_path.name,
+            )
+            related = html_part.get_payload()[-1]
+            related["Content-Location"] = image_path.name
+            # The generated poster is both embedded in the HTML and attached at
+            # original resolution so clients that block remote/inline content
+            # still expose it directly to the user.
+            message.add_attachment(
+                image_path.read_bytes(),
+                maintype=maintype,
+                subtype=subtype,
                 filename=image_path.name,
             )
         message.add_attachment(

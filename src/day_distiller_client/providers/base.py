@@ -57,8 +57,9 @@ class PanelPlan(BaseModel):
 class DailySynthesis(BaseModel):
     title: str
     one_sentence_summary: str
+    warm_message: str = ""
     narrative: str
-    panels: list[PanelPlan] = Field(min_length=1, max_length=8)
+    panels: list[PanelPlan] = Field(min_length=1, max_length=1)
 
 
 @dataclass(frozen=True)

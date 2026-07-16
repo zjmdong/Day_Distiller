@@ -17,7 +17,7 @@ from .legacy_import import (
     import_legacy_day,
     sha256_file,
 )
-from .media import MediaPreprocessor, PreprocessedMedia, image_average_hash
+from .media import MediaPreprocessor, PreprocessedMedia, image_average_hash, image_sharpness
 from .paths import AppPaths
 from .providers.base import BatchMultimodalProvider, ImageProvider, MailProvider, SceneProvider, StoryProvider
 from .reporting import RenderedReport, ReportRenderer, day_report_from_json
@@ -168,7 +168,7 @@ class DistillationPipeline:
                     JobStage.GENERATING,
                     JobStage.RENDERING,
                     0.72,
-                    "漫画生成完成",
+                    "单张纪念海报生成完成",
                 )
 
             if report_row is None:
@@ -352,21 +352,28 @@ class DistillationPipeline:
             for item in evidence
         ]
         synthesis = self.story_provider.synthesize_day(report_date, scene_payloads)
-        panel_dir = self.paths.reports / report_date.isoformat() / job_id / "panels"
-        panels: list[ComicPanel] = []
-        for index, plan in enumerate(synthesis.panels, start=1):
-            destination = panel_dir / f"panel_{index:02d}.jpg"
-            self.image_provider.generate_panel(plan.image_prompt, destination, avatar_references)
-            panels.append(
-                ComicPanel(
-                    record_ids=plan.record_ids,
-                    time_label=plan.time_label,
-                    caption=plan.caption,
-                    image_prompt=plan.image_prompt,
-                    image_path=str(destination),
-                )
+        plan = synthesis.panels[0]
+        poster_dir = self.paths.reports / report_date.isoformat() / job_id
+        destination = poster_dir / "daily_poster.jpg"
+        # The poster call intentionally receives only the selected original
+        # capture frames. Keeping the request at no more than three inputs is a
+        # hard cost boundary; avatar references are not added as a fourth image.
+        poster_references = _select_poster_reference_frames(plan.record_ids, evidence)
+        self.image_provider.generate_panel(plan.image_prompt, destination, poster_references)
+        panels = [
+            ComicPanel(
+                record_ids=plan.record_ids,
+                time_label=plan.time_label,
+                caption=plan.caption,
+                image_prompt=plan.image_prompt,
+                image_path=str(destination),
             )
-            self._notify(JobStage.GENERATING, index / len(synthesis.panels), f"已生成漫画第 {index} 格")
+        ]
+        self._notify(
+            JobStage.GENERATING,
+            1.0,
+            f"单张纪念海报生成完成（参考原图 {len(poster_references)} 张）",
+        )
         timeline = [
             {
                 "record_id": item.record_id,
@@ -400,6 +407,7 @@ class DistillationPipeline:
             report_date=report_date,
             title=synthesis.title,
             one_sentence_summary=synthesis.one_sentence_summary,
+            warm_message=synthesis.warm_message or synthesis.one_sentence_summary,
             narrative=synthesis.narrative,
             timeline=timeline,
             panels=panels,
@@ -523,3 +531,68 @@ def _rank_frames(paths: list[Path], scores: list[float], limit: int = 6) -> list
         return paths[:limit]
     ranked = sorted(enumerate(paths), key=lambda item: (-scores[item[0]], item[0]))
     return [path for _, path in ranked[:limit]]
+
+
+def _select_poster_reference_frames(
+    selected_record_ids: list[str], evidence: list[SceneEvidence], limit: int = 3
+) -> list[Path]:
+    """Choose one strong, non-duplicate original frame from each selected scene.
+
+    DeepSeek chooses the meaningful scenes from all evidence. This local step
+    then chooses the sharpest usable source frame for each scene and fills any
+    missing second/third input from the remaining high-importance material.
+    """
+
+    evidence_by_id = {item.record_id: item for item in evidence}
+    ordered: list[SceneEvidence] = []
+    for record_id in selected_record_ids:
+        item = evidence_by_id.get(record_id)
+        if item and item not in ordered:
+            ordered.append(item)
+    for item in sorted(evidence, key=lambda value: (-value.importance, value.captured_at)):
+        if item not in ordered:
+            ordered.append(item)
+    valid_selected_count = sum(1 for record_id in selected_record_ids if record_id in evidence_by_id)
+    selection_goal = min(limit, max(2, valid_selected_count))
+
+    selected: list[tuple[Path, int]] = []
+
+    def add_best(item: SceneEvidence) -> None:
+        candidates: list[tuple[float, Path, int]] = []
+        for path in item.frame_paths:
+            path = Path(path)
+            if not path.is_file():
+                continue
+            try:
+                candidates.append((image_sharpness(path), path, image_average_hash(path)))
+            except Exception:
+                continue
+        for _sharpness, path, fingerprint in sorted(candidates, key=lambda value: -value[0]):
+            if all((fingerprint ^ existing_hash).bit_count() > 4 for _existing, existing_hash in selected):
+                selected.append((path, fingerprint))
+                return
+
+    for item in ordered:
+        if len(selected) >= selection_goal:
+            break
+        add_best(item)
+
+    # A day with fewer selected scenes can still use additional distinct source
+    # frames, while never exceeding the three-input budget.
+    if len(selected) < selection_goal:
+        for item in ordered:
+            for path in item.frame_paths:
+                path = Path(path)
+                if not path.is_file():
+                    continue
+                try:
+                    fingerprint = image_average_hash(path)
+                except Exception:
+                    continue
+                if all((fingerprint ^ existing_hash).bit_count() > 4 for _existing, existing_hash in selected):
+                    selected.append((path, fingerprint))
+                if len(selected) >= selection_goal:
+                    break
+            if len(selected) >= selection_goal:
+                break
+    return [path for path, _fingerprint in selected[:limit]]
