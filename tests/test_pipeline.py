@@ -26,6 +26,17 @@ class _UnexpectedAIProvider:
         raise AssertionError(f"AI provider should not be called while resuming email stage: {name}")
 
 
+class _CountingImageProvider:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def generate_panel(self, prompt, destination, reference_images=None):
+        self.calls.append((prompt, list(reference_images or [])))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (864, 1152), "#6C5CE7").save(destination)
+        return destination
+
+
 def _write_imu(path: Path) -> None:
     samples = []
     for index in range(100):
@@ -115,6 +126,24 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(regenerated_render.pdf_path.is_file())
             self.assertTrue(resent_render.html_path.is_file())
             self.assertEqual(len(list((root / "outbox").glob("*.eml"))), 2)
+
+            report_json_before = database.get_report(job_id)["report_json"]
+            counting_image = _CountingImageProvider()
+            unexpected = _UnexpectedAIProvider()
+            preview = DistillationPipeline(
+                paths,
+                database,
+                unexpected,
+                unexpected,
+                unexpected,
+                counting_image,
+                unexpected,
+            ).regenerate_poster_only(job_id, style_fingerprint="abstract-minimal")
+            self.assertTrue(preview.is_file())
+            self.assertIn("style-tests", preview.parts)
+            self.assertEqual(len(counting_image.calls), 1)
+            self.assertLessEqual(len(counting_image.calls[0][1]), 3)
+            self.assertEqual(database.get_report(job_id)["report_json"], report_json_before)
 
     def test_verified_cleanup_runs_only_after_mock_mail_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

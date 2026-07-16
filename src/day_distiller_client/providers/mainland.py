@@ -32,11 +32,16 @@ class DeepSeekSettings:
 class SeedreamSettings:
     base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     image_model: str = "doubao-seedream-5-0-pro"
-    # 1328 x 1776 is a vertical 3:4-class canvas and contains 2,358,528
-    # pixels, staying below the 2.36M cost boundary requested for a poster.
-    image_size: str = "1328x1776"
+    # Exact 3:4, 1K-class output (995,328 pixels). This is deliberately well
+    # below the 2.2M ceiling so small provider-side rounding cannot cross tiers.
+    image_size: str = "864x1152"
     response_format: str = "b64_json"
     character_description: str = ""
+    art_style_name: str = "扁平色块波普"
+    art_style_prompt: str = (
+        "Minimal flat-color pop illustration using large saturated color blocks, clean rounded "
+        "contours, simplified facial features and material details, with a lively premium palette."
+    )
 
 
 class QwenEvidenceProvider:
@@ -230,9 +235,8 @@ class SeedreamImageProvider:
             "Create ONE finished vertical 3:4 daily-memory poster, not separate outputs. "
             "Selectively fuse the referenced real moments into one cohesive editorial composition "
             "with a clear visual hierarchy and seamless transitions between two or three scenes. "
-            "Art direction: bold contemporary flat-vector illustration, crisp simplified shapes, "
-            "confident clean contours, subtle gradients, saturated royal blue, warm coral-orange, "
-            "amber yellow and deep navy, expressive but tasteful, like a premium illustrated memoir. "
+            f"The selected art direction is '{self.settings.art_style_name}'. Follow this art direction "
+            f"precisely: {self.settings.art_style_prompt.strip()} "
             "Preserve the recognizable actions, environment and personal details supported by the "
             "references, while artistically simplifying them. When the same protagonist appears in "
             "multiple references, keep their visual identity consistent and make any repeated depiction "
@@ -299,9 +303,13 @@ confirmed OCR and only correct clear mistakes. Separate observation from inferen
 strength as confidence, never identify a person, and never infer continuity outside this clip."""
 
 _DAILY_PROMPT = """You are the evidence editor and art director for a private Chinese daily diary.
-Review ALL supplied visual, audio, OCR and IMU evidence. Select only the 2-3 scenes that are most
-valuable, special, emotionally meaningful, visually distinctive, or representative of the day.
-Prefer distinct moments rather than near-duplicates. If only one usable scene exists, select it.
+Review ALL supplied visual, audio, OCR and IMU evidence. First mentally cluster adjacent or similar
+captures into meaningful Moments instead of treating every frame as an independent event. Select only
+the 2-3 Moments that are most valuable, special, emotionally meaningful, visually distinctive, or
+representative of the day's central theme. Prioritize supported signs of intentional capture, meaningful
+interactions, a surprising change, personal milestones, and small moments that would be worth remembering.
+Do not choose a scene merely because it is technically sharp. Avoid near-duplicates and routine filler.
+If only one usable Moment exists, select it. Make the chosen Moments form a coherent emotional arc.
 Create one concise theme title that can serve unchanged as both the report title and email subject.
 Create one warm, specific, caring sentence addressed to the user, grounded in the selected events.
 Plan ONE vertical 3:4 poster that artistically fuses the selected moments into a cohesive image.
@@ -549,8 +557,8 @@ def _validate_poster_image_size(value: str) -> tuple[int, int]:
         raise ValueError("Poster size must be vertical")
     if abs(width / height - 0.75) > 0.02:
         raise ValueError("Poster size must use a 3:4 aspect ratio")
-    if width * height >= 2_360_000:
-        raise ValueError("Poster size must contain fewer than 2.36 million pixels")
+    if width * height >= 2_200_000:
+        raise ValueError("Poster size must contain fewer than 2.2 million pixels")
     return width, height
 
 

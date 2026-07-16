@@ -195,9 +195,10 @@ class MainlandProviderTests(unittest.TestCase):
         self.assertEqual(chat.calls[0]["reasoning_effort"], "high")
         self.assertNotIn("sequential_image_generation", image_calls[0]["extra_body"])
         self.assertNotIn("stream", image_calls[0]["extra_body"])
-        self.assertEqual(image_calls[0]["size"], "1328x1776")
+        self.assertEqual(image_calls[0]["size"], "864x1152")
         self.assertEqual(len(image_calls[0]["extra_body"]["image"]), 3)
         self.assertIn("ONE finished vertical 3:4", image_calls[0]["prompt"])
+        self.assertIn("扁平色块波普", image_calls[0]["prompt"])
 
     def test_seedream_rejects_landscape_or_over_budget_size_before_calling_api(self) -> None:
         provider = SeedreamImageProvider(
@@ -206,7 +207,7 @@ class MainlandProviderTests(unittest.TestCase):
             max_attempts=1,
         )
         with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaisesRegex(ValueError, "2.36 million"):
+            with self.assertRaisesRegex(ValueError, "2.2 million"):
                 provider.generate_panel("poster", Path(temporary) / "poster.jpg")
 
 

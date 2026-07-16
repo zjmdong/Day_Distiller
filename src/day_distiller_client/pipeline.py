@@ -355,10 +355,16 @@ class DistillationPipeline:
         plan = synthesis.panels[0]
         poster_dir = self.paths.reports / report_date.isoformat() / job_id
         destination = poster_dir / "daily_poster.jpg"
-        # The poster call intentionally receives only the selected original
-        # capture frames. Keeping the request at no more than three inputs is a
-        # hard cost boundary; avatar references are not added as a fourth image.
+        # Keep the request at no more than three inputs as a hard cost boundary.
+        # When only two Moments are selected, the optional character reference
+        # may use the remaining slot without displacing factual scene evidence.
         poster_references = _select_poster_reference_frames(plan.record_ids, evidence)
+        for avatar in avatar_references:
+            candidate = Path(avatar)
+            if len(poster_references) >= 3:
+                break
+            if candidate.is_file() and candidate not in poster_references:
+                poster_references.append(candidate)
         self.image_provider.generate_panel(plan.image_prompt, destination, poster_references)
         panels = [
             ComicPanel(
@@ -399,6 +405,7 @@ class DistillationPipeline:
             "batch_omni": getattr(scene_settings, "omni_model", "mock-v1"),
             "daily": getattr(daily_settings, "daily_model", "mock-v1"),
             "image": getattr(image_settings, "image_model", "mock-v1"),
+            "art_style": getattr(image_settings, "art_style_name", "mock-default"),
             "motion": "heuristic-v1" if not self.motion_model_path else self.motion_model_path.name,
         }
         return DayReport(
@@ -428,6 +435,42 @@ class DistillationPipeline:
         rendered = self.renderer.render(report, self.paths.reports / job.target_date.isoformat() / job_id)
         self.database.save_report(report, rendered.html_path, rendered.pdf_path)
         return report, rendered
+
+    def regenerate_poster_only(
+        self,
+        job_id: str,
+        avatar_references: list[Path] | None = None,
+        style_fingerprint: str = "preview",
+    ) -> Path:
+        """Generate one style preview from saved evidence without rerunning analysis or writing the report."""
+        row = self.database.get_report(job_id)
+        if row is None:
+            raise RuntimeError("请选择一条已经成功生成日报的记录")
+        report = day_report_from_json(json.loads(row["report_json"]))
+        if not report.panels:
+            raise RuntimeError("所选日报没有可复用的海报计划")
+        evidence = [self._evidence_from_json(item) for item in self.database.list_scene_evidence(job_id)]
+        if not evidence:
+            raise RuntimeError("所选日报没有已保存的场景证据")
+
+        plan = report.panels[0]
+        references = _select_poster_reference_frames(plan.record_ids, evidence)
+        for avatar in avatar_references or []:
+            candidate = Path(avatar)
+            if candidate.is_file() and candidate not in references:
+                references.append(candidate)
+        references = references[:3]
+        digest = hashlib.sha256(
+            (style_fingerprint + plan.image_prompt + "|".join(plan.record_ids)).encode("utf-8")
+        ).hexdigest()[:12]
+        destination = (
+            self.paths.reports
+            / report.report_date.isoformat()
+            / job_id
+            / "style-tests"
+            / f"poster-{digest}.jpg"
+        )
+        return self.image_provider.generate_panel(plan.image_prompt, destination, references)
 
     def resend(self, job_id: str) -> RenderedReport:
         row = self.database.get_report(job_id)

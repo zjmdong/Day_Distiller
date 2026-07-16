@@ -11,6 +11,15 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from .art_styles import (
+    ART_STYLES,
+    CUSTOM_ART_STYLE_ID,
+    DEFAULT_ART_STYLE_ID,
+    MAX_CUSTOM_STYLE_CHARS,
+    get_art_style,
+    resolve_art_style_prompt,
+    validate_custom_style_prompt,
+)
 from .credentials import CredentialName, CredentialStore
 from .database import JobDatabase
 from .device import PortCandidate, UsbLinkDevice, find_device, list_serial_ports
@@ -35,9 +44,10 @@ from .providers import (
 from .reporting import ReportRenderer, day_report_from_json
 from .resources import bundled_ffmpeg_paths
 from .windows import drive_letters, list_removable_drives, safe_eject, wait_for_new_drive
+from .ui_theme import APP_STYLESHEET
 
 
-DEFAULT_POSTER_IMAGE_SIZE = "1328x1776"
+DEFAULT_POSTER_IMAGE_SIZE = "864x1152"
 
 
 def _validate_base_url(value: str, provider: str) -> str:
@@ -56,14 +66,14 @@ def _validate_image_size(value: str) -> str:
     candidate = value.strip().upper()
     match = re.fullmatch(r"(\d{3,5})X(\d{3,5})", candidate)
     if not match:
-        raise ValueError("海报尺寸应填写明确的宽x高像素值，例如 1328x1776")
+        raise ValueError("海报尺寸应填写明确的宽x高像素值，例如 864x1152")
     width, height = map(int, match.groups())
     if min(width, height) < 512 or width >= height:
         raise ValueError("海报必须使用竖版尺寸")
     if abs(width / height - 0.75) > 0.02:
         raise ValueError("海报必须接近 3:4 竖版比例")
-    if width * height >= 2_360_000:
-        raise ValueError("海报总像素数必须少于236万，以控制 Seedream 生成成本")
+    if width * height >= 2_200_000:
+        raise ValueError("海报总像素数必须少于220万，以避免进入更高的 Seedream 计费档位")
     return candidate.lower()
 
 
@@ -86,6 +96,7 @@ def main() -> int:
 
     application = QApplication([])
     application.setApplicationName("Day Distiller v2")
+    application.setStyle("Fusion")
     window = MainWindow()
     window.show()
     return application.exec()
@@ -97,8 +108,10 @@ class MainWindow:
         from PySide6.QtWidgets import QMainWindow
 
         self.window = QMainWindow()
-        self.window.setWindowTitle("Day Distiller · AI 每日蒸馏 v2")
-        self.window.resize(1080, 760)
+        self.window.setWindowTitle("Day Distiller · 把今天变成一张值得收藏的海报")
+        self.window.resize(1280, 820)
+        self.window.setMinimumSize(1060, 700)
+        self.window.setStyleSheet(APP_STYLESHEET)
         self.paths = AppPaths.default().ensure()
         self.database = JobDatabase(self.paths.database)
         self.credentials = CredentialStore()
@@ -127,51 +140,136 @@ class MainWindow:
         self.window.show()
 
     def _build_ui(self) -> None:
-        from PySide6.QtWidgets import QTabWidget
+        from PySide6.QtWidgets import QHBoxLayout, QLabel, QTabWidget, QVBoxLayout, QWidget
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._guide_page(), "用户指引")
+        self.tabs.setTabPosition(QTabWidget.TabPosition.West)
+        self.tabs.setDocumentMode(True)
+        self.tabs.addTab(self._guide_page(), "开始")
         self.tabs.addTab(self._device_page(), "设备")
-        self.tabs.addTab(self._records_page(), "今日记录")
-        self.tabs.addTab(self._distillation_page(), "蒸馏进度")
-        self.tabs.addTab(self._history_page(), "报告历史")
-        self.tabs.addTab(self._avatar_page(), "参考形象")
+        self.tabs.addTab(self._records_page(), "记录")
+        self.tabs.addTab(self._distillation_page(), "生成")
+        self.tabs.addTab(self._history_page(), "回忆")
+        self.tabs.addTab(self._avatar_page(), "形象与风格")
         self.tabs.addTab(self._settings_page_v2(), "设置")
-        self.window.setCentralWidget(self.tabs)
+
+        root = QWidget()
+        root.setObjectName("appRoot")
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        header = QWidget()
+        header.setStyleSheet("background:#FFFFFF; border-bottom:1px solid #E9EAF0;")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(24, 15, 24, 15)
+        brand_box = QVBoxLayout()
+        brand_box.setSpacing(1)
+        brand = QLabel("Day Distiller")
+        brand.setObjectName("brandTitle")
+        brand_subtitle = QLabel("把散落的瞬间，变成一张值得收藏的今日海报")
+        brand_subtitle.setObjectName("brandSubtitle")
+        brand_box.addWidget(brand)
+        brand_box.addWidget(brand_subtitle)
+        header_layout.addLayout(brand_box)
+        header_layout.addStretch(1)
+        cost_chip = QLabel("1K 海报 · 低于 100 万像素")
+        cost_chip.setProperty("chip", True)
+        header_layout.addWidget(cost_chip)
+        root_layout.addWidget(header)
+        root_layout.addWidget(self.tabs, 1)
+        self.window.setCentralWidget(root)
+
+    @staticmethod
+    def _page_header(title: str, subtitle: str):
+        from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 8)
+        layout.setSpacing(4)
+        heading = QLabel(title)
+        heading.setObjectName("pageTitle")
+        copy = QLabel(subtitle)
+        copy.setObjectName("pageSubtitle")
+        copy.setWordWrap(True)
+        layout.addWidget(heading)
+        layout.addWidget(copy)
+        return widget
+
+    @staticmethod
+    def _mark_button(button, role: str = "primary"):
+        button.setProperty("role", role)
+        return button
 
     def _guide_page(self):
-        from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QGroupBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
         page = QWidget()
         layout = QVBoxLayout(page)
-        title = QLabel("<h1>欢迎使用 AI 每日蒸馏</h1>")
-        guide = QLabel(
-            "<h3>首次配置</h3>"
-            "<ol><li>打开“设置”，填写百炼、DeepSeek、火山方舟和 Resend SMTP 参数。</li>"
-            "<li>打开“参考形象”，上传一张清晰的单人参考图并填写简短描述。</li>"
-            "<li>在 Resend 控制台验证发件域名；发件地址必须属于该域名。</li></ol>"
-            "<h3>每天使用</h3>"
-            "<ol><li>出门前携带并启动设备，让设备按计划无感记录。</li>"
-            "<li>回家后唤醒设备并连接电脑。</li>"
-            "<li>在“设备”确认连接，在“今日记录”选择日期。</li>"
-            "<li>进入“蒸馏进度”，点击从设备开始蒸馏。</li>"
-            "<li>邮件被 Resend 接受后，可在“报告历史”查看、修改或重新发送。</li></ol>"
-            "<p><b>隐私提示：</b>IMU和地点记忆留在本地；关键帧和音频发送到百炼，结构化证据发送给DeepSeek；最终筛选出的2–3张原始关键帧和无文字海报提示发送到火山方舟。</p>"
-            "<p>FFmpeg和IMU分类器已内置，无需安装或配置。</p>"
+        layout.setContentsMargins(34, 28, 34, 28)
+        layout.setSpacing(18)
+        layout.addWidget(
+            self._page_header(
+                "今天，值得被好好记住",
+                "连接设备、选择当天记录，然后让 AI 从所有素材中找到真正重要的 2–3 个 Moments。",
+            )
         )
-        guide.setWordWrap(True)
-        go_settings = QPushButton("前往设置")
+
+        steps = QHBoxLayout()
+        steps.setSpacing(14)
+        for number, title, copy, color in (
+            ("1", "连接设备", "回家后唤醒设备并连接电脑。", "#6C5CE7"),
+            ("2", "确认记录", "扫描今天，快速确认素材数量。", "#FF6B8A"),
+            ("3", "生成海报", "一键筛选、分析、创作并发送。", "#00BFA6"),
+        ):
+            card = QGroupBox()
+            card_layout = QVBoxLayout(card)
+            badge = QLabel(number)
+            badge.setFixedSize(38, 38)
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setStyleSheet(
+                f"background:{color}; color:white; border-radius:19px; font-size:18px; font-weight:700;"
+            )
+            heading = QLabel(title)
+            heading.setStyleSheet("font-size:18px; font-weight:700;")
+            description = QLabel(copy)
+            description.setProperty("muted", True)
+            description.setWordWrap(True)
+            card_layout.addWidget(badge)
+            card_layout.addWidget(heading)
+            card_layout.addWidget(description)
+            card_layout.addStretch(1)
+            steps.addWidget(card, 1)
+        layout.addLayout(steps)
+
+        action_row = QHBoxLayout()
+        begin = self._mark_button(QPushButton("开始整理今天"))
+        begin.clicked.connect(lambda: self._select_tab("记录"))
+        go_settings = QPushButton("首次使用？完成配置")
         go_settings.clicked.connect(lambda: self.tabs.setCurrentIndex(self.tabs.count() - 1))
-        layout.addWidget(title)
-        layout.addWidget(guide)
-        layout.addWidget(go_settings)
+        action_row.addWidget(begin)
+        action_row.addWidget(go_settings)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+
+        privacy = QLabel(
+            "隐私与费用  ·  IMU 与地点记忆只在本机处理；只有关键帧、音频和必要证据会按流程发送给已配置模型。"
+            "最终海报固定为 864×1152（约 99.5 万像素）。FFmpeg 与 IMU 模型已经内置。"
+        )
+        privacy.setWordWrap(True)
+        privacy.setProperty("muted", True)
+        layout.addWidget(privacy)
         layout.addStretch(1)
         return page
 
     def _avatar_page(self):
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import (
+            QComboBox,
             QFileDialog,
+            QGroupBox,
+            QHBoxLayout,
             QLabel,
             QLineEdit,
             QPlainTextEdit,
@@ -182,39 +280,105 @@ class MainWindow:
 
         page = QWidget()
         layout = QVBoxLayout(page)
-        intro = QLabel(
-            "上传一张清晰、光线均匀、只有一名主体的正面或半身照片。"
-            "描述建议控制在20–100字，例如：短黑发、圆框眼镜、常穿深蓝夹克，海报中保持温和自然的形象。"
+        layout.setContentsMargins(30, 24, 30, 28)
+        layout.setSpacing(14)
+        layout.addWidget(
+            self._page_header(
+                "形象与艺术风格",
+                "形象参考决定“画谁”，艺术风格决定“如何记住今天”。你也可以用历史日报只测试一张新风格。",
+            )
         )
-        intro.setWordWrap(True)
+
+        columns = QHBoxLayout()
+        columns.setSpacing(18)
+        avatar_card = QGroupBox("我的海报形象")
+        avatar_layout = QVBoxLayout(avatar_card)
         self.avatar_preview = QLabel("尚未选择参考形象")
         self.avatar_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.avatar_preview.setMinimumHeight(320)
-        self.avatar_preview.setStyleSheet("border: 1px solid #888; background: #202020;")
+        self.avatar_preview.setMinimumHeight(260)
+        self.avatar_preview.setStyleSheet(
+            "border:1px dashed #C8CDDA; border-radius:16px; background:#F8F9FC; color:#8B92A5;"
+        )
         self.avatar_edit = QLineEdit()
         self.avatar_edit.setReadOnly(True)
+        self.avatar_edit.setPlaceholderText("可上传 AI 形象，也可上传自己的实拍参考图")
         self.avatar_description_edit = QPlainTextEdit()
-        self.avatar_description_edit.setPlaceholderText("简短描述你的发型、衣着、配饰和希望保持的海报角色特征")
-        self.avatar_description_edit.setMaximumHeight(120)
+        self.avatar_description_edit.setPlaceholderText("简短描述发型、衣着、配饰和希望保持的角色特征")
+        self.avatar_description_edit.setMaximumHeight(92)
         choose = QPushButton("选择参考形象")
         choose.clicked.connect(lambda: self._choose_avatar(QFileDialog))
-        save = QPushButton("保存参考形象")
+        save = self._mark_button(QPushButton("保存形象与风格"))
         save.clicked.connect(self.save_avatar_profile)
-        layout.addWidget(intro)
-        layout.addWidget(self.avatar_preview, 1)
-        layout.addWidget(self.avatar_edit)
-        layout.addWidget(self.avatar_description_edit)
-        layout.addWidget(choose)
-        layout.addWidget(save)
+        avatar_layout.addWidget(self.avatar_preview, 1)
+        avatar_layout.addWidget(self.avatar_edit)
+        avatar_layout.addWidget(self.avatar_description_edit)
+        avatar_actions = QHBoxLayout()
+        avatar_actions.addWidget(choose)
+        avatar_actions.addWidget(save)
+        avatar_layout.addLayout(avatar_actions)
+        columns.addWidget(avatar_card, 1)
+
+        style_card = QGroupBox("海报艺术风格")
+        style_layout = QVBoxLayout(style_card)
+        self.art_style_combo = QComboBox()
+        for style in ART_STYLES:
+            self.art_style_combo.addItem(f"{style.name}  ·  {style.tagline}", style.id)
+        self.art_style_combo.addItem("自定义风格  ·  用自己的 200 字提示词", CUSTOM_ART_STYLE_ID)
+        self.art_style_combo.currentIndexChanged.connect(self._on_art_style_changed)
+        self.art_style_description = QLabel()
+        self.art_style_description.setWordWrap(True)
+        self.art_style_description.setMinimumHeight(64)
+        self.custom_style_edit = QPlainTextEdit()
+        self.custom_style_edit.setPlaceholderText(
+            "描述画面风格、材质、色彩与氛围。无需重复写竖版、无文字等规则。"
+        )
+        self.custom_style_edit.setMaximumHeight(90)
+        self.custom_style_edit.textChanged.connect(self._limit_custom_style_prompt)
+        self.custom_style_counter = QLabel(f"0/{MAX_CUSTOM_STYLE_CHARS}")
+        self.custom_style_counter.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.custom_style_counter.setProperty("muted", True)
+
+        history_label = QLabel("用一条成功记录测试当前风格")
+        history_label.setStyleSheet("font-weight:650; margin-top:8px;")
+        self.style_test_job_combo = QComboBox()
+        self.style_test_job_combo.setPlaceholderText("选择历史日报")
+        self.style_test_button = self._mark_button(
+            QPushButton("只生成一张风格试片（调用 1 次 Seedream）"), "accent"
+        )
+        self.style_test_button.clicked.connect(self.test_current_art_style)
+        self.style_test_status = QLabel("不会重新分析视频、音频或 IMU，也不会发送邮件。")
+        self.style_test_status.setProperty("muted", True)
+        self.style_test_status.setWordWrap(True)
+        self.style_preview = QLabel("新风格试片会显示在这里")
+        self.style_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.style_preview.setMinimumHeight(240)
+        self.style_preview.setStyleSheet(
+            "border:1px dashed #C8CDDA; border-radius:16px; background:#F8F9FC; color:#8B92A5;"
+        )
+        style_layout.addWidget(self.art_style_combo)
+        style_layout.addWidget(self.art_style_description)
+        style_layout.addWidget(self.custom_style_edit)
+        style_layout.addWidget(self.custom_style_counter)
+        style_layout.addWidget(history_label)
+        style_layout.addWidget(self.style_test_job_combo)
+        style_layout.addWidget(self.style_test_button)
+        style_layout.addWidget(self.style_test_status)
+        style_layout.addWidget(self.style_preview, 1)
+        columns.addWidget(style_card, 1)
+        layout.addLayout(columns, 1)
+        self._on_art_style_changed()
         return page
 
     def _settings_page_v2(self):
         from PySide6.QtWidgets import (
             QComboBox,
             QFormLayout,
+            QGroupBox,
+            QHBoxLayout,
             QLabel,
             QLineEdit,
             QPushButton,
+            QScrollArea,
             QSpinBox,
             QVBoxLayout,
             QWidget,
@@ -222,12 +386,23 @@ class MainWindow:
 
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 24, 30, 28)
+        layout.setSpacing(14)
+        layout.addWidget(
+            self._page_header(
+                "服务设置",
+                "只需首次填写。密钥保存在 Windows 凭据管理器，并按你的要求在此页明文显示。",
+            )
+        )
         notice = QLabel(
-            "API Key仅保存到本机 Windows Credential Manager，并会在本设置页明文显示，便于检查和修改；"
-            "请勿截图或向他人展示此页面。Base URL、模型名和邮件参数保存在本地SQLite。"
+            "安全提醒 · 请勿截图或向他人展示此页面。Base URL、模型名和邮件参数保存在本地 SQLite。"
         )
         notice.setWordWrap(True)
-        form = QFormLayout()
+        notice.setStyleSheet(
+            "background:#FFF2D9; color:#7A4A00; border-radius:12px; padding:11px; font-weight:600;"
+        )
+        layout.addWidget(notice)
+
         self.api_key_edit = self._password_edit(QLineEdit)
         self.deepseek_key_edit = self._password_edit(QLineEdit)
         self.volcengine_key_edit = self._password_edit(QLineEdit)
@@ -247,33 +422,61 @@ class MainWindow:
         self.daily_model_edit = QLineEdit("deepseek-v4-pro")
         self.image_model_edit = QLineEdit("doubao-seedream-5-0-pro")
         self.image_size_edit = QLineEdit(DEFAULT_POSTER_IMAGE_SIZE)
+        self.image_size_edit.setReadOnly(True)
+        self.image_size_edit.setToolTip("固定 1K 级 3:4 输出，约 99.5 万像素，避免误触更高计费档位")
         self.resend_sender_edit = QLineEdit()
         self.resend_recipient_edit = QLineEdit()
-        form.addRow("百炼 Base URL", self.qwen_base_url_edit)
-        form.addRow("百炼 API Key", self.api_key_edit)
-        form.addRow("关键帧模型", self.scene_model_edit)
-        form.addRow("批量音视频/OCR模型", self.omni_model_edit)
-        form.addRow("DeepSeek Base URL", self.deepseek_base_url_edit)
-        form.addRow("DeepSeek API Key", self.deepseek_key_edit)
-        form.addRow("日报模型", self.daily_model_edit)
-        form.addRow("火山方舟 Base URL", self.volcengine_base_url_edit)
-        form.addRow("火山方舟 API Key", self.volcengine_key_edit)
-        form.addRow("Seedream模型/Endpoint ID", self.image_model_edit)
-        form.addRow("单张海报尺寸（3:4，<236万像素）", self.image_size_edit)
-        form.addRow("Resend SMTP主机", self.resend_host_edit)
-        form.addRow("Resend SMTP端口", self.resend_port_edit)
-        form.addRow("Resend SMTP安全方式", self.resend_security_combo)
-        form.addRow("Resend API Key（SMTP密码）", self.resend_key_edit)
-        form.addRow("Resend发件地址", self.resend_sender_edit)
-        form.addRow("日报收件地址", self.resend_recipient_edit)
-        save = QPushButton("保存设置")
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        content = QWidget()
+        columns = QHBoxLayout(content)
+        columns.setContentsMargins(2, 2, 12, 2)
+        columns.setSpacing(16)
+
+        ai_group = QGroupBox("AI 模型")
+        ai_form = QFormLayout(ai_group)
+        ai_form.addRow("百炼 Base URL", self.qwen_base_url_edit)
+        ai_form.addRow("百炼 API Key", self.api_key_edit)
+        ai_form.addRow("关键帧理解", self.scene_model_edit)
+        ai_form.addRow("音视频 / OCR", self.omni_model_edit)
+        ai_form.addRow("DeepSeek Base URL", self.deepseek_base_url_edit)
+        ai_form.addRow("DeepSeek API Key", self.deepseek_key_edit)
+        ai_form.addRow("每日主题与文案", self.daily_model_edit)
+        ai_form.addRow("火山方舟 Base URL", self.volcengine_base_url_edit)
+        ai_form.addRow("火山方舟 API Key", self.volcengine_key_edit)
+        ai_form.addRow("Seedream 模型 / Endpoint", self.image_model_edit)
+        ai_form.addRow("海报分辨率（固定 1K）", self.image_size_edit)
+        columns.addWidget(ai_group, 3)
+
+        mail_group = QGroupBox("邮件 · Resend SMTP")
+        mail_form = QFormLayout(mail_group)
+        mail_form.addRow("SMTP 主机", self.resend_host_edit)
+        mail_form.addRow("SMTP 端口", self.resend_port_edit)
+        mail_form.addRow("安全方式", self.resend_security_combo)
+        mail_form.addRow("Resend API Key", self.resend_key_edit)
+        mail_form.addRow("发件地址", self.resend_sender_edit)
+        mail_form.addRow("日报收件地址", self.resend_recipient_edit)
+        mail_note = QLabel(
+            "发件地址必须属于已在 Resend 验证的域名。SMTP 用户名固定为 resend；API Key 同时作为 SMTP 密码。"
+        )
+        mail_note.setWordWrap(True)
+        mail_note.setProperty("muted", True)
+        mail_form.addRow(mail_note)
+        columns.addWidget(mail_group, 2)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        save = self._mark_button(QPushButton("保存全部设置"))
         save.clicked.connect(self.save_cloud_settings)
-        layout.addWidget(notice)
-        layout.addLayout(form)
-        layout.addWidget(save)
+        bottom = QHBoxLayout()
+        bottom.addWidget(save)
         self.data_usage_label = QLabel()
-        layout.addWidget(self.data_usage_label)
-        layout.addStretch(1)
+        self.data_usage_label.setProperty("muted", True)
+        bottom.addStretch(1)
+        bottom.addWidget(self.data_usage_label)
+        layout.addLayout(bottom)
         self.refresh_data_usage()
         return page
 
@@ -299,11 +502,16 @@ class MainWindow:
 
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 24, 30, 28)
+        layout.setSpacing(14)
+        layout.addWidget(
+            self._page_header("连接设备", "通常只需点击“自动发现”。高级 MSC 操作仅在设备维护时使用。")
+        )
         row = QHBoxLayout()
         self.port_combo = QComboBox()
         self.refresh_button = QPushButton("刷新串口")
         self.connect_button = QPushButton("连接")
-        self.auto_button = QPushButton("自动发现")
+        self.auto_button = self._mark_button(QPushButton("自动发现"))
         row.addWidget(QLabel("协议 CDC"))
         row.addWidget(self.port_combo, 1)
         row.addWidget(self.refresh_button)
@@ -366,6 +574,14 @@ class MainWindow:
 
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 24, 30, 28)
+        layout.setSpacing(14)
+        layout.addWidget(
+            self._page_header(
+                "选择今天的记录",
+                "设备挂载后会自动带入路径。也可以选择本机测试文件夹，再扫描指定日期。",
+            )
+        )
         source_row = QHBoxLayout()
         self.source_edit = QLineEdit()
         self.source_edit.setPlaceholderText("虚拟 TF 卡目录或已挂载设备盘符，例如 E:\\")
@@ -381,7 +597,7 @@ class MainWindow:
         date_row = QHBoxLayout()
         self.target_date = QDateEdit(QDate.currentDate())
         self.target_date.setCalendarPopup(True)
-        scan_button = QPushButton("扫描所选日期")
+        scan_button = self._mark_button(QPushButton("扫描所选日期"), "mint")
         scan_button.clicked.connect(self.scan_records)
         date_row.addWidget(QLabel("日期"))
         date_row.addWidget(self.target_date)
@@ -410,13 +626,21 @@ class MainWindow:
 
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 24, 30, 28)
+        layout.setSpacing(14)
+        layout.addWidget(
+            self._page_header(
+                "生成今日海报",
+                "已经扫描过记录时会直接开始；尚未选择素材时，应用会带你回到记录页。",
+            )
+        )
         top = QHBoxLayout()
         self.provider_combo = QComboBox()
-        self.provider_combo.addItem("离线 Mock（零云端调用）", "mock")
         self.provider_combo.addItem("中国大陆模型工作流 + Resend", "mainland")
+        self.provider_combo.addItem("离线演示（零云端调用）", "mock")
         self.delete_virtual_source = QCheckBox("邮件成功后删除所选虚拟卡记录")
-        self.start_folder_button = QPushButton("从文件夹开始蒸馏")
-        self.start_device_button = QPushButton("从当前设备一键蒸馏")
+        self.start_folder_button = QPushButton("使用已扫描的文件夹")
+        self.start_device_button = self._mark_button(QPushButton("从当前设备一键生成"))
         top.addWidget(QLabel("产出模式"))
         top.addWidget(self.provider_combo)
         top.addWidget(self.delete_virtual_source)
@@ -425,9 +649,12 @@ class MainWindow:
         top.addWidget(self.start_device_button)
         layout.addLayout(top)
         self.stage_label = QLabel("等待开始")
+        self.stage_label.setStyleSheet("font-size:18px; font-weight:700; color:#312A63;")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1000)
-        self.usage_label = QLabel("Mock 模式估算用量为 0；真实模式只调用一次 Seedream，最多输入3张原始关键帧，输出单张3:4海报且少于236万像素。")
+        self.usage_label = QLabel(
+            "费用边界 · 每次完整生成只调用一次 Seedream；最多输入 3 张参考图，输出固定 864×1152、约 99.5 万像素的 3:4 海报。"
+        )
         self.usage_label.setWordWrap(True)
         self.distill_log = QPlainTextEdit()
         self.distill_log.setReadOnly(True)
@@ -444,11 +671,16 @@ class MainWindow:
 
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 24, 30, 28)
+        layout.setSpacing(14)
+        layout.addWidget(
+            self._page_header("我的回忆", "打开、微调或再次发送已经完成的日报；失败任务也可以从这里恢复。")
+        )
         row = QHBoxLayout()
         refresh = QPushButton("刷新")
-        self.open_report_button = QPushButton("打开日报")
+        self.open_report_button = self._mark_button(QPushButton("打开日报"))
         self.edit_report_button = QPushButton("修改地点与文字")
-        self.regenerate_button = QPushButton("重新生成海报")
+        self.regenerate_button = QPushButton("重新编排并生成")
         self.resend_button = QPushButton("手动再次发送")
         self.retry_job_button = QPushButton("重试失败任务")
         self.retry_cleanup_button = QPushButton("重试设备清理")
@@ -654,7 +886,7 @@ class MainWindow:
             source = normalize_source_root(self.source_edit.text())
         except (ValueError, FileNotFoundError) as exc:
             QMessageBox.information(self.window, "请选择记录", str(exc))
-            self._select_tab("今日记录")
+            self._select_tab("记录")
             return
         target = self._selected_date()
         if (
@@ -665,14 +897,14 @@ class MainWindow:
             QMessageBox.information(
                 self.window,
                 "请先扫描记录",
-                "请在“今日记录”页选择记录根目录和日期，并确认扫描到了至少一条记录。",
+                "请在“记录”页选择记录根目录和日期，并确认扫描到了至少一条记录。",
             )
-            self._select_tab("今日记录")
+            self._select_tab("记录")
             return
         provider_mode = str(self.provider_combo.currentData())
         delete_source = self.delete_virtual_source.isChecked()
         self._set_busy(True)
-        self._select_tab("蒸馏进度")
+        self._select_tab("生成")
 
         def work():
             pipeline = self._create_pipeline(provider_mode)
@@ -686,14 +918,24 @@ class MainWindow:
     def start_device_distillation(self) -> None:
         from PySide6.QtWidgets import QMessageBox
 
+        target = self._selected_date()
+        if (
+            self.scanned_source_root is not None
+            and self.scanned_target_date == target
+            and self.scanned_record_count > 0
+        ):
+            # A mounted device card and a user-selected fixture are both valid
+            # record sources. Reuse the confirmed selection instead of forcing
+            # the user through device discovery again.
+            self.start_folder_distillation()
+            return
         if self.device is None and not self.port_combo.currentData():
             QMessageBox.information(self.window, "请先连接设备", "尚未选择设备串口，请先在“设备”页连接或自动发现设备。")
             self._select_tab("设备")
             return
-        target = self._selected_date()
         provider_mode = str(self.provider_combo.currentData())
         self._set_busy(True)
-        self._select_tab("蒸馏进度")
+        self._select_tab("生成")
 
         def work():
             pipeline = self._create_pipeline(provider_mode)
@@ -714,7 +956,7 @@ class MainWindow:
             return
         provider_mode = self.database.get_job(job_id).provider_mode
         self._set_busy(True)
-        self._select_tab("蒸馏进度")
+        self._select_tab("生成")
         self._start(
             "distill",
             lambda: self._create_pipeline(provider_mode).process(
@@ -737,12 +979,25 @@ class MainWindow:
         from PySide6.QtCore import Qt
 
         self.history_list.clear()
+        if hasattr(self, "style_test_job_combo"):
+            self.style_test_job_combo.clear()
         for job in self.database.list_jobs():
-            item_text = f"{job.target_date.isoformat()}  ·  {job.stage.value}  ·  {job.provider_mode}"
+            report_row = self.database.get_report(job.id)
+            report_title = ""
+            if report_row is not None:
+                try:
+                    report_title = str(json.loads(report_row["report_json"]).get("title", ""))
+                except (json.JSONDecodeError, TypeError):
+                    report_title = ""
+            item_text = f"{job.target_date.isoformat()}  ·  {report_title or job.stage.value}"
             if job.error:
                 item_text += f"  ·  {job.error}"
             self.history_list.addItem(item_text)
             self.history_list.item(self.history_list.count() - 1).setData(Qt.ItemDataRole.UserRole, job.id)
+            if report_row is not None and hasattr(self, "style_test_job_combo"):
+                self.style_test_job_combo.addItem(
+                    f"{job.target_date.isoformat()}  ·  {report_title or '已完成日报'}", job.id
+                )
         if hasattr(self, "data_usage_label"):
             self.refresh_data_usage()
 
@@ -986,7 +1241,7 @@ class MainWindow:
     def _choose_avatar(self, file_dialog) -> None:
         selected, _ = file_dialog.getOpenFileName(
             self.window,
-            "选择漫画参考形象",
+            "选择海报参考形象",
             filter="Images (*.jpg *.jpeg *.png *.webp)",
         )
         if selected:
@@ -999,30 +1254,132 @@ class MainWindow:
 
         source = Path(self.avatar_edit.text().strip()) if self.avatar_edit.text().strip() else None
         description = self.avatar_description_edit.toPlainText().strip()
-        if source is None or not source.is_file():
-            QMessageBox.warning(self.window, "参考形象", "请先选择一张有效图片。")
+        try:
+            style_id, style_name, style_prompt, custom_prompt = self._current_art_style()
+        except ValueError as exc:
+            QMessageBox.warning(self.window, "艺术风格", str(exc))
             return
-        if not description:
+        if source is not None and not source.is_file():
+            QMessageBox.warning(self.window, "参考形象", "所选参考图片已经不存在，请重新选择。")
+            return
+        if source is not None and not description:
             QMessageBox.warning(self.window, "参考形象", "请填写一段简短的形象描述。")
             return
         try:
-            with Image.open(source) as image:
-                image.verify()
-            profile_dir = self.paths.root / "profile"
-            profile_dir.mkdir(parents=True, exist_ok=True)
-            destination = profile_dir / ("reference" + source.suffix.lower())
-            if source.resolve() != destination.resolve():
-                shutil.copy2(source, destination)
             settings = self.database.get_setting("desktop_v2", {})
-            settings["avatar"] = str(destination)
-            settings["avatar_description"] = description
+            destination = source
+            if source is not None:
+                with Image.open(source) as image:
+                    image.verify()
+                profile_dir = self.paths.root / "profile"
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                destination = profile_dir / ("reference" + source.suffix.lower())
+                if source.resolve() != destination.resolve():
+                    shutil.copy2(source, destination)
+                settings["avatar"] = str(destination)
+                settings["avatar_description"] = description
+            settings["art_style_id"] = style_id
+            settings["art_style_name"] = style_name
+            settings["art_style_prompt"] = style_prompt
+            settings["custom_art_style_prompt"] = custom_prompt
             self.database.set_setting("desktop_v2", settings)
-            self.avatar_edit.setText(str(destination))
-            self._update_avatar_preview(destination)
+            if destination is not None:
+                self.avatar_edit.setText(str(destination))
+                self._update_avatar_preview(destination)
         except Exception as exc:
             QMessageBox.warning(self.window, "参考形象保存失败", str(exc))
             return
-        QMessageBox.information(self.window, "参考形象", "参考形象和描述已保存在本机。")
+        saved = "参考形象、描述和艺术风格" if source is not None else "艺术风格"
+        QMessageBox.information(self.window, "形象与风格", f"{saved}已保存在本机。")
+
+    def _current_art_style(self) -> tuple[str, str, str, str]:
+        style_id = str(self.art_style_combo.currentData() or DEFAULT_ART_STYLE_ID)
+        custom_prompt = validate_custom_style_prompt(self.custom_style_edit.toPlainText())
+        style_name, style_prompt = resolve_art_style_prompt(style_id, custom_prompt)
+        return style_id, style_name, style_prompt, custom_prompt
+
+    def _save_art_style_settings(self) -> tuple[str, str, str, str]:
+        style_id, style_name, style_prompt, custom_prompt = self._current_art_style()
+        settings = self.database.get_setting("desktop_v2", {})
+        settings.update(
+            {
+                "art_style_id": style_id,
+                "art_style_name": style_name,
+                "art_style_prompt": style_prompt,
+                "custom_art_style_prompt": custom_prompt,
+            }
+        )
+        self.database.set_setting("desktop_v2", settings)
+        return style_id, style_name, style_prompt, custom_prompt
+
+    def _on_art_style_changed(self, _index: int | None = None) -> None:
+        style_id = str(self.art_style_combo.currentData() or DEFAULT_ART_STYLE_ID)
+        custom = style_id == CUSTOM_ART_STYLE_ID
+        self.custom_style_edit.setVisible(custom)
+        self.custom_style_counter.setVisible(custom)
+        if custom:
+            description = "用不超过 200 字定义独有的色彩、材质、笔触和情绪。系统仍会强制保持竖版、无文字与事实一致。"
+            accent = "#6C5CE7"
+        else:
+            style = get_art_style(style_id)
+            description = f"{style.description}\n{style.tagline}"
+            accent = style.accent
+        self.art_style_description.setText(description)
+        self.art_style_description.setStyleSheet(
+            f"background:#F7F5FF; color:#30394D; border:2px solid {accent}; "
+            "border-radius:13px; padding:12px; font-weight:600;"
+        )
+
+    def _limit_custom_style_prompt(self) -> None:
+        text = self.custom_style_edit.toPlainText()
+        if len(text) > MAX_CUSTOM_STYLE_CHARS:
+            self.custom_style_edit.blockSignals(True)
+            self.custom_style_edit.setPlainText(text[:MAX_CUSTOM_STYLE_CHARS])
+            cursor = self.custom_style_edit.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            self.custom_style_edit.setTextCursor(cursor)
+            self.custom_style_edit.blockSignals(False)
+            text = text[:MAX_CUSTOM_STYLE_CHARS]
+        self.custom_style_counter.setText(f"{len(text)}/{MAX_CUSTOM_STYLE_CHARS}")
+
+    def test_current_art_style(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        job_id = self.style_test_job_combo.currentData()
+        if not job_id:
+            QMessageBox.information(self.window, "选择历史日报", "请先选择一条已经成功生成的历史日报。")
+            return
+        try:
+            style_id, style_name, style_prompt, _custom = self._save_art_style_settings()
+        except ValueError as exc:
+            QMessageBox.warning(self.window, "艺术风格", str(exc))
+            return
+        self._set_busy(True)
+        self.style_test_status.setText(f"正在用“{style_name}”生成 1K 试片…")
+        self._start(
+            "style_test",
+            lambda: self._create_style_test_pipeline().regenerate_poster_only(
+                str(job_id),
+                self._avatar_references(),
+                style_fingerprint=style_id + ":" + style_prompt,
+            ),
+        )
+
+    def _update_style_preview(self, path: Path) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QPixmap
+
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            self.style_preview.setText("图片已经生成，但预览加载失败")
+            return
+        self.style_preview.setPixmap(
+            pixmap.scaled(
+                self.style_preview.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
 
     def _update_avatar_preview(self, path: Path) -> None:
         from PySide6.QtCore import Qt
@@ -1044,6 +1401,7 @@ class MainWindow:
         from PySide6.QtWidgets import QMessageBox
 
         try:
+            self.image_size_edit.setText(DEFAULT_POSTER_IMAGE_SIZE)
             _validate_base_url(self.qwen_base_url_edit.text(), "百炼")
             _validate_base_url(self.deepseek_base_url_edit.text(), "DeepSeek")
             _validate_base_url(self.volcengine_base_url_edit.text(), "火山方舟")
@@ -1102,14 +1460,9 @@ class MainWindow:
         self.omni_model_edit.setText(models.get("omni", self.omni_model_edit.text()))
         self.daily_model_edit.setText(models.get("daily", self.daily_model_edit.text()))
         self.image_model_edit.setText(models.get("image", self.image_model_edit.text()))
-        saved_image_size = models.get("image_size", DEFAULT_POSTER_IMAGE_SIZE)
-        try:
-            saved_image_size = _validate_image_size(saved_image_size)
-        except ValueError:
-            # Migrate the former 4:3 / 2K panel setting to the cost-capped
-            # vertical poster default without blocking existing installations.
-            saved_image_size = DEFAULT_POSTER_IMAGE_SIZE
-        self.image_size_edit.setText(saved_image_size)
+        # v2.1 intentionally migrates every older canvas setting to the fixed
+        # 1K cost-safe output. The field remains visible for transparency.
+        self.image_size_edit.setText(DEFAULT_POSTER_IMAGE_SIZE)
         self.qwen_base_url_edit.setText(endpoints.get("qwen", self.qwen_base_url_edit.text()))
         self.deepseek_base_url_edit.setText(endpoints.get("deepseek", self.deepseek_base_url_edit.text()))
         self.volcengine_base_url_edit.setText(endpoints.get("volcengine", self.volcengine_base_url_edit.text()))
@@ -1136,6 +1489,11 @@ class MainWindow:
         path = Path(self.avatar_edit.text()) if self.avatar_edit.text() else None
         if path and path.is_file():
             self._update_avatar_preview(path)
+        style_id = settings.get("art_style_id", DEFAULT_ART_STYLE_ID)
+        index = self.art_style_combo.findData(style_id)
+        self.art_style_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.custom_style_edit.setPlainText(settings.get("custom_art_style_prompt", ""))
+        self._on_art_style_changed()
 
     def _create_pipeline(self, provider_mode: str) -> DistillationPipeline:
         settings = self.database.get_setting("desktop_v2", {})
@@ -1148,12 +1506,7 @@ class MainWindow:
             _validate_base_url(endpoints.get("qwen", QwenSettings.base_url), "百炼")
             _validate_base_url(endpoints.get("deepseek", DeepSeekSettings.base_url), "DeepSeek")
             _validate_base_url(endpoints.get("volcengine", SeedreamSettings.base_url), "火山方舟")
-            try:
-                poster_image_size = _validate_image_size(
-                    models.get("image_size", DEFAULT_POSTER_IMAGE_SIZE)
-                )
-            except ValueError:
-                poster_image_size = DEFAULT_POSTER_IMAGE_SIZE
+            poster_image_size = _validate_image_size(DEFAULT_POSTER_IMAGE_SIZE)
             qwen_key = self.credentials.get(CredentialName.QWEN_API_KEY)
             deepseek_key = self.credentials.get(CredentialName.DEEPSEEK_API_KEY)
             volcengine_key = self.credentials.get(CredentialName.VOLCENGINE_API_KEY)
@@ -1183,6 +1536,8 @@ class MainWindow:
                     image_model=models.get("image", "doubao-seedream-5-0-pro"),
                     image_size=poster_image_size,
                     character_description=settings.get("avatar_description", ""),
+                    art_style_name=settings.get("art_style_name", get_art_style(DEFAULT_ART_STYLE_ID).name),
+                    art_style_prompt=settings.get("art_style_prompt", get_art_style(DEFAULT_ART_STYLE_ID).prompt),
                 ),
             )
             resend = settings.get("resend", {})
@@ -1213,6 +1568,42 @@ class MainWindow:
             ),
         )
 
+    def _create_style_test_pipeline(self) -> DistillationPipeline:
+        settings = self.database.get_setting("desktop_v2", {})
+        models = settings.get("models", {})
+        endpoints = settings.get("endpoints", {})
+        base_url = _validate_base_url(
+            endpoints.get("volcengine", SeedreamSettings.base_url), "火山方舟"
+        )
+        image_size = _validate_image_size(DEFAULT_POSTER_IMAGE_SIZE)
+        volcengine_key = self.credentials.get(CredentialName.VOLCENGINE_API_KEY)
+        if not volcengine_key:
+            raise RuntimeError("请先在设置页保存火山方舟 API Key")
+        mock = MockAIProvider()
+        image = SeedreamImageProvider(
+            api_key=volcengine_key,
+            settings=SeedreamSettings(
+                base_url=base_url,
+                image_model=models.get("image", "doubao-seedream-5-0-pro"),
+                image_size=image_size,
+                character_description=settings.get("avatar_description", ""),
+                art_style_name=settings.get("art_style_name", get_art_style(DEFAULT_ART_STYLE_ID).name),
+                art_style_prompt=settings.get("art_style_prompt", get_art_style(DEFAULT_ART_STYLE_ID).prompt),
+            ),
+        )
+        ffmpeg, ffprobe = bundled_ffmpeg_paths()
+        return DistillationPipeline(
+            self.paths,
+            self.database,
+            mock,
+            mock,
+            mock,
+            image,
+            MockMailProvider(self.paths.root / "mock_outbox"),
+            media_preprocessor=MediaPreprocessor(ffmpeg, ffprobe),
+            motion_model_path=None,
+        )
+
     def _avatar_references(self) -> list[Path]:
         value = self.database.get_setting("desktop_v2", {}).get("avatar", "")
         path = Path(value) if value else None
@@ -1229,6 +1620,13 @@ class MainWindow:
         return str(item.data(Qt.ItemDataRole.UserRole)) if item else None
 
     def _select_tab(self, title: str) -> None:
+        title = {
+            "用户指引": "开始",
+            "今日记录": "记录",
+            "蒸馏进度": "生成",
+            "报告历史": "回忆",
+            "参考形象": "形象与风格",
+        }.get(title, title)
         for index in range(self.tabs.count()):
             if self.tabs.tabText(index) == title:
                 self.tabs.setCurrentIndex(index)
@@ -1237,6 +1635,8 @@ class MainWindow:
     def _start(self, name: str, operation: Callable[[], Any]) -> None:
         if name in {"distill", "cleanup_retry", "manual_regenerate", "manual_resend"}:
             self.distill_log.appendPlainText(f"{name}...")
+        elif name == "style_test":
+            self.style_test_status.setText("正在连接 Seedream，仅生成最终海报试片…")
         else:
             self._device_log(f"{name}...")
         self.worker.run(name, operation)
@@ -1262,6 +1662,9 @@ class MainWindow:
                     self.distill_log.appendPlainText(f"{name} 失败：{error}")
                     self._set_busy(False)
                     self.refresh_history()
+                elif name == "style_test":
+                    self.style_test_status.setText(f"生成失败：{error}")
+                    self._set_busy(False)
                 else:
                     self._device_log(f"{name} 失败：{error}")
                 continue
@@ -1320,6 +1723,11 @@ class MainWindow:
             self.distill_log.appendPlainText(f"邮件服务器已接受手动发送：{result.html_path}")
             self._set_busy(False)
             self.refresh_history()
+        elif name == "style_test":
+            path = Path(result)
+            self._update_style_preview(path)
+            self.style_test_status.setText(f"试片已生成 · {path.name}（未覆盖原日报，也未发送邮件）")
+            self._set_busy(False)
 
     def _require_device(self) -> UsbLinkDevice:
         if self.device is None:
@@ -1360,6 +1768,8 @@ class MainWindow:
         self.edit_report_button.setDisabled(busy)
         self.regenerate_button.setDisabled(busy)
         self.resend_button.setDisabled(busy)
+        if hasattr(self, "style_test_button"):
+            self.style_test_button.setDisabled(busy)
 
     def _device_log(self, message: str) -> None:
         self.device_log.appendPlainText(message)
