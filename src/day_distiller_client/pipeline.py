@@ -106,28 +106,94 @@ class DistillationPipeline:
             raise ValueError("job is already completed")
         try:
             records = self._records(job_id)
-            self._validate_local(records)
-            self._advance(job_id, JobStage.VALIDATING, JobStage.PREPROCESSING, 0.15, "本地哈希校验完成")
+            current = self.database.get_job(job_id).stage
+            if current in {
+                JobStage.VALIDATING,
+                JobStage.PREPROCESSING,
+                JobStage.ANALYZING,
+            }:
+                self._validate_local(records)
+                self._advance(
+                    job_id,
+                    JobStage.VALIDATING,
+                    JobStage.PREPROCESSING,
+                    0.15,
+                    "本地哈希校验完成",
+                )
 
-            preprocessed: dict[str, PreprocessedMedia] = {}
-            for index, record in enumerate(records, start=1):
-                preprocessed[record.record_id] = self.media.preprocess_record(record, self.paths.cache / job_id / "frames")
-                self._notify(JobStage.PREPROCESSING, index / len(records), f"已预处理 {record.record_name}")
-            self._advance(job_id, JobStage.PREPROCESSING, JobStage.ANALYZING, 0.3, "媒体预处理完成")
+                preprocessed: dict[str, PreprocessedMedia] = {}
+                for index, record in enumerate(records, start=1):
+                    preprocessed[record.record_id] = self.media.preprocess_record(
+                        record, self.paths.cache / job_id / "frames"
+                    )
+                    self._notify(
+                        JobStage.PREPROCESSING,
+                        index / len(records),
+                        f"已预处理 {record.record_name}",
+                    )
+                self._advance(
+                    job_id,
+                    JobStage.PREPROCESSING,
+                    JobStage.ANALYZING,
+                    0.3,
+                    "媒体预处理完成",
+                )
 
-            evidence = self._analyze(records, preprocessed)
-            self._advance(job_id, JobStage.ANALYZING, JobStage.GENERATING, 0.55, "逐片证据分析完成")
+                evidence = self._analyze(records, preprocessed)
+                self._advance(
+                    job_id,
+                    JobStage.ANALYZING,
+                    JobStage.GENERATING,
+                    0.55,
+                    "逐片证据分析完成",
+                )
 
-            report = self._generate_report(job_id, job.target_date, evidence, avatar_references or [])
-            self.database.save_report(report)
-            self._advance(job_id, JobStage.GENERATING, JobStage.RENDERING, 0.72, "漫画生成完成")
+            current = self.database.get_job(job_id).stage
+            report_row = self.database.get_report(job_id)
+            if current == JobStage.GENERATING and report_row is None:
+                evidence = [
+                    self._evidence_from_json(item)
+                    for item in self.database.list_scene_evidence(job_id)
+                ]
+                if not evidence:
+                    raise RuntimeError("任务没有可恢复的场景证据")
+                report = self._generate_report(
+                    job_id, job.target_date, evidence, avatar_references or []
+                )
+                self.database.save_report(report)
+                report_row = self.database.get_report(job_id)
+            if current == JobStage.GENERATING:
+                self._advance(
+                    job_id,
+                    JobStage.GENERATING,
+                    JobStage.RENDERING,
+                    0.72,
+                    "漫画生成完成",
+                )
 
-            rendered = self.renderer.render(report, self.paths.reports / job.target_date.isoformat() / job_id)
+            if report_row is None:
+                report_row = self.database.get_report(job_id)
+            if report_row is None:
+                raise RuntimeError("任务没有可恢复的日报")
+            report = day_report_from_json(json.loads(report_row["report_json"]))
+            rendered = self.renderer.render(
+                report, self.paths.reports / job.target_date.isoformat() / job_id
+            )
             self.database.save_report(report, rendered.html_path, rendered.pdf_path)
-            self._advance(job_id, JobStage.RENDERING, JobStage.EMAILING, 0.84, "HTML 与 PDF 排版完成")
+            if self.database.get_job(job_id).stage == JobStage.RENDERING:
+                self._advance(
+                    job_id,
+                    JobStage.RENDERING,
+                    JobStage.EMAILING,
+                    0.84,
+                    "HTML 与 PDF 排版完成",
+                )
 
             message_id = f"<day-distiller-{job_id}@local>"
-            if not self.database.accepted_delivery(job_id, message_id):
+            if (
+                self.database.get_job(job_id).stage == JobStage.EMAILING
+                and not self.database.accepted_delivery(job_id, message_id)
+            ):
                 delivery = self.mail_provider.send(
                     report.title,
                     rendered.plain_text,
@@ -139,10 +205,25 @@ class DistillationPipeline:
                 self.database.save_delivery(job_id, delivery.message_id, delivery.accepted, delivery.response)
                 if not delivery.accepted:
                     raise RuntimeError(f"邮件服务器未接受日报：{delivery.response}")
-            self._advance(job_id, JobStage.EMAILING, JobStage.CLEANUP, 0.94, "邮件服务器已接受日报")
+            if self.database.get_job(job_id).stage == JobStage.EMAILING:
+                self._advance(
+                    job_id,
+                    JobStage.EMAILING,
+                    JobStage.CLEANUP,
+                    0.94,
+                    "邮件服务器已接受日报",
+                )
 
-            cleanup_state = self._cleanup(job_id, cleanup_source_root, cleanup_handler)
-            self._advance(job_id, JobStage.CLEANUP, JobStage.COMPLETED, 1.0, "每日蒸馏完成")
+            cleanup_state = "pending_cleanup"
+            if self.database.get_job(job_id).stage == JobStage.CLEANUP:
+                cleanup_state = self._cleanup(job_id, cleanup_source_root, cleanup_handler)
+                self._advance(
+                    job_id,
+                    JobStage.CLEANUP,
+                    JobStage.COMPLETED,
+                    1.0,
+                    "每日蒸馏完成",
+                )
             return PipelineResult(job_id, report, rendered, cleanup_state)
         except Exception as exc:
             if self.database.get_job(job_id).stage != JobStage.COMPLETED:

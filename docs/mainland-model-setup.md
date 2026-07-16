@@ -21,7 +21,9 @@
 
 - Qwen 3.5 Omni Plus按官方兼容接口要求使用流式输出；本地音频以 `data:;base64,...` 数据URI发送，避免被服务端误判成无效URL。百炼模型关闭思考，专注忠实提取视觉、环境声、转写和OCR证据。
 - DeepSeek V4 Pro启用思考模式，并使用 `high` 推理等级完成全天证据冲突消解和编排。
-- Seedream默认输出 `2048x1536`（4:3）漫画格；尺寸可在设置页改成账号当前模型支持的像素尺寸或 `2K`，并关闭组图、流式输出和水印。
+- Seedream默认输出 `2048x1536`（4:3）漫画格；尺寸可在设置页改成账号当前模型支持的像素尺寸或 `2K`。应用关闭水印；不会向 Seedream 5.0 发送仅 Seedream 4.0 支持的组图和流式参数。
+
+兼容接口偶尔会在合法JSON末尾附加Markdown围栏，或把数组、评分字段输出成近似类型。应用会提取首个完整JSON对象、规范常见类型漂移，再执行严格字段校验；无效或缺失的核心日报内容仍会使任务失败。任务在生图、排版或邮件阶段失败后，会从已有证据或报告继续，不会重新调用已经完成的上游模型。
 
 官方参考：[百炼 Qwen Omni](https://help.aliyun.com/zh/model-studio/qwen-omni)、[DeepSeek思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)、[火山方舟图像生成](https://www.volcengine.com/docs/82379/1541523?lang=zh)、[Resend SMTP](https://resend.com/docs/send-with-smtp)。
 

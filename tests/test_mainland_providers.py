@@ -12,6 +12,9 @@ from day_distiller_client.providers.mainland import (
     DeepSeekStoryProvider,
     QwenEvidenceProvider,
     SeedreamImageProvider,
+    _normalize_batch_payload,
+    _normalize_daily_payload,
+    _parse_json_payload,
 )
 
 
@@ -37,6 +40,48 @@ class _ChatCompletions:
 
 
 class MainlandProviderTests(unittest.TestCase):
+    def test_json_parser_accepts_markdown_fences_and_trailing_fence(self) -> None:
+        self.assertEqual(_parse_json_payload('{"ok":true}\n```', "qwen"), {"ok": True})
+        self.assertEqual(
+            _parse_json_payload('```json\n{"ok":true}\n```', "deepseek"), {"ok": True}
+        )
+
+    def test_batch_normalizer_repairs_common_omni_type_drift(self) -> None:
+        payload = _normalize_batch_payload(
+            {
+                "transcript": None,
+                "ambient_sounds": "道路声",
+                "visual_observations": "室内人物挥手",
+                "media_quality": "clear enough",
+                "frame_scores": ["0.8"],
+            },
+            2,
+        )
+        self.assertEqual(payload["ambient_sounds"], ["道路声"])
+        self.assertEqual(payload["visual_observations"], ["室内人物挥手"])
+        self.assertEqual(payload["frame_scores"], [0.8, 0.5])
+        self.assertEqual(payload["media_quality"], 0.5)
+
+    def test_daily_normalizer_maps_common_deepseek_field_names(self) -> None:
+        payload = _normalize_daily_payload(
+            {
+                "date": "2026-07-16",
+                "narrative": "晚间记录。",
+                "panels": [
+                    {
+                        "time": "19:31",
+                        "title": "挥手",
+                        "description": "A person waving indoors",
+                    }
+                ],
+            },
+            [{"record_id": "r1", "time_label": "19:31", "summary": "室内挥手"}],
+            date(2026, 7, 16),
+        )
+        self.assertEqual(payload["panels"][0]["record_ids"], ["r1"])
+        self.assertEqual(payload["panels"][0]["caption"], "挥手")
+        self.assertEqual(payload["one_sentence_summary"], "晚间记录。")
+
     def test_qwen_omni_then_keyframe_review(self) -> None:
         batch = {
             "transcript": "你好",
@@ -99,10 +144,14 @@ class MainlandProviderTests(unittest.TestCase):
         chat = _ChatCompletions([daily])
         story = DeepSeekStoryProvider(client=SimpleNamespace(chat=SimpleNamespace(completions=chat)), max_attempts=1)
         image_bytes = b"jpeg-data"
-        images = SimpleNamespace(
-            generate=lambda **kwargs: SimpleNamespace(
+        image_calls = []
+        def generate_image(**kwargs):
+            image_calls.append(kwargs)
+            return SimpleNamespace(
                 data=[SimpleNamespace(b64_json=base64.b64encode(image_bytes).decode(), url=None)]
             )
+        images = SimpleNamespace(
+            generate=generate_image
         )
         image_provider = SeedreamImageProvider(client=SimpleNamespace(images=images), max_attempts=1)
         with tempfile.TemporaryDirectory() as temporary:
@@ -112,6 +161,8 @@ class MainlandProviderTests(unittest.TestCase):
         self.assertEqual(result.title, "一天")
         self.assertEqual(chat.calls[0]["model"], "deepseek-v4-pro")
         self.assertEqual(chat.calls[0]["reasoning_effort"], "high")
+        self.assertNotIn("sequential_image_generation", image_calls[0]["extra_body"])
+        self.assertNotIn("stream", image_calls[0]["extra_body"])
 
 
 if __name__ == "__main__":

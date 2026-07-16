@@ -60,6 +60,19 @@ class LegacyImportTests(unittest.TestCase):
         self.assertEqual(resumed_manifest, manifest)
         self.assertEqual([item.sha256 for item in resumed[0].files], first_hashes)
 
+    def test_reimporting_same_record_for_new_job_gets_new_record_id_and_manifest(self) -> None:
+        make_record(self.source, "REC_0001_260715_090000")
+        first, first_manifest = import_legacy_day(
+            self.source, date(2026, 7, 15), self.destination, "job-1", "device-1"
+        )
+        second, second_manifest = import_legacy_day(
+            self.source, date(2026, 7, 15), self.destination, "job-2", "device-1"
+        )
+        self.assertNotEqual(first[0].record_id, second[0].record_id)
+        self.assertNotEqual(first_manifest, second_manifest)
+        self.assertTrue(first_manifest.is_file())
+        self.assertTrue(second_manifest.is_file())
+
     def test_normalize_source_root_accepts_explorer_quotes(self) -> None:
         self.assertEqual(normalize_source_root(f'"{self.source}"'), self.source)
 

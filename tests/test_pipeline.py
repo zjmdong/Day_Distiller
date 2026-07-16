@@ -18,6 +18,11 @@ class _RejectingMailProvider:
         return DeliveryResult(False, message_id, "550 rejected")
 
 
+class _UnexpectedAIProvider:
+    def __getattr__(self, name):
+        raise AssertionError(f"AI provider should not be called while resuming email stage: {name}")
+
+
 def _write_imu(path: Path) -> None:
     samples = []
     for index in range(100):
@@ -122,6 +127,19 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(database.get_job(job_id).stage, JobStage.FAILED)
             self.assertEqual(cleanup_calls, [])
             self.assertTrue(record.is_dir())
+
+            unexpected = _UnexpectedAIProvider()
+            resumed = DistillationPipeline(
+                paths,
+                database,
+                unexpected,
+                unexpected,
+                unexpected,
+                unexpected,
+                MockMailProvider(root / "outbox"),
+            ).process(job_id)
+            self.assertEqual(database.get_job(job_id).stage, JobStage.COMPLETED)
+            self.assertTrue(resumed.rendered.pdf_path.is_file())
 
 
 if __name__ == "__main__":

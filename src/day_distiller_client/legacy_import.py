@@ -166,7 +166,15 @@ def import_legacy_day(
                 schema_version = int(metadata.get("schema_version", 1))
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 schema_version = 1
-        record_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"day-distiller:{device_id}:{source_dir.name}"))
+        # A physical recording can be distilled more than once. Record rows are
+        # job-owned, so include the job id while keeping retries of the same job
+        # deterministic.
+        record_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"day-distiller:{job_id}:{device_id}:{source_dir.name}",
+            )
+        )
         record = CaptureRecord(
             record_id=record_id,
             record_name=source_dir.name,
@@ -200,7 +208,8 @@ def import_legacy_day(
         "imported_at": datetime.now(timezone.utc).isoformat(),
         "records": manifest_records,
     }
-    manifest_path = day_dir / "import_manifest.json"
+    # Never overwrite another job's cleanup proof for the same calendar day.
+    manifest_path = day_dir / f"import_manifest_{job_id}.json"
     temporary = manifest_path.with_suffix(".json.part")
     temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(manifest_path)
