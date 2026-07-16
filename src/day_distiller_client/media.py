@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .domain import CaptureRecord
+from .subprocess_utils import hidden_window_options
 
 
 class MediaProcessingError(RuntimeError):
@@ -68,6 +69,7 @@ class MediaPreprocessor:
             text=True,
             timeout=30,
             check=False,
+            **hidden_window_options(),
         )
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
@@ -158,6 +160,7 @@ class MediaPreprocessor:
             text=True,
             timeout=60,
             check=False,
+            **hidden_window_options(),
         )
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()

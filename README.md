@@ -12,7 +12,7 @@ Day Distiller 的 Windows 上位机与“AI 每日蒸馏”工作流。当前版
 - IMU 特征、启发式活动/携带形态分类，以及可加载的 scikit-learn 模型。
 - 中国大陆多模型工作流：Qwen 3.5 Omni Plus批量音视频/OCR、Qwen 3.7 Plus关键帧复核、DeepSeek V4 Pro全天编排、Seedream 5.0 Pro无文字漫画生图。
 - 确定性 Mock AI 与本地 `.eml` outbox，可在没有 API Key、Resend 或设备时验收。
-- 同版 HTML/PDF、Resend、确定性幂等键、发送回执和邮件成功后的精确设备清理。
+- 同版 HTML/PDF、Resend SMTP、确定性 Message-ID、发送回执和邮件成功后的精确设备清理。
 - 日报修改、地点记忆、重新生成和手动再次发送。
 
 ## 快速开始
@@ -34,7 +34,7 @@ python -m pip install -e .[dev]
 - [IMU 数据采集与训练](docs/imu-data-collection.md)
 - [USB、TF 卡与 FFmpeg 排障](docs/usb-ffmpeg-troubleshooting.md)
 
-不要在聊天、配置文件、截图或 Git 中提交 API Key 和应用密码；只在应用“设置”页填写。
+不要在聊天、配置文件、截图或 Git 中提交 API Key 和应用密码；只在应用“设置”页填写。已保存密钥会在本机设置页明文回显，查看页面时注意旁人和录屏软件。
 
 ## 当前设备的一键流程
 
@@ -42,7 +42,7 @@ python -m pip install -e .[dev]
 2. 以只读模式进入 MSC，导入所选日期并生成 `import_manifest.json`。
 3. 校验本地文件，安全弹出并退出 MSC；生成期间每 30 秒发送一次 `PING`。
 4. 完成本地分析、云端生成、HTML/PDF 与邮件发送。
-5. 只有 Resend API 明确接受邮件后，才重新以读写模式挂载。
+5. 只有 Resend SMTP 服务器明确接受邮件后，才重新以读写模式挂载。
 6. 删除前重新核对目录、文件集合、大小和 SHA-256，只删除本次清单中的目录。
 7. 清理失败会留下 `pending_cleanup`，可在“报告历史”重试，不影响日报。
 

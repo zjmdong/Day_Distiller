@@ -9,6 +9,7 @@ from day_distiller_client.legacy_import import (
     available_record_dates,
     delete_verified_source_records,
     import_legacy_day,
+    normalize_source_root,
     parse_record_datetime,
     scan_record_directories,
 )
@@ -59,6 +60,13 @@ class LegacyImportTests(unittest.TestCase):
         self.assertEqual(resumed_manifest, manifest)
         self.assertEqual([item.sha256 for item in resumed[0].files], first_hashes)
 
+    def test_normalize_source_root_accepts_explorer_quotes(self) -> None:
+        self.assertEqual(normalize_source_root(f'"{self.source}"'), self.source)
+
+    def test_normalize_source_root_rejects_nul(self) -> None:
+        with self.assertRaisesRegex(ValueError, "无效字符"):
+            normalize_source_root(str(self.source) + "\x00")
+
     def test_cleanup_requires_unchanged_source(self) -> None:
         record = make_record(self.source, "REC_0001_260715_090000")
         _records, manifest = import_legacy_day(
@@ -83,4 +91,3 @@ class LegacyImportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

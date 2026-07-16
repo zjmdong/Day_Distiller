@@ -5,16 +5,18 @@ import shutil
 import threading
 import time
 import json
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from .credentials import CredentialName, CredentialStore
 from .database import JobDatabase
 from .device import PortCandidate, UsbLinkDevice, find_device, list_serial_ports
 from .device_workflow import LegacyDeviceWorkflow
 from .domain import JobStage
-from .legacy_import import available_record_dates, scan_record_directories
+from .legacy_import import available_record_dates, normalize_source_root, scan_record_directories
 from .media import MediaPreprocessor
 from .paths import AppPaths
 from .pipeline import DistillationPipeline
@@ -27,12 +29,34 @@ from .providers import (
     QwenSettings,
     SeedreamImageProvider,
     SeedreamSettings,
-    ResendMailProvider,
-    ResendSettings,
+    SmtpMailProvider,
+    SmtpSettings,
 )
 from .reporting import ReportRenderer, day_report_from_json
 from .resources import bundled_ffmpeg_paths
 from .windows import drive_letters, list_removable_drives, safe_eject, wait_for_new_drive
+
+
+def _validate_base_url(value: str, provider: str) -> str:
+    candidate = value.strip().rstrip("/")
+    parsed = urlparse(candidate)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or any(token in candidate for token in ("{", "}", " "))
+    ):
+        raise ValueError(f"{provider} Base URL格式无效，请填写完整的 http(s) 地址")
+    return candidate
+
+
+def _validate_image_size(value: str) -> str:
+    candidate = value.strip().upper()
+    if candidate in {"1K", "2K", "4K"}:
+        return candidate
+    match = re.fullmatch(r"(\d{3,5})X(\d{3,5})", candidate)
+    if not match or min(map(int, match.groups())) < 512:
+        raise ValueError("漫画尺寸应填写 2K，或像 2048x1536 这样的宽x高像素值")
+    return candidate.lower()
 
 
 class Worker:
@@ -76,6 +100,9 @@ class MainWindow:
         self.ports: list[PortCandidate] = []
         self.last_drive_letter: str | None = None
         self.active_job_id: str | None = None
+        self.scanned_source_root: Path | None = None
+        self.scanned_target_date: date | None = None
+        self.scanned_record_count = 0
 
         self._build_ui()
         self._load_cloud_settings()
@@ -112,7 +139,7 @@ class MainWindow:
         title = QLabel("<h1>欢迎使用 AI 每日蒸馏</h1>")
         guide = QLabel(
             "<h3>首次配置</h3>"
-            "<ol><li>打开“设置”，填写百炼、DeepSeek、火山方舟和 Resend 参数。</li>"
+            "<ol><li>打开“设置”，填写百炼、DeepSeek、火山方舟和 Resend SMTP 参数。</li>"
             "<li>打开“参考形象”，上传一张清晰的单人参考图并填写简短描述。</li>"
             "<li>在 Resend 控制台验证发件域名；发件地址必须属于该域名。</li></ol>"
             "<h3>每天使用</h3>"
@@ -174,13 +201,22 @@ class MainWindow:
         return page
 
     def _settings_page_v2(self):
-        from PySide6.QtWidgets import QFormLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
+        from PySide6.QtWidgets import (
+            QComboBox,
+            QFormLayout,
+            QLabel,
+            QLineEdit,
+            QPushButton,
+            QSpinBox,
+            QVBoxLayout,
+            QWidget,
+        )
 
         page = QWidget()
         layout = QVBoxLayout(page)
         notice = QLabel(
-            "API Key仅保存到Windows Credential Manager；Base URL、模型名、发件人与收件人保存在本地SQLite。"
-            " 留空密钥输入框不会删除已经保存的密钥。"
+            "API Key仅保存到本机 Windows Credential Manager，并会在本设置页明文显示，便于检查和修改；"
+            "请勿截图或向他人展示此页面。Base URL、模型名和邮件参数保存在本地SQLite。"
         )
         notice.setWordWrap(True)
         form = QFormLayout()
@@ -191,11 +227,18 @@ class MainWindow:
         self.qwen_base_url_edit = QLineEdit("https://dashscope.aliyuncs.com/compatible-mode/v1")
         self.deepseek_base_url_edit = QLineEdit("https://api.deepseek.com")
         self.volcengine_base_url_edit = QLineEdit("https://ark.cn-beijing.volces.com/api/v3")
-        self.resend_base_url_edit = QLineEdit("https://api.resend.com")
+        self.resend_host_edit = QLineEdit("smtp.resend.com")
+        self.resend_port_edit = QSpinBox()
+        self.resend_port_edit.setRange(1, 65535)
+        self.resend_port_edit.setValue(465)
+        self.resend_security_combo = QComboBox()
+        self.resend_security_combo.addItem("SSL/TLS（端口465，推荐）", "ssl")
+        self.resend_security_combo.addItem("STARTTLS（端口587）", "starttls")
         self.scene_model_edit = QLineEdit("qwen3.7-plus")
         self.omni_model_edit = QLineEdit("qwen3.5-omni-plus")
         self.daily_model_edit = QLineEdit("deepseek-v4-pro")
         self.image_model_edit = QLineEdit("doubao-seedream-5-0-pro")
+        self.image_size_edit = QLineEdit("2048x1536")
         self.resend_sender_edit = QLineEdit()
         self.resend_recipient_edit = QLineEdit()
         form.addRow("百炼 Base URL", self.qwen_base_url_edit)
@@ -208,8 +251,11 @@ class MainWindow:
         form.addRow("火山方舟 Base URL", self.volcengine_base_url_edit)
         form.addRow("火山方舟 API Key", self.volcengine_key_edit)
         form.addRow("Seedream模型/Endpoint ID", self.image_model_edit)
-        form.addRow("Resend Base URL", self.resend_base_url_edit)
-        form.addRow("Resend API Key", self.resend_key_edit)
+        form.addRow("漫画尺寸（4:3）", self.image_size_edit)
+        form.addRow("Resend SMTP主机", self.resend_host_edit)
+        form.addRow("Resend SMTP端口", self.resend_port_edit)
+        form.addRow("Resend SMTP安全方式", self.resend_security_combo)
+        form.addRow("Resend API Key（SMTP密码）", self.resend_key_edit)
         form.addRow("Resend发件地址", self.resend_sender_edit)
         form.addRow("日报收件地址", self.resend_recipient_edit)
         save = QPushButton("保存设置")
@@ -226,8 +272,8 @@ class MainWindow:
     @staticmethod
     def _password_edit(line_edit_class):
         edit = line_edit_class()
-        edit.setEchoMode(line_edit_class.EchoMode.Password)
-        edit.setPlaceholderText("留空则保留已保存的密钥")
+        edit.setEchoMode(line_edit_class.EchoMode.Normal)
+        edit.setPlaceholderText("保存在本机凭据管理器；此处会明文显示")
         return edit
 
     def _device_page(self):
@@ -568,8 +614,12 @@ class MainWindow:
 
     def scan_records(self) -> None:
         self.records_list.clear()
-        root = Path(self.source_edit.text().strip())
+        self.scanned_source_root = None
+        self.scanned_target_date = None
+        self.scanned_record_count = 0
         try:
+            root = normalize_source_root(self.source_edit.text())
+            self.source_edit.setText(str(root))
             dates = available_record_dates(root)
             if dates:
                 selected = self._selected_date()
@@ -583,16 +633,38 @@ class MainWindow:
                 files = ", ".join(path.name for path in record.iterdir() if path.is_file())
                 self.records_list.addItem(f"{record.name}    {files}")
             self.records_hint.setText(f"{selected.isoformat()} 共 {len(records)} 条记录。只分析实际记录片段。")
+            self.scanned_source_root = root
+            self.scanned_target_date = selected
+            self.scanned_record_count = len(records)
         except Exception as exc:
             self.records_hint.setText(f"扫描失败：{exc}")
 
     def start_folder_distillation(self) -> None:
-        source = Path(self.source_edit.text().strip())
+        from PySide6.QtWidgets import QMessageBox
+
+        try:
+            source = normalize_source_root(self.source_edit.text())
+        except (ValueError, FileNotFoundError) as exc:
+            QMessageBox.information(self.window, "请选择记录", str(exc))
+            self._select_tab("今日记录")
+            return
         target = self._selected_date()
+        if (
+            self.scanned_source_root != source
+            or self.scanned_target_date != target
+            or self.scanned_record_count < 1
+        ):
+            QMessageBox.information(
+                self.window,
+                "请先扫描记录",
+                "请在“今日记录”页选择记录根目录和日期，并确认扫描到了至少一条记录。",
+            )
+            self._select_tab("今日记录")
+            return
         provider_mode = str(self.provider_combo.currentData())
         delete_source = self.delete_virtual_source.isChecked()
         self._set_busy(True)
-        self.tabs.setCurrentIndex(2)
+        self._select_tab("蒸馏进度")
 
         def work():
             pipeline = self._create_pipeline(provider_mode)
@@ -604,10 +676,16 @@ class MainWindow:
         self._start("distill", work)
 
     def start_device_distillation(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        if self.device is None and not self.port_combo.currentData():
+            QMessageBox.information(self.window, "请先连接设备", "尚未选择设备串口，请先在“设备”页连接或自动发现设备。")
+            self._select_tab("设备")
+            return
         target = self._selected_date()
         provider_mode = str(self.provider_combo.currentData())
         self._set_busy(True)
-        self.tabs.setCurrentIndex(2)
+        self._select_tab("蒸馏进度")
 
         def work():
             pipeline = self._create_pipeline(provider_mode)
@@ -628,7 +706,7 @@ class MainWindow:
             return
         provider_mode = self.database.get_job(job_id).provider_mode
         self._set_busy(True)
-        self.tabs.setCurrentIndex(2)
+        self._select_tab("蒸馏进度")
         self._start(
             "distill",
             lambda: self._create_pipeline(provider_mode).process(
@@ -954,6 +1032,17 @@ class MainWindow:
     def save_cloud_settings(self) -> None:
         from PySide6.QtWidgets import QMessageBox
 
+        try:
+            _validate_base_url(self.qwen_base_url_edit.text(), "百炼")
+            _validate_base_url(self.deepseek_base_url_edit.text(), "DeepSeek")
+            _validate_base_url(self.volcengine_base_url_edit.text(), "火山方舟")
+            if not self.resend_host_edit.text().strip():
+                raise ValueError("Resend SMTP主机不能为空")
+            _validate_image_size(self.image_size_edit.text())
+        except ValueError as exc:
+            QMessageBox.warning(self.window, "设置无效", str(exc))
+            return
+
         settings = self.database.get_setting("desktop_v2", {})
         settings.update(
             {
@@ -962,14 +1051,17 @@ class MainWindow:
                     "omni": self.omni_model_edit.text().strip(),
                     "daily": self.daily_model_edit.text().strip(),
                     "image": self.image_model_edit.text().strip(),
+                    "image_size": self.image_size_edit.text().strip(),
                 },
                 "endpoints": {
                     "qwen": self.qwen_base_url_edit.text().strip(),
                     "deepseek": self.deepseek_base_url_edit.text().strip(),
                     "volcengine": self.volcengine_base_url_edit.text().strip(),
-                    "resend": self.resend_base_url_edit.text().strip(),
                 },
                 "resend": {
+                    "host": self.resend_host_edit.text().strip(),
+                    "port": self.resend_port_edit.value(),
+                    "security": self.resend_security_combo.currentData(),
                     "sender": self.resend_sender_edit.text().strip(),
                     "recipient": self.resend_recipient_edit.text().strip(),
                 },
@@ -985,7 +1077,6 @@ class MainWindow:
             ):
                 if field.text():
                     self.credentials.set(credential, field.text())
-                    field.clear()
         except Exception as exc:
             QMessageBox.warning(self.window, "凭据保存失败", str(exc))
             return
@@ -1000,12 +1091,25 @@ class MainWindow:
         self.omni_model_edit.setText(models.get("omni", self.omni_model_edit.text()))
         self.daily_model_edit.setText(models.get("daily", self.daily_model_edit.text()))
         self.image_model_edit.setText(models.get("image", self.image_model_edit.text()))
+        self.image_size_edit.setText(models.get("image_size", self.image_size_edit.text()))
         self.qwen_base_url_edit.setText(endpoints.get("qwen", self.qwen_base_url_edit.text()))
         self.deepseek_base_url_edit.setText(endpoints.get("deepseek", self.deepseek_base_url_edit.text()))
         self.volcengine_base_url_edit.setText(endpoints.get("volcengine", self.volcengine_base_url_edit.text()))
-        self.resend_base_url_edit.setText(endpoints.get("resend", self.resend_base_url_edit.text()))
+        self.resend_host_edit.setText(resend.get("host", self.resend_host_edit.text()))
+        self.resend_port_edit.setValue(int(resend.get("port", self.resend_port_edit.value())))
+        index = self.resend_security_combo.findData(resend.get("security", "ssl"))
+        if index >= 0:
+            self.resend_security_combo.setCurrentIndex(index)
         self.resend_sender_edit.setText(resend.get("sender", ""))
         self.resend_recipient_edit.setText(resend.get("recipient", ""))
+        for field, credential in (
+            (self.api_key_edit, CredentialName.QWEN_API_KEY),
+            (self.deepseek_key_edit, CredentialName.DEEPSEEK_API_KEY),
+            (self.volcengine_key_edit, CredentialName.VOLCENGINE_API_KEY),
+            (self.resend_key_edit, CredentialName.RESEND_API_KEY),
+        ):
+            value = self.credentials.get(credential)
+            field.setText(value or "")
 
     def _load_avatar_profile(self) -> None:
         settings = self.database.get_setting("desktop_v2", {})
@@ -1023,6 +1127,10 @@ class MainWindow:
             scene = story = batch = image = MockAIProvider()
             mail = MockMailProvider(self.paths.root / "mock_outbox")
         else:
+            _validate_base_url(endpoints.get("qwen", QwenSettings.base_url), "百炼")
+            _validate_base_url(endpoints.get("deepseek", DeepSeekSettings.base_url), "DeepSeek")
+            _validate_base_url(endpoints.get("volcengine", SeedreamSettings.base_url), "火山方舟")
+            _validate_image_size(models.get("image_size", "2048x1536"))
             qwen_key = self.credentials.get(CredentialName.QWEN_API_KEY)
             deepseek_key = self.credentials.get(CredentialName.DEEPSEEK_API_KEY)
             volcengine_key = self.credentials.get(CredentialName.VOLCENGINE_API_KEY)
@@ -1050,15 +1158,19 @@ class MainWindow:
                 settings=SeedreamSettings(
                     base_url=endpoints.get("volcengine", SeedreamSettings.base_url),
                     image_model=models.get("image", "doubao-seedream-5-0-pro"),
+                    image_size=models.get("image_size", "2048x1536"),
                     character_description=settings.get("avatar_description", ""),
                 ),
             )
             resend = settings.get("resend", {})
-            mail = ResendMailProvider(
-                ResendSettings(
+            mail = SmtpMailProvider(
+                SmtpSettings(
+                    host=resend.get("host", "smtp.resend.com"),
+                    port=int(resend.get("port", 465)),
+                    security=resend.get("security", "ssl"),
+                    username="resend",
                     sender=resend.get("sender", ""),
                     recipient=resend.get("recipient", ""),
-                    base_url=endpoints.get("resend", "https://api.resend.com"),
                 ),
                 resend_key,
             )
@@ -1092,6 +1204,12 @@ class MainWindow:
 
         item = self.history_list.currentItem()
         return str(item.data(Qt.ItemDataRole.UserRole)) if item else None
+
+    def _select_tab(self, title: str) -> None:
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) == title:
+                self.tabs.setCurrentIndex(index)
+                return
 
     def _start(self, name: str, operation: Callable[[], Any]) -> None:
         if name in {"distill", "cleanup_retry", "manual_regenerate", "manual_resend"}:

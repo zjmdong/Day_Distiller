@@ -36,3 +36,11 @@ $FfmpegReadme = Join-Path $FfmpegRoot "README.txt"
 Write-Host ""
 Write-Host "Built EXE:"
 Write-Host (Join-Path $DistPath "DayDistillerClient\DayDistillerClient.exe")
+
+$PackagePath = Join-Path $DistPath "DayDistillerClient-v2.zip"
+if (Test-Path -LiteralPath $PackagePath) {
+  Remove-Item -LiteralPath $PackagePath -Force
+}
+Compress-Archive -LiteralPath (Join-Path $DistPath "DayDistillerClient") -DestinationPath $PackagePath -CompressionLevel Optimal
+Write-Host "Packaged ZIP:"
+Write-Host $PackagePath

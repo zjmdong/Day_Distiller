@@ -4,10 +4,10 @@
 
 1. 打开“设置”页，依次填写阿里云百炼、DeepSeek、火山方舟的 Base URL、API Key 和模型名。默认模型分别为 `qwen3.7-plus`、`qwen3.5-omni-plus`、`deepseek-v4-pro`；Seedream 请使用火山控制台中实际开通的 Model ID 或 Endpoint ID。
 2. 注册 Resend，添加自己拥有的域名，并按控制台提示设置 SPF、DKIM 等 DNS 记录。域名验证完成后创建 API Key。
-3. 在应用设置页填写 Resend API Key、发件地址和日报收件地址。发件地址的域名必须与 Resend 已验证域名完全一致。
+3. 在应用设置页填写 Resend SMTP 参数：主机 `smtp.resend.com`、SSL/TLS端口 `465`（或STARTTLS端口 `587`）、API Key、发件地址和日报收件地址。SMTP用户名固定为 `resend`，API Key作为SMTP密码。发件地址的域名必须与 Resend 已验证域名完全一致。
 4. 打开“参考形象”页，上传一张清晰的单人正面或半身照片，再填写20–100字的形象描述并保存。照片和描述保存在电脑本地；生成漫画时会发送到火山方舟。
 
-API Key只保存在Windows Credential Manager。不要通过聊天、截图或Git提交密钥。
+API Key只保存在Windows Credential Manager，并会在本机设置页明文回显。不要通过聊天、截图或Git提交密钥；查看设置页时注意旁人和录屏软件。
 
 ## 每天使用
 
@@ -27,7 +27,7 @@ API Key只保存在Windows Credential Manager。不要通过聊天、截图或Gi
 
 ## Resend常见问题
 
-- `403 domain mismatch`：检查发件地址域名是否与Resend中验证的域名或子域名完全一致。
+- `550/553 sender rejected`：检查发件地址域名是否与Resend中验证的域名或子域名完全一致。
 - 只能发给自己：测试域名 `onboarding@resend.dev` 有收件限制；向其他地址发送前需要验证自己的域名。
-- 重试收到重复邮件：应用使用确定性任务ID作为Resend幂等键；Resend的幂等保护有效期为24小时，超过后手动重发会被视为新邮件。
+- 重试收到重复邮件：应用同时发送确定性的 `Message-ID` 和 Resend 官方支持的 `Resend-Idempotency-Key`，降低崩溃重试造成的重复邮件；超过Resend幂等保护窗口后，手动重发仍会被视为新邮件。
 - 邮件超过限制：Resend附件经过Base64编码后的总大小上限为40MB。日报图片会压缩为JPEG，PDF也作为附件发送。

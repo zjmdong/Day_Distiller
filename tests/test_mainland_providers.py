@@ -22,8 +22,17 @@ class _ChatCompletions:
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
+        payload = json.dumps(next(self.payloads))
+        if kwargs.get("stream"):
+            return iter(
+                [
+                    SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content=payload))]
+                    )
+                ]
+            )
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(next(self.payloads))))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=payload))]
         )
 
 
@@ -72,7 +81,13 @@ class MainlandProviderTests(unittest.TestCase):
         self.assertEqual(scene_result.ocr_text, ["便利店"])
         self.assertEqual(chat.calls[0]["model"], "qwen3.5-omni-plus")
         self.assertEqual(chat.calls[1]["model"], "qwen3.7-plus")
-        self.assertTrue(any(item["type"] == "input_audio" for item in chat.calls[0]["messages"][0]["content"]))
+        self.assertTrue(chat.calls[0]["stream"])
+        self.assertEqual(chat.calls[0]["modalities"], ["text"])
+        self.assertFalse(chat.calls[0]["extra_body"]["enable_thinking"])
+        audio_item = next(
+            item for item in chat.calls[0]["messages"][0]["content"] if item["type"] == "input_audio"
+        )
+        self.assertTrue(audio_item["input_audio"]["data"].startswith("data:;base64,"))
 
     def test_deepseek_and_seedream_defaults(self) -> None:
         daily = {
@@ -96,6 +111,7 @@ class MainlandProviderTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), image_bytes)
         self.assertEqual(result.title, "一天")
         self.assertEqual(chat.calls[0]["model"], "deepseek-v4-pro")
+        self.assertEqual(chat.calls[0]["reasoning_effort"], "high")
 
 
 if __name__ == "__main__":

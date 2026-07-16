@@ -35,17 +35,41 @@ def parse_record_datetime(name: str) -> datetime:
 
 def scan_record_directories(root: Path, target_date: date | None = None) -> list[Path]:
     root = Path(root)
-    if not root.is_dir():
-        raise FileNotFoundError(root)
+    try:
+        if not root.is_dir():
+            raise FileNotFoundError(f"记录根目录不存在或不可访问：{root}")
+    except OSError as exc:
+        raise FileNotFoundError(f"记录根目录无效或已断开：{root}") from exc
     records: list[tuple[datetime, Path]] = []
-    for candidate in root.iterdir():
-        if not candidate.is_dir() or not RECORD_NAME.fullmatch(candidate.name):
-            continue
-        captured_at = parse_record_datetime(candidate.name)
-        if target_date is not None and captured_at.date() != target_date:
-            continue
-        records.append((captured_at, candidate))
+    try:
+        for candidate in root.iterdir():
+            if not candidate.is_dir() or not RECORD_NAME.fullmatch(candidate.name):
+                continue
+            captured_at = parse_record_datetime(candidate.name)
+            if target_date is not None and captured_at.date() != target_date:
+                continue
+            records.append((captured_at, candidate))
+    except OSError as exc:
+        raise FileNotFoundError(f"无法读取记录根目录（设备可能已断开）：{root}") from exc
     return [path for _captured_at, path in sorted(records, key=lambda item: (item[0], item[1].name))]
+
+
+def normalize_source_root(value: str) -> Path:
+    """Normalize a path pasted from Windows Explorer without resolving a missing drive."""
+    raw = value.strip().strip('"').strip("'").strip()
+    if not raw:
+        raise ValueError("请先选择记录根目录")
+    if "\x00" in raw:
+        raise ValueError("记录根目录包含无效字符，请重新选择目录")
+    if len(raw) == 2 and raw[0].isalpha() and raw[1] == ":":
+        raw += "\\"
+    root = Path(raw).expanduser()
+    try:
+        if not root.exists() or not root.is_dir():
+            raise FileNotFoundError(f"记录根目录不存在或设备已断开：{root}")
+    except OSError as exc:
+        raise ValueError(f"记录根目录无效：{root}") from exc
+    return root
 
 
 def available_record_dates(root: Path) -> list[date]:
@@ -236,4 +260,3 @@ def delete_verified_source_records(source_root: Path, manifest_path: Path) -> li
         shutil.rmtree(resolved)
         deleted.append(resolved.name)
     return deleted
-

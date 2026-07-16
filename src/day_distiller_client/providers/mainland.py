@@ -32,7 +32,7 @@ class DeepSeekSettings:
 class SeedreamSettings:
     base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     image_model: str = "doubao-seedream-5-0-pro"
-    image_size: str = "2048x1365"
+    image_size: str = "2048x1536"
     response_format: str = "b64_json"
     character_description: str = ""
 
@@ -64,12 +64,15 @@ class QwenEvidenceProvider:
                 {
                     "type": "input_audio",
                     "input_audio": {
-                        "data": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
+                        # Qwen Omni's OpenAI-compatible endpoint treats a naked
+                        # Base64 string as a URL.  Local audio must use a data URI.
+                        "data": "data:;base64,"
+                        + base64.b64encode(audio_path.read_bytes()).decode("ascii"),
                         "format": audio_path.suffix.lower().lstrip(".") or "wav",
                     },
                 }
             )
-        payload = self._json_chat(self.settings.omni_model, content)
+        payload = self._json_chat(self.settings.omni_model, content, omni=True)
         return BatchAnalysis.model_validate(payload)
 
     def analyze_scene(
@@ -94,19 +97,38 @@ class QwenEvidenceProvider:
         ]
         for frame in frame_paths:
             content.append({"type": "image_url", "image_url": {"url": _data_url(frame)}})
-        payload = self._json_chat(self.settings.keyframe_model, content)
+        payload = self._json_chat(self.settings.keyframe_model, content, omni=False)
         return SceneAnalysis.model_validate(payload)
 
-    def _json_chat(self, model: str, content: list[dict[str, Any]]) -> dict[str, Any]:
+    def _json_chat(
+        self, model: str, content: list[dict[str, Any]], omni: bool
+    ) -> dict[str, Any]:
         def request() -> Any:
-            return self.client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": content}],
-                response_format={"type": "json_object"},
-            )
+            arguments: dict[str, Any] = {
+                "model": model,
+                "messages": [{"role": "user", "content": content}],
+                "response_format": {"type": "json_object"},
+                "extra_body": {"enable_thinking": False},
+            }
+            if omni:
+                arguments.update(
+                    {
+                        "stream": True,
+                        "stream_options": {"include_usage": True},
+                        "modalities": ["text"],
+                    }
+                )
+            return self.client.chat.completions.create(**arguments)
 
         response = _retry(request, self.max_attempts)
-        raw = response.choices[0].message.content
+        if omni:
+            parts: list[str] = []
+            for chunk in response:
+                if chunk.choices and getattr(chunk.choices[0].delta, "content", None):
+                    parts.append(chunk.choices[0].delta.content)
+            raw = "".join(parts)
+        else:
+            raw = response.choices[0].message.content
         if not raw:
             raise RuntimeError(f"{model} returned an empty structured response")
         return json.loads(raw)
@@ -153,6 +175,7 @@ class DeepSeekStoryProvider:
                     {"role": "user", "content": payload},
                 ],
                 response_format={"type": "json_object"},
+                reasoning_effort="high",
                 extra_body={"thinking": {"type": "enabled"}},
             )
 
@@ -199,7 +222,11 @@ class SeedreamImageProvider:
         )
 
         def request() -> Any:
-            extra_body: dict[str, Any] = {"sequential_image_generation": "disabled"}
+            extra_body: dict[str, Any] = {
+                "sequential_image_generation": "disabled",
+                "stream": False,
+                "watermark": False,
+            }
             if reference_images:
                 extra_body["image"] = [_data_url(Path(path)) for path in reference_images]
             return self.client.images.generate(

@@ -4,6 +4,8 @@ import subprocess
 import time
 from dataclasses import dataclass
 
+from .subprocess_utils import hidden_window_options
+
 
 @dataclass(frozen=True)
 class DriveInfo:
@@ -91,6 +93,7 @@ def safe_eject(letter: str) -> None:
             text=True,
             timeout=15,
             check=False,
+            **hidden_window_options(),
         )
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip() or str(exc)

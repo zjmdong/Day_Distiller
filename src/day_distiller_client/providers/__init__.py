@@ -17,7 +17,6 @@ from .mainland import (
 )
 from .openai_provider import ModelSettings, OpenAIProvider
 from .smtp_provider import SmtpMailProvider, SmtpSettings
-from .resend_provider import ResendMailProvider, ResendSettings
 
 __all__ = [
     "DailySynthesis",
@@ -36,8 +35,6 @@ __all__ = [
     "SceneAnalysis",
     "SmtpMailProvider",
     "SmtpSettings",
-    "ResendMailProvider",
-    "ResendSettings",
     "StoryProvider",
     "TranscriptionProvider",
 ]

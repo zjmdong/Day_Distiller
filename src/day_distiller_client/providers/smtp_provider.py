@@ -49,6 +49,9 @@ class SmtpMailProvider:
         message["From"] = self.settings.sender
         message["To"] = self.settings.recipient
         message["Message-ID"] = message_id
+        # Resend supports the same idempotency mechanism over SMTP via a
+        # custom header. Keep it deterministic for crash-safe retries.
+        message["Resend-Idempotency-Key"] = _resend_idempotency_key(message_id)
         message.set_content(plain_text)
         message.add_alternative(html, subtype="html")
         html_part = message.get_payload()[-1]
@@ -86,3 +89,7 @@ class SmtpMailProvider:
             return DeliveryResult(False, message_id, f"recipients refused: {refused}")
         return DeliveryResult(True, message_id, "SMTP server accepted message")
 
+
+def _resend_idempotency_key(message_id: str) -> str:
+    normalized = message_id.strip().strip("<>").replace("@", "-")
+    return normalized[:256] or "day-distiller-message"
