@@ -23,7 +23,7 @@ from .art_styles import (
 from .credentials import CredentialName, CredentialStore
 from .database import JobDatabase
 from .device import PortCandidate, UsbLinkDevice, find_device, list_serial_ports
-from .device_workflow import LegacyDeviceWorkflow, SyncedDay
+from .device_workflow import LegacyDeviceWorkflow, SyncInventory, SyncedDay
 from .domain import JobStage
 from .legacy_import import available_record_dates, normalize_source_root, scan_record_directories
 from .media import MediaPreprocessor
@@ -130,6 +130,45 @@ class Spinner:
 
     def stop(self) -> None:
         self._timer.stop()
+        self.widget.hide()
+
+
+class FlatSuccessIcon:
+    """Font-independent flat success mark matching the production UI."""
+
+    def __init__(self, parent=None, diameter: int = 38) -> None:
+        from PySide6.QtWidgets import QWidget
+
+        self.widget = QWidget(parent)
+        self.widget.setFixedSize(diameter, diameter)
+        self.widget.paintEvent = self._paint_event
+
+    def _paint_event(self, _event) -> None:
+        from PySide6.QtCore import QPointF, QRectF, Qt
+        from PySide6.QtGui import QColor, QPainter, QPen
+
+        painter = QPainter(self.widget)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        diameter = min(self.widget.width(), self.widget.height())
+        inset = max(1.0, diameter * 0.035)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#22c875"))
+        painter.drawEllipse(QRectF(inset, inset, diameter - inset * 2, diameter - inset * 2))
+        pen = QPen(QColor("#ffffff"), max(2.2, diameter * 0.075))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        first = QPointF(diameter * 0.28, diameter * 0.52)
+        middle = QPointF(diameter * 0.44, diameter * 0.68)
+        last = QPointF(diameter * 0.73, diameter * 0.36)
+        painter.drawLine(first, middle)
+        painter.drawLine(middle, last)
+
+    def show(self) -> None:
+        self.widget.show()
+
+    def hide(self) -> None:
         self.widget.hide()
 
 
@@ -270,10 +309,19 @@ class MainWindow:
         self.guided_discovery_inflight = False
         self.guided_sync_workflow: LegacyDeviceWorkflow | None = None
         self.guided_synced_day: SyncedDay | None = None
+        self.guided_sync_inventory: SyncInventory | None = None
+        self.guided_synced_days: list[SyncedDay] = []
         self.guided_countdown = 0
         self.guided_started_at = 0.0
+        self.guided_discovery_deadline = 0.0
+        self.guided_backgrounded = False
+        self.guided_operation_active = False
+        self.guided_completed_days = 0
+        self.guided_total_days = 0
         self.guided_phase = "idle"
         self.style_preview_path: Path | None = None
+        self._landing_reveal_targets: list[tuple[object, object]] = []
+        self._landing_animation_groups: list[object] = []
 
         self.discovery_timer = QTimer()
         self.discovery_timer.setInterval(1000)
@@ -287,6 +335,7 @@ class MainWindow:
         self._load_avatar_profile()
         self.refresh_ports()
         self.refresh_history()
+        QTimer.singleShot(80, self._play_landing_intro)
 
         self.timer = QTimer()
         self.timer.setInterval(100)
@@ -374,9 +423,11 @@ class MainWindow:
         return button
 
     def _guide_page(self):
-        from PySide6.QtCore import Qt
+        from PySide6.QtCore import QRectF, Qt
+        from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
         from PySide6.QtWidgets import (
             QFrame,
+            QGraphicsBlurEffect,
             QHBoxLayout,
             QLabel,
             QListWidget,
@@ -410,27 +461,124 @@ class MainWindow:
             label.setFixedHeight(28)
             return label
 
+        class RoundedProgressBar(QProgressBar):
+            """Paints both the track and fill through the same rounded clip."""
+
+            def paintEvent(self, _event) -> None:
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                track = QRectF(0.75, 0.75, self.width() - 1.5, self.height() - 1.5)
+                radius = track.height() / 2
+                path = QPainterPath()
+                path.addRoundedRect(track, radius, radius)
+                painter.fillPath(path, QColor("#151515"))
+                painter.setPen(QPen(QColor("#2b2b2b"), 1))
+                painter.drawPath(path)
+                span = self.maximum() - self.minimum()
+                ratio = 0.0 if span <= 0 else (self.value() - self.minimum()) / span
+                if ratio > 0:
+                    fill = QRectF(
+                        track.left(),
+                        track.top(),
+                        track.width() * min(1.0, ratio),
+                        track.height(),
+                    )
+                    fill_radius = min(radius, fill.width() / 2)
+                    fill_path = QPainterPath()
+                    fill_path.addRoundedRect(fill, fill_radius, fill_radius)
+                    painter.fillPath(fill_path, QColor("#0099ff"))
+                painter.setPen(QColor("#e6e6e6"))
+                painter.drawText(track, Qt.AlignmentFlag.AlignCenter, f"{round(ratio * 100)}%")
+
+        class RevealEffect(QGraphicsBlurEffect):
+            """One render pass for both soft focus and opacity on Windows."""
+
+            from PySide6.QtCore import Property as _Property
+
+            def __init__(self, parent=None) -> None:
+                super().__init__(parent)
+                self._reveal_opacity = 0.0
+
+            def _get_reveal_opacity(self) -> float:
+                return self._reveal_opacity
+
+            def _set_reveal_opacity(self, value: float) -> None:
+                self._reveal_opacity = max(0.0, min(1.0, float(value)))
+                self.update()
+
+            revealOpacity = _Property(
+                float,
+                _get_reveal_opacity,
+                _set_reveal_opacity,
+            )
+
+            def draw(self, painter) -> None:
+                painter.save()
+                painter.setOpacity(self._reveal_opacity)
+                super().draw(painter)
+                painter.restore()
+
+        def workflow_header(text: str) -> QHBoxLayout:
+            row = QHBoxLayout()
+            back = QPushButton("←  返回首页")
+            back.setObjectName("workflowBackButton")
+            back.setFixedWidth(112)
+            back.clicked.connect(self._return_guided_home)
+            row.addWidget(back)
+            row.addStretch(1)
+            row.addWidget(step_label(text))
+            row.addStretch(1)
+            row.addSpacing(112)
+            return row
+
+        def reveal_container(content: QWidget) -> QWidget:
+            outer = QWidget()
+            outer_layout = QVBoxLayout(outer)
+            outer_layout.setContentsMargins(0, 0, 0, 0)
+            outer_layout.addWidget(content)
+            effect = RevealEffect(content)
+            effect.setBlurRadius(16.0)
+            effect.setProperty("revealOpacity", 0.0)
+            content.setGraphicsEffect(effect)
+            self._landing_reveal_targets.append((content, effect))
+            return outer
+
         landing, landing_layout = centered_page()
         landing_layout.addStretch(2)
         hero = QLabel("让今天，成为值得收藏的一张海报")
         hero.setObjectName("heroTitle")
         hero.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hero.setWordWrap(True)
+        hero_holder = QWidget()
+        hero_holder_layout = QVBoxLayout(hero_holder)
+        hero_holder_layout.setContentsMargins(0, 0, 0, 0)
+        hero_holder_layout.addWidget(hero)
+
         hero_copy = QLabel("连接设备后，Day Distiller 会自动同步、理解、创作并发送。")
         hero_copy.setObjectName("heroSubtitle")
         hero_copy.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        begin = self._mark_button(QPushButton("开始"))
-        begin.setObjectName("heroStartButton")
-        begin.setFixedSize(320, 66)
-        begin.clicked.connect(self.start_guided_workflow)
+        self.hero_start_button = self._mark_button(QPushButton("开始"))
+        self.hero_start_button.setObjectName("heroStartButton")
+        self.hero_start_button.setFixedSize(310, 62)
+        self.hero_start_button.clicked.connect(self.start_guided_workflow)
         start_row = QHBoxLayout()
         start_row.addStretch(1)
-        start_row.addWidget(begin)
+        start_row.addWidget(self.hero_start_button)
         start_row.addStretch(1)
-        landing_layout.addWidget(hero)
-        landing_layout.addWidget(hero_copy)
-        landing_layout.addSpacing(22)
-        landing_layout.addLayout(start_row)
+        action_holder = QWidget()
+        action_layout = QVBoxLayout(action_holder)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(14)
+        action_layout.addWidget(hero_copy)
+        action_layout.addSpacing(8)
+        action_layout.addLayout(start_row)
+        self.guided_home_status = QLabel("")
+        self.guided_home_status.setObjectName("homeStatus")
+        self.guided_home_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        action_layout.addWidget(self.guided_home_status)
+
+        landing_layout.addWidget(reveal_container(hero_holder))
+        landing_layout.addWidget(reveal_container(action_holder))
         landing_layout.addStretch(3)
         first_use = QPushButton("首次使用？先完成配置")
         first_use.setProperty("role", "link")
@@ -439,50 +587,61 @@ class MainWindow:
         first_use_row.addStretch(1)
         first_use_row.addWidget(first_use)
         first_use_row.addStretch(1)
-        landing_layout.addLayout(first_use_row)
         privacy = QLabel("隐私与费用：IMU 与地点记忆在本地处理；仅必要的关键帧、音频与证据会发送至已配置服务。")
         privacy.setObjectName("privacyFootnote")
         privacy.setAlignment(Qt.AlignmentFlag.AlignCenter)
         privacy.setWordWrap(True)
-        landing_layout.addWidget(privacy)
+        footer_holder = QWidget()
+        footer_layout = QVBoxLayout(footer_holder)
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setSpacing(6)
+        footer_layout.addLayout(first_use_row)
+        footer_layout.addWidget(privacy)
+        landing_layout.addWidget(reveal_container(footer_holder))
         self.home_stack.addWidget(landing)
 
         connect_page, connect_layout = centered_page()
-        connect_layout.addWidget(step_label("步骤 1 / 3"), alignment=Qt.AlignmentFlag.AlignHCenter)
+        connect_layout.addLayout(workflow_header("步骤 1 / 3"))
         connect_title = QLabel("连接设备")
         connect_title.setObjectName("workflowTitle")
         connect_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        connect_copy = QLabel("请重启 Day Distiller 设备，并使用 USB 连接至电脑。")
-        connect_copy.setObjectName("workflowSubtitle")
-        connect_copy.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.guided_connect_copy = QLabel("请重启 Day Distiller 设备，并使用 USB 连接至电脑。")
+        self.guided_connect_copy.setObjectName("workflowSubtitle")
+        self.guided_connect_copy.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.guided_connect_copy.setWordWrap(True)
         connect_layout.addWidget(connect_title)
-        connect_layout.addWidget(connect_copy)
+        connect_layout.addWidget(self.guided_connect_copy)
         connect_layout.addSpacing(26)
         status_card = QFrame()
         status_card.setObjectName("workflowStatusCard")
         status_row = QHBoxLayout(status_card)
         status_row.setContentsMargins(24, 22, 24, 22)
         self.connect_spinner = Spinner(status_card, 34)
-        self.connect_success_icon = QLabel("✓")
-        self.connect_success_icon.setObjectName("successIconSmall")
-        self.connect_success_icon.setFixedSize(38, 38)
-        self.connect_success_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.connect_success_icon = FlatSuccessIcon(status_card, 38)
         self.connect_success_icon.hide()
         self.guided_connection_status = QLabel("正在寻找设备")
         self.guided_connection_status.setObjectName("workflowStatusText")
         status_row.addStretch(1)
         status_row.addWidget(self.connect_spinner.widget)
-        status_row.addWidget(self.connect_success_icon)
+        status_row.addWidget(self.connect_success_icon.widget)
         status_row.addSpacing(10)
         status_row.addWidget(self.guided_connection_status)
         status_row.addStretch(1)
         status_card.setMaximumWidth(580)
         connect_layout.addWidget(status_card, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.guided_retry_connection_button = self._mark_button(QPushButton("重新寻找设备"))
+        self.guided_retry_connection_button.setFixedWidth(180)
+        self.guided_retry_connection_button.clicked.connect(self.start_guided_workflow)
+        self.guided_retry_connection_button.hide()
+        connect_layout.addWidget(
+            self.guided_retry_connection_button,
+            alignment=Qt.AlignmentFlag.AlignHCenter,
+        )
         connect_layout.addStretch(1)
         self.home_stack.addWidget(connect_page)
 
         sync_page, sync_layout = centered_page()
-        sync_layout.addWidget(step_label("步骤 2 / 3"), alignment=Qt.AlignmentFlag.AlignHCenter)
+        sync_layout.addLayout(workflow_header("步骤 2 / 3"))
         sync_title = QLabel("正在同步数据")
         sync_title.setObjectName("workflowTitle")
         sync_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -491,24 +650,29 @@ class MainWindow:
         self.guided_sync_subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sync_layout.addWidget(sync_title)
         sync_layout.addWidget(self.guided_sync_subtitle)
-        self.guided_sync_progress = QProgressBar()
+        self.guided_sync_progress = RoundedProgressBar()
         self.guided_sync_progress.setRange(0, 100)
         self.guided_sync_progress.setValue(0)
         self.guided_sync_progress.setFormat("%p%")
         sync_layout.addWidget(self.guided_sync_progress)
         self.guided_records_list = QListWidget()
         self.guided_records_list.setObjectName("guidedRecordsList")
+        self.guided_records_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        self.guided_records_list.itemChanged.connect(self._guided_date_selection_changed)
         self.guided_records_list.setMinimumHeight(250)
         self.guided_records_list.hide()
         sync_layout.addWidget(self.guided_records_list, 1)
         self.guided_sync_actions = QWidget()
         sync_actions = QHBoxLayout(self.guided_sync_actions)
         sync_actions.setContentsMargins(0, 0, 0, 0)
+        self.guided_select_all_button = QPushButton("全选日期")
+        self.guided_select_all_button.clicked.connect(self._guided_select_all_dates)
         self.guided_resync_button = QPushButton("重新同步")
         self.guided_start_distill_button = self._mark_button(QPushButton("开始蒸馏（3s）"))
         self.guided_resync_button.clicked.connect(self._guided_start_sync)
         self.guided_start_distill_button.clicked.connect(self._guided_start_distillation)
         sync_actions.addStretch(1)
+        sync_actions.addWidget(self.guided_select_all_button)
         sync_actions.addWidget(self.guided_resync_button)
         sync_actions.addWidget(self.guided_start_distill_button)
         sync_actions.addStretch(1)
@@ -517,7 +681,7 @@ class MainWindow:
         self.home_stack.addWidget(sync_page)
 
         distill_page, distill_layout = centered_page()
-        distill_layout.addWidget(step_label("步骤 3 / 3"), alignment=Qt.AlignmentFlag.AlignHCenter)
+        distill_layout.addLayout(workflow_header("步骤 3 / 3"))
         distill_title = QLabel("蒸馏进行中")
         distill_title.setObjectName("workflowTitle")
         distill_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -527,7 +691,7 @@ class MainWindow:
         distill_layout.addWidget(distill_title)
         distill_layout.addWidget(distill_copy)
         progress_row = QHBoxLayout()
-        self.guided_distill_progress = QProgressBar()
+        self.guided_distill_progress = RoundedProgressBar()
         self.guided_distill_progress.setRange(0, 100)
         self.guided_distill_progress.setValue(0)
         self.guided_distill_progress.setFormat("%p%")
@@ -545,10 +709,7 @@ class MainWindow:
 
         complete_page, complete_layout = centered_page()
         complete_layout.addStretch(1)
-        done_icon = QLabel("✓")
-        done_icon.setObjectName("successIconLarge")
-        done_icon.setFixedSize(86, 86)
-        done_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        done_icon = FlatSuccessIcon(complete_page, 86)
         done_title = QLabel("蒸馏已完成")
         done_title.setObjectName("workflowTitle")
         done_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -562,7 +723,7 @@ class MainWindow:
         finish_row.addStretch(1)
         finish_row.addWidget(finish)
         finish_row.addStretch(1)
-        complete_layout.addWidget(done_icon, alignment=Qt.AlignmentFlag.AlignHCenter)
+        complete_layout.addWidget(done_icon.widget, alignment=Qt.AlignmentFlag.AlignHCenter)
         complete_layout.addWidget(done_title)
         complete_layout.addWidget(self.guided_complete_email)
         complete_layout.addSpacing(22)
@@ -1367,16 +1528,55 @@ class MainWindow:
         except Exception as exc:
             self.records_hint.setText(f"扫描失败：{exc}")
 
+    def _play_landing_intro(self) -> None:
+        """Reveal the landing content in three lightweight 60 Hz Qt animations."""
+
+        from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QTimer
+
+        self._landing_animation_groups.clear()
+        for index, (content, effect) in enumerate(self._landing_reveal_targets):
+            effect.setBlurRadius(16.0)
+            effect.setProperty("revealOpacity", 0.0)
+
+            def start_reveal(content=content, effect=effect, index=index) -> None:
+                group = QParallelAnimationGroup(self.window)
+                blur_animation = QPropertyAnimation(effect, b"blurRadius", group)
+                blur_animation.setStartValue(16.0)
+                blur_animation.setEndValue(0.0)
+                blur_animation.setDuration(680)
+                blur_animation.setEasingCurve(QEasingCurve.Type.OutQuart)
+                opacity_animation = QPropertyAnimation(effect, b"revealOpacity", group)
+                opacity_animation.setStartValue(0.0)
+                opacity_animation.setEndValue(1.0)
+                opacity_animation.setDuration(620)
+                opacity_animation.setEasingCurve(QEasingCurve.Type.OutQuart)
+                group.finished.connect(lambda content=content: content.setGraphicsEffect(None))
+                self._landing_animation_groups.append(group)
+                group.start()
+
+            QTimer.singleShot(index * 145, start_reveal)
+
     def start_guided_workflow(self) -> None:
         """Enter the production one-click flow and begin 1 Hz device discovery."""
+        if self.guided_operation_active:
+            return
         self.sync_countdown_timer.stop()
         self.guided_phase = "discovering"
+        self.guided_backgrounded = False
         self.guided_discovery_inflight = False
         self.guided_sync_workflow = None
         self.guided_synced_day = None
+        self.guided_synced_days = []
+        self.guided_sync_inventory = None
+        self.guided_completed_days = 0
+        self.guided_total_days = 0
+        self.guided_discovery_deadline = time.monotonic() + 120.0
         self.connect_success_icon.hide()
         self.connect_spinner.start()
+        self.guided_retry_connection_button.hide()
+        self.guided_connect_copy.setText("请重启 Day Distiller 设备，并使用 USB 连接至电脑。")
         self.guided_connection_status.setText("正在寻找设备")
+        self.guided_home_status.setText("")
         self.home_stack.setCurrentIndex(1)
         self.discovery_timer.start()
         self._guided_discovery_tick()
@@ -1384,35 +1584,67 @@ class MainWindow:
     def _guided_discovery_tick(self) -> None:
         if self.guided_phase != "discovering" or self.guided_discovery_inflight:
             return
+        if time.monotonic() >= self.guided_discovery_deadline:
+            self._guided_discovery_timeout()
+            return
         self.guided_discovery_inflight = True
         self.worker.run("guided_discover", find_device)
 
+    def _guided_discovery_timeout(self) -> None:
+        self.discovery_timer.stop()
+        self.guided_phase = "discovery_timeout"
+        self.connect_spinner.stop()
+        self.connect_success_icon.hide()
+        self.guided_connection_status.setText("暂未找到设备")
+        self.guided_connect_copy.setText(
+            "已等待 120 秒。请检查 USB 连接与设备状态，重启设备后再试一次。"
+        )
+        self.guided_retry_connection_button.show()
+
+    def _return_guided_home(self) -> None:
+        self.discovery_timer.stop()
+        self.sync_countdown_timer.stop()
+        self.connect_spinner.stop()
+        active = self.guided_phase in {"syncing", "distilling"}
+        if active:
+            self.guided_backgrounded = True
+            self.hero_start_button.setDisabled(True)
+            activity = "同步" if self.guided_phase == "syncing" else "蒸馏"
+            self.guided_home_status.setText(f"{activity}仍在后台安全进行，完成前请勿断开设备。")
+        else:
+            self.guided_phase = "idle"
+            self.guided_backgrounded = False
+            self.hero_start_button.setDisabled(False)
+        self.home_stack.setCurrentIndex(0)
+        self._select_tab("开始")
+
     def _guided_start_sync(self) -> None:
+        if self.guided_phase not in {"discovering", "sync_error", "synced"}:
+            return
+        if self.guided_operation_active:
+            return
         self.discovery_timer.stop()
         self.sync_countdown_timer.stop()
         self.guided_phase = "syncing"
+        self.guided_operation_active = True
         self.home_stack.setCurrentIndex(2)
         self.guided_sync_progress.setValue(2)
-        self.guided_sync_subtitle.setText("正在切换设备状态并安全读取今天的记录，请稍等。")
+        self.guided_sync_subtitle.setText("正在挂载设备并比对本地缓存，请稍等。")
         self.guided_records_list.clear()
         self.guided_records_list.hide()
         self.guided_sync_actions.hide()
 
-        provider_mode = str(self.provider_combo.currentData() or "mainland")
-        target = date.today()
-        self.target_date.setDate(target)
-
         def work():
-            # Import itself does not call cloud providers. Keeping a deterministic
-            # provider here lets synchronization succeed before API credentials
-            # are needed; the selected provider is persisted on the job.
             pipeline = self._create_pipeline("mock")
             workflow = LegacyDeviceWorkflow(
                 pipeline,
                 status=lambda message: self.events.put(("guided_message", message, None)),
+                sync_progress=lambda progress, message: self.events.put(
+                    ("guided_sync_progress", (progress, message), None)
+                ),
             )
-            synced = workflow.sync_day(target, provider_mode=provider_mode)
-            return workflow, synced
+            inventory = workflow.sync_all(self.paths.imports)
+            return workflow, inventory
 
         self.worker.run("guided_sync", work)
 
@@ -1424,14 +1656,44 @@ class MainWindow:
             return
         self.guided_start_distill_button.setText(f"开始蒸馏（{self.guided_countdown}s）")
 
+    def _guided_select_all_dates(self) -> None:
+        from PySide6.QtCore import Qt
+
+        for index in range(self.guided_records_list.count()):
+            self.guided_records_list.item(index).setCheckState(Qt.CheckState.Checked)
+
+    def _guided_date_selection_changed(self, _item=None) -> None:
+        selected = self._selected_guided_dates()
+        self.guided_start_distill_button.setDisabled(not selected)
+        if self.guided_sync_inventory and len(self.guided_sync_inventory.days) > 1:
+            self.guided_start_distill_button.setText(
+                f"开始蒸馏（{len(selected)} 天）" if selected else "请选择日期"
+            )
+
+    def _selected_guided_dates(self) -> list[date]:
+        from PySide6.QtCore import Qt
+
+        selected: list[date] = []
+        for index in range(self.guided_records_list.count()):
+            item = self.guided_records_list.item(index)
+            if item.checkState() == Qt.CheckState.Checked:
+                selected.append(date.fromisoformat(str(item.data(Qt.ItemDataRole.UserRole))))
+        return selected
+
     def _guided_start_distillation(self) -> None:
         from PySide6.QtWidgets import QMessageBox
 
         self.sync_countdown_timer.stop()
-        if self.guided_synced_day is None:
+        if self.guided_sync_inventory is None:
             QMessageBox.information(self.window, "尚未同步", "请先等待设备记录同步完成。")
             return
+        selected_dates = self._selected_guided_dates()
+        if not selected_dates:
+            QMessageBox.information(self.window, "请选择日期", "请勾选一个或多个需要蒸馏的日期。")
+            return
         self.guided_phase = "distilling"
+        self.guided_operation_active = True
+        self.guided_backgrounded = False
         self._set_busy(True)
         self.home_stack.setCurrentIndex(3)
         self.guided_distill_progress.setValue(1)
@@ -1439,19 +1701,60 @@ class MainWindow:
         self.guided_live_progress.appendPlainText("本地数据已校验，正在准备分析…")
         self.guided_eta_label.setText("正在估算剩余时间")
         self.guided_started_at = time.monotonic()
-        synced = self.guided_synced_day
-        provider_mode = self.database.get_job(synced.job_id).provider_mode
+        provider_mode = str(self.provider_combo.currentData() or "mainland")
+        inventory = self.guided_sync_inventory
+        self.guided_total_days = len(selected_dates)
+        self.guided_completed_days = 0
 
         def work():
-            pipeline = self._create_pipeline(provider_mode)
-            workflow = LegacyDeviceWorkflow(
-                pipeline,
-                status=lambda message: self.events.put(("guided_message", message, None)),
+            preparation_pipeline = self._create_pipeline(
+                "mock",
+                progress_callback=lambda _stage, _progress, message: self.events.put(
+                    ("guided_message", message, None)
+                ),
             )
-            self.guided_sync_workflow = workflow
-            return workflow.process_synced(
-                synced.job_id, avatar_references=self._avatar_references()
+            preparation_workflow = LegacyDeviceWorkflow(preparation_pipeline)
+            synced_days = preparation_workflow.prepare_days(
+                inventory,
+                selected_dates,
+                provider_mode=provider_mode,
             )
+            self.guided_synced_days = synced_days
+            results = []
+            for index, synced in enumerate(synced_days):
+                day_label = synced.target_date.isoformat() if synced.target_date else "所选日期"
+                self.events.put(
+                    ("guided_day_start", (index, len(synced_days), day_label), None)
+                )
+
+                def progress_callback(stage, progress, message, index=index):
+                    self.events.put(
+                        (
+                            "guided_batch_progress",
+                            (index, len(synced_days), stage, progress, message),
+                            None,
+                        )
+                    )
+
+                pipeline = self._create_pipeline(
+                    provider_mode,
+                    progress_callback=progress_callback,
+                )
+                workflow = LegacyDeviceWorkflow(
+                    pipeline,
+                    status=lambda message: self.events.put(("guided_message", message, None)),
+                )
+                self.guided_sync_workflow = workflow
+                results.append(
+                    workflow.process_synced(
+                        synced.job_id,
+                        avatar_references=self._avatar_references(),
+                    )
+                )
+                self.events.put(
+                    ("guided_day_complete", (index + 1, len(synced_days), day_label), None)
+                )
+            return results
 
         self.worker.run("guided_distill", work)
 
@@ -1485,8 +1788,14 @@ class MainWindow:
         self.discovery_timer.stop()
         self.sync_countdown_timer.stop()
         self.guided_phase = "idle"
+        self.guided_operation_active = False
+        self.guided_backgrounded = False
         self.guided_sync_workflow = None
         self.guided_synced_day = None
+        self.guided_synced_days = []
+        self.guided_sync_inventory = None
+        self.hero_start_button.setDisabled(False)
+        self.guided_home_status.setText("")
         self.home_stack.setCurrentIndex(0)
         self._select_tab("开始")
 
@@ -2232,7 +2541,10 @@ class MainWindow:
         self._on_art_style_changed()
 
     def _create_pipeline(
-        self, provider_mode: str, recipient_override: str | None = None
+        self,
+        provider_mode: str,
+        recipient_override: str | None = None,
+        progress_callback: Callable[[JobStage, float, str], None] | None = None,
     ) -> DistillationPipeline:
         settings = self.database.get_setting("desktop_v2", {})
         models = settings.get("models", {})
@@ -2301,8 +2613,11 @@ class MainWindow:
             mail,
             media_preprocessor=MediaPreprocessor(ffmpeg, ffprobe),
             motion_model_path=None,
-            progress=lambda stage, progress, message: self.events.put(
-                ("progress", (stage, progress, message), None)
+            progress=progress_callback
+            or (
+                lambda stage, progress, message: self.events.put(
+                    ("progress", (stage, progress, message), None)
+                )
             ),
         )
 
@@ -2386,6 +2701,34 @@ class MainWindow:
                 name, result, error = self.events.get_nowait()
             except queue.Empty:
                 return
+            if name == "guided_sync_progress":
+                progress, message = result
+                self.guided_sync_progress.setValue(max(3, min(96, round(float(progress) * 96))))
+                self.guided_sync_subtitle.setText(str(message))
+                continue
+            if name == "guided_batch_progress":
+                index, total, stage, progress, message = result
+                day_percent = self._guided_progress_value(stage, progress)
+                overall = round(((index + day_percent / 100.0) / max(1, total)) * 100)
+                self.guided_distill_progress.setValue(max(1, min(99, overall)))
+                self._update_guided_eta(overall)
+                self.guided_live_progress.appendPlainText(
+                    f"第 {index + 1}/{total} 天 · {stage.value} · {message}"
+                )
+                continue
+            if name == "guided_day_start":
+                index, total, day_label = result
+                self.guided_live_progress.appendPlainText(
+                    f"开始处理 {day_label}（{index + 1}/{total}）"
+                )
+                continue
+            if name == "guided_day_complete":
+                completed, total, day_label = result
+                self.guided_completed_days = completed
+                self.guided_live_progress.appendPlainText(
+                    f"{day_label} 已完成并发送（{completed}/{total}）"
+                )
+                continue
             if name == "progress":
                 stage, progress, message = result
                 if self.guided_phase == "syncing" and stage == JobStage.IMPORTING:
@@ -2412,17 +2755,34 @@ class MainWindow:
             if error:
                 if name == "guided_discover":
                     self.guided_discovery_inflight = False
-                    self.guided_connection_status.setText("正在寻找设备")
+                    if self.guided_phase == "discovering":
+                        self.guided_connection_status.setText("正在寻找设备")
                 elif name == "guided_sync":
                     self.guided_phase = "sync_error"
-                    self.guided_sync_subtitle.setText(f"同步失败：{error}")
-                    self.guided_sync_actions.show()
-                    self.guided_start_distill_button.hide()
-                    self.guided_resync_button.setText("重新同步")
+                    self.guided_operation_active = False
+                    self.hero_start_button.setDisabled(False)
+                    if self.guided_backgrounded:
+                        self.guided_home_status.setText(f"后台同步失败：{error}")
+                    else:
+                        self.guided_sync_subtitle.setText(f"同步失败：{error}")
+                        self.guided_sync_actions.show()
+                        self.guided_select_all_button.hide()
+                        self.guided_start_distill_button.hide()
+                        self.guided_resync_button.setText("重新同步")
                 elif name == "guided_distill":
                     self.guided_phase = "distill_error"
-                    self.guided_live_progress.appendPlainText(f"蒸馏失败：{error}")
-                    self.guided_eta_label.setText("任务未完成")
+                    self.guided_operation_active = False
+                    self.hero_start_button.setDisabled(False)
+                    partial = (
+                        f"已完成 {self.guided_completed_days}/{self.guided_total_days} 天。"
+                        if self.guided_total_days > 1
+                        else ""
+                    )
+                    if self.guided_backgrounded:
+                        self.guided_home_status.setText(f"后台蒸馏失败：{partial}{error}")
+                    else:
+                        self.guided_live_progress.appendPlainText(f"蒸馏失败：{partial}{error}")
+                        self.guided_eta_label.setText("任务未完成，可返回首页")
                     self._set_busy(False)
                     self.refresh_history()
                 elif name in {"distill", "cleanup_retry", "manual_regenerate", "manual_resend"}:
@@ -2445,7 +2805,11 @@ class MainWindow:
             from PySide6.QtCore import QTimer
 
             self.guided_discovery_inflight = False
+            if self.guided_phase != "discovering":
+                return
             if not result:
+                if time.monotonic() >= self.guided_discovery_deadline:
+                    self._guided_discovery_timeout()
                 return
             port, status = result
             self.discovery_timer.stop()
@@ -2457,35 +2821,90 @@ class MainWindow:
             self.guided_connection_status.setText("设备已连接")
             QTimer.singleShot(700, self._guided_start_sync)
         elif name == "guided_sync":
-            workflow, synced = result
+            from PySide6.QtCore import QSignalBlocker, Qt
+            from PySide6.QtWidgets import QListWidgetItem
+
+            workflow, inventory = result
+            self.guided_operation_active = False
             self.guided_sync_workflow = workflow
-            self.guided_synced_day = synced
+            self.guided_sync_inventory = inventory
             self.guided_phase = "synced"
             self.guided_sync_progress.setValue(100)
+            blocker = QSignalBlocker(self.guided_records_list)
             self.guided_records_list.clear()
-            for record_name in synced.record_names:
-                self.guided_records_list.addItem(record_name)
+            single_day = len(inventory.days) == 1
+            for synced_date in inventory.days:
+                changed = len(synced_date.changed_record_names)
+                detail = (
+                    f"新增或更新 {changed} 条"
+                    if changed
+                    else "本地缓存已是最新"
+                )
+                item = QListWidgetItem(
+                    f"{synced_date.target_date.isoformat()}   ·   "
+                    f"{len(synced_date.record_names)} 条记录   ·   {detail}"
+                )
+                item.setFlags(
+                    item.flags()
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsEnabled
+                )
+                item.setData(Qt.ItemDataRole.UserRole, synced_date.target_date.isoformat())
+                item.setCheckState(
+                    Qt.CheckState.Checked if single_day else Qt.CheckState.Unchecked
+                )
+                self.guided_records_list.addItem(item)
+            del blocker
             self.guided_records_list.show()
-            count = len(synced.record_names)
-            self.guided_sync_subtitle.setText(f"已同步 {count} 条数据，将在 3 秒后自动开始蒸馏。")
+            if single_day:
+                self.guided_sync_subtitle.setText(
+                    f"已同步 {inventory.total_records} 条记录，将在 3 秒后自动开始蒸馏。"
+                )
+            else:
+                self.guided_sync_subtitle.setText(
+                    f"发现 {len(inventory.days)} 天、共 {inventory.total_records} 条记录。"
+                    "请选择一个或多个日期，也可以全选。"
+                )
             self.guided_start_distill_button.show()
+            self.guided_select_all_button.setVisible(not single_day)
             self.guided_resync_button.setText("重新同步")
             self.guided_sync_actions.show()
-            self.guided_countdown = 3
-            self.guided_start_distill_button.setText("开始蒸馏（3s）")
-            self.sync_countdown_timer.start()
+            self._guided_date_selection_changed()
+            if single_day and not self.guided_backgrounded:
+                self.guided_countdown = 3
+                self.guided_start_distill_button.setText("开始蒸馏（3s）")
+                self.sync_countdown_timer.start()
+            if self.guided_backgrounded:
+                self.hero_start_button.setDisabled(False)
+                self.guided_home_status.setText("后台同步已完成。点击开始可重新读取并选择蒸馏日期。")
         elif name == "guided_distill":
             self.guided_phase = "completed"
+            self.guided_operation_active = False
             self.guided_distill_progress.setValue(100)
             self.guided_eta_label.setText("已完成")
-            self.guided_live_progress.appendPlainText("每日蒸馏完成，邮件服务器已接受。")
+            result_count = len(result) if isinstance(result, list) else 1
+            self.guided_live_progress.appendPlainText(
+                f"{result_count} 天的每日蒸馏已完成，邮件服务器均已接受。"
+            )
             recipient = str(
                 self.database.get_setting("desktop_v2", {}).get("resend", {}).get("recipient", "")
             ).strip()
             self.guided_complete_email.setText(
-                f"已发送至指定邮箱：{recipient}" if recipient else "邮件已发送至指定收件地址"
+                (
+                    f"已将 {result_count} 份日报发送至：{recipient}"
+                    if result_count > 1 and recipient
+                    else f"已发送至指定邮箱：{recipient}"
+                    if recipient
+                    else "邮件已发送至指定收件地址"
+                )
             )
-            self.home_stack.setCurrentIndex(4)
+            self.hero_start_button.setDisabled(False)
+            if self.guided_backgrounded:
+                self.guided_home_status.setText(
+                    f"后台蒸馏已完成，{result_count} 份日报已发送。"
+                )
+            else:
+                self.home_stack.setCurrentIndex(4)
             self._set_busy(False)
             self.refresh_history()
         elif name == "auto_find":

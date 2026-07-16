@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
@@ -25,12 +25,40 @@ class ImportVerificationError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class CachedRecord:
+    """One device record verified into the long-lived local material cache."""
+
+    record_name: str
+    captured_at: datetime
+    local_dir: Path
+    files: tuple[FileDigest, ...]
+    was_new: bool
+    changed_files: int
+
+
+@dataclass(frozen=True)
+class CacheSyncResult:
+    records: tuple[CachedRecord, ...]
+    manifest_path: Path
+
+    @property
+    def changed_record_count(self) -> int:
+        return sum(1 for record in self.records if record.was_new or record.changed_files)
+
+
 def parse_record_datetime(name: str) -> datetime:
     match = RECORD_NAME.fullmatch(name)
     if not match:
         raise ValueError(f"invalid legacy record directory: {name}")
     value = datetime.strptime(match.group("date") + match.group("time"), "%y%m%d%H%M%S")
-    return value.astimezone()
+    # On Windows, converting a naive pre-1970 datetime with astimezone() can
+    # route through a negative C timestamp and raise OSError(22). The device
+    # directory format uses two-digit years, so old RTC test captures can hit
+    # that path. Attaching the host's local timezone directly is deterministic
+    # and does not perform the unsupported timestamp conversion.
+    local_timezone = datetime.now().astimezone().tzinfo
+    return value.replace(tzinfo=local_timezone)
 
 
 def scan_record_directories(root: Path, target_date: date | None = None) -> list[Path]:
@@ -84,13 +112,13 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def _copy_verified(source: Path, destination: Path) -> FileDigest:
+def _copy_verified_with_status(source: Path, destination: Path) -> tuple[FileDigest, bool]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     expected_size = source.stat().st_size
     if destination.is_file() and destination.stat().st_size == expected_size:
         existing_hash = sha256_file(destination)
         if existing_hash == sha256_file(source):
-            return FileDigest(destination.name, expected_size, existing_hash)
+            return FileDigest(destination.name, expected_size, existing_hash), False
 
     partial = destination.with_name(destination.name + ".part")
     partial.unlink(missing_ok=True)
@@ -111,7 +139,12 @@ def _copy_verified(source: Path, destination: Path) -> FileDigest:
         destination.unlink(missing_ok=True)
         raise ImportVerificationError(f"hash mismatch while copying {source}")
     shutil.copystat(source, destination)
-    return FileDigest(destination.name, expected_size, destination_hash)
+    return FileDigest(destination.name, expected_size, destination_hash), True
+
+
+def _copy_verified(source: Path, destination: Path) -> FileDigest:
+    digest, _copied = _copy_verified_with_status(source, destination)
+    return digest
 
 
 def _record_files(record_dir: Path) -> list[Path]:
@@ -124,6 +157,120 @@ def _record_files(record_dir: Path) -> list[Path]:
             raise ImportVerificationError(f"record contains an unsafe path: {path}")
         files.append(path)
     return sorted(files, key=lambda item: item.relative_to(record_dir).as_posix())
+
+
+def sync_legacy_cache(
+    source_root: Path,
+    destination_root: Path,
+    progress: ProgressCallback | None = None,
+) -> CacheSyncResult:
+    """Differentially mirror every verified device record into the local cache.
+
+    The cache is organized by ISO calendar day. Existing files are reused only
+    after size and SHA-256 match, so reconnecting every day copies only new or
+    changed material while still detecting corruption.
+    """
+
+    source_root = Path(source_root).resolve()
+    destination_root = Path(destination_root).resolve()
+    destination_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = destination_root / "device_sync_manifest.json"
+    previous_files: dict[tuple[str, str], dict[str, object]] = {}
+    if manifest_path.is_file():
+        try:
+            previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if previous_manifest.get("adapter") == "legacy_msc_v1_cache":
+                for record in previous_manifest.get("records", []):
+                    if not isinstance(record, dict):
+                        continue
+                    record_name = str(record.get("record_name", ""))
+                    for item in record.get("files", []):
+                        if isinstance(item, dict):
+                            previous_files[(record_name, str(item.get("relative_path", "")))] = item
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            previous_files = {}
+    selected = scan_record_directories(source_root)
+    total_files = sum(len(_record_files(record_dir)) for record_dir in selected)
+    completed_files = 0
+    cached_records: list[CachedRecord] = []
+    manifest_records: list[dict[str, object]] = []
+
+    for source_dir in selected:
+        captured_at = parse_record_datetime(source_dir.name)
+        local_dir = destination_root / captured_at.date().isoformat() / source_dir.name
+        was_new = not local_dir.is_dir()
+        changed_files = 0
+        digests: list[FileDigest] = []
+        manifest_files: list[dict[str, object]] = []
+        for source_file in _record_files(source_dir):
+            relative = source_file.relative_to(source_dir)
+            relative_text = relative.as_posix()
+            destination = local_dir / relative
+            source_stat = source_file.stat()
+            previous = previous_files.get((source_dir.name, relative_text))
+            try:
+                can_reuse = bool(
+                    previous
+                    and int(previous.get("size", -1)) == source_stat.st_size
+                    and int(previous.get("source_mtime_ns", -1)) == source_stat.st_mtime_ns
+                    and destination.is_file()
+                    and destination.stat().st_size == source_stat.st_size
+                )
+            except (TypeError, ValueError):
+                can_reuse = False
+            if can_reuse and sha256_file(destination) == str(previous.get("sha256", "")):
+                digest = FileDigest(destination.name, source_stat.st_size, str(previous["sha256"]))
+                copied = False
+            else:
+                digest, copied = _copy_verified_with_status(source_file, destination)
+            normalized = FileDigest(relative.as_posix(), digest.size, digest.sha256)
+            digests.append(normalized)
+            manifest_files.append(
+                {
+                    **asdict(normalized),
+                    "source_mtime_ns": source_stat.st_mtime_ns,
+                }
+            )
+            changed_files += int(copied)
+            completed_files += 1
+            if progress:
+                progress(
+                    completed_files,
+                    total_files,
+                    f"正在同步 {source_dir.name}/{relative.as_posix()}",
+                )
+
+        cached = CachedRecord(
+            record_name=source_dir.name,
+            captured_at=captured_at,
+            local_dir=local_dir,
+            files=tuple(digests),
+            was_new=was_new,
+            changed_files=changed_files,
+        )
+        cached_records.append(cached)
+        manifest_records.append(
+            {
+                "record_name": cached.record_name,
+                "captured_at": cached.captured_at.isoformat(),
+                "local_dir": str(cached.local_dir),
+                "was_new": cached.was_new,
+                "changed_files": cached.changed_files,
+                "files": manifest_files,
+            }
+        )
+
+    manifest = {
+        "schema_version": 1,
+        "adapter": "legacy_msc_v1_cache",
+        "source_root": str(source_root),
+        "synced_at": datetime.now(timezone.utc).isoformat(),
+        "records": manifest_records,
+    }
+    temporary = manifest_path.with_suffix(".json.part")
+    temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(manifest_path)
+    return CacheSyncResult(tuple(cached_records), manifest_path)
 
 
 def import_legacy_day(

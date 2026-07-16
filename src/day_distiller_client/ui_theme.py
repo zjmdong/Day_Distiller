@@ -58,6 +58,11 @@ QLabel#privacyFootnote {
     color: #5f5f5f;
     font-size: 11px;
 }
+QLabel#homeStatus {
+    color: #737373;
+    font-size: 12px;
+    min-height: 20px;
+}
 QLabel[stepBadge="true"] {
     background: #0b1820;
     color: #4db7ff;
@@ -240,9 +245,30 @@ QPushButton[role="primary"]:hover, QPushButton[role="accent"]:hover, QPushButton
     border-color: #1aa3ff;
 }
 QPushButton#heroStartButton {
-    border-radius: 33px;
+    min-height: 60px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(25, 166, 255, 235), stop:1 rgba(0, 122, 255, 235));
+    border: 1px solid rgba(102, 201, 255, 210);
+    border-radius: 18px;
     font-size: 20px;
     font-weight: 650;
+}
+QPushButton#heroStartButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(52, 178, 255, 245), stop:1 rgba(15, 135, 255, 245));
+    border-color: #8bd6ff;
+}
+QPushButton#workflowBackButton {
+    min-height: 34px;
+    background: transparent;
+    color: #8f8f8f;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 0 10px;
+    text-align: left;
+}
+QPushButton#workflowBackButton:hover {
+    background: #0d0d0d;
+    color: #ffffff;
+    border-color: #242424;
 }
 QPushButton[role="link"] {
     min-height: 28px;
@@ -308,6 +334,17 @@ QListWidget#contentList::item:selected, QListWidget#historyList::item:selected,
 QListWidget#guidedRecordsList::item:selected, QListWidget#developerHistoryList::item:selected {
     background: #0d2230;
     color: #ffffff;
+    border-color: #0099ff;
+}
+QListWidget#guidedRecordsList::indicator {
+    width: 18px;
+    height: 18px;
+    background: #090909;
+    border: 1px solid #3a3a3a;
+    border-radius: 5px;
+}
+QListWidget#guidedRecordsList::indicator:checked {
+    background: #0099ff;
     border-color: #0099ff;
 }
 QPlainTextEdit#guidedLiveProgress {

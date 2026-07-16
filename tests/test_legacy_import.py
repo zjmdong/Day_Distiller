@@ -15,6 +15,12 @@ from day_distiller_client.legacy_import import (
 )
 
 
+def test_parse_pre_epoch_record_date_is_supported_on_windows() -> None:
+    captured = parse_record_datetime("REC_0001_690101_000000")
+    assert captured.year == 1969
+    assert captured.tzinfo is not None
+
+
 def make_record(root: Path, name: str, payload: bytes = b"video") -> Path:
     record = root / name
     record.mkdir()
