@@ -91,12 +91,86 @@ class Worker:
         threading.Thread(target=target, name=f"day-distiller-{name}", daemon=True).start()
 
 
+class NavigationStack:
+    """Horizontal-text sidebar navigation backed by a QStackedWidget."""
+
+    def __init__(self) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QListWidget, QStackedWidget, QVBoxLayout, QWidget
+
+        self.widget = QWidget()
+        self.widget.setAutoFillBackground(True)
+        layout = QHBoxLayout(self.widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        sidebar = QFrame()
+        sidebar.setObjectName("sideBar")
+        sidebar.setAutoFillBackground(True)
+        sidebar.setFixedWidth(184)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(14, 22, 14, 18)
+        sidebar_layout.setSpacing(10)
+        label = QLabel("WORKSPACE")
+        label.setProperty("muted", True)
+        label.setStyleSheet("font-size:10px; font-weight:600; padding-left:12px;")
+        self.navigation = QListWidget()
+        self.navigation.setObjectName("sideNav")
+        self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.navigation.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.navigation.setSpacing(1)
+        sidebar_layout.addWidget(label)
+        sidebar_layout.addWidget(self.navigation, 1)
+
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("pageStack")
+        self.navigation.currentRowChanged.connect(self.stack.setCurrentIndex)
+        layout.addWidget(sidebar)
+        layout.addWidget(self.stack, 1)
+
+    def addTab(self, widget, title: str) -> int:
+        from PySide6.QtCore import QSize
+        from PySide6.QtWidgets import QListWidgetItem
+
+        item = QListWidgetItem(title)
+        item.setSizeHint(QSize(150, 46))
+        self.navigation.addItem(item)
+        index = self.stack.addWidget(widget)
+        if self.navigation.currentRow() < 0:
+            self.navigation.setCurrentRow(0)
+        return index
+
+    def count(self) -> int:
+        return self.stack.count()
+
+    def tabText(self, index: int) -> str:
+        item = self.navigation.item(index)
+        return item.text() if item else ""
+
+    def setCurrentIndex(self, index: int) -> None:
+        self.navigation.setCurrentRow(index)
+
+    def currentIndex(self) -> int:
+        return self.stack.currentIndex()
+
+
 def main() -> int:
+    from PySide6.QtGui import QFont, QFontDatabase
     from PySide6.QtWidgets import QApplication
 
     application = QApplication([])
     application.setApplicationName("Day Distiller v2")
     application.setStyle("Fusion")
+    installed_fonts = set(QFontDatabase.families())
+    ui_family = next(
+        (
+            candidate
+            for candidate in ("Inter", "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI")
+            if candidate in installed_fonts
+        ),
+        QApplication.font().family(),
+    )
+    application.setFont(QFont(ui_family, 10))
     window = MainWindow()
     window.show()
     return application.exec()
@@ -140,11 +214,10 @@ class MainWindow:
         self.window.show()
 
     def _build_ui(self) -> None:
-        from PySide6.QtWidgets import QHBoxLayout, QLabel, QTabWidget, QVBoxLayout, QWidget
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-        self.tabs = QTabWidget()
-        self.tabs.setTabPosition(QTabWidget.TabPosition.West)
-        self.tabs.setDocumentMode(True)
+        self.tabs = NavigationStack()
         self.tabs.addTab(self._guide_page(), "开始")
         self.tabs.addTab(self._device_page(), "设备")
         self.tabs.addTab(self._records_page(), "记录")
@@ -155,11 +228,12 @@ class MainWindow:
 
         root = QWidget()
         root.setObjectName("appRoot")
+        root.setAutoFillBackground(True)
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
-        header = QWidget()
-        header.setStyleSheet("background:#FFFFFF; border-bottom:1px solid #E9EAF0;")
+        header = QFrame()
+        header.setObjectName("appHeader")
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(24, 15, 24, 15)
         brand_box = QVBoxLayout()
@@ -176,8 +250,24 @@ class MainWindow:
         cost_chip.setProperty("chip", True)
         header_layout.addWidget(cost_chip)
         root_layout.addWidget(header)
-        root_layout.addWidget(self.tabs, 1)
+        root_layout.addWidget(self.tabs.widget, 1)
         self.window.setCentralWidget(root)
+
+        def repaint_after_navigation(_index: int) -> None:
+            # On Windows, a stacked-page switch can leave unchanged child widgets
+            # waiting for the next native paint event. Repaint the complete visible
+            # tree so the persistent header/sidebar never appear temporarily blank.
+            def repaint_visible_tree() -> None:
+                root.repaint()
+                for child in root.findChildren(QWidget):
+                    if child.isVisible():
+                        child.repaint()
+                QApplication.processEvents()
+
+            QTimer.singleShot(0, repaint_visible_tree)
+            QTimer.singleShot(40, repaint_visible_tree)
+
+        self.tabs.navigation.currentRowChanged.connect(repaint_after_navigation)
 
     @staticmethod
     def _page_header(title: str, subtitle: str):
@@ -218,10 +308,10 @@ class MainWindow:
 
         steps = QHBoxLayout()
         steps.setSpacing(14)
-        for number, title, copy, color in (
-            ("1", "连接设备", "回家后唤醒设备并连接电脑。", "#6C5CE7"),
-            ("2", "确认记录", "扫描今天，快速确认素材数量。", "#FF6B8A"),
-            ("3", "生成海报", "一键筛选、分析、创作并发送。", "#00BFA6"),
+        for number, title, copy in (
+            ("1", "连接设备", "回家后唤醒设备并连接电脑。"),
+            ("2", "确认记录", "扫描今天，快速确认素材数量。"),
+            ("3", "生成海报", "一键筛选、分析、创作并发送。"),
         ):
             card = QGroupBox()
             card_layout = QVBoxLayout(card)
@@ -229,7 +319,8 @@ class MainWindow:
             badge.setFixedSize(38, 38)
             badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
             badge.setStyleSheet(
-                f"background:{color}; color:white; border-radius:19px; font-size:18px; font-weight:700;"
+                "background:#111111; color:white; border:1px solid #2b2b2b; "
+                "border-radius:19px; font-size:17px; font-weight:600;"
             )
             heading = QLabel(title)
             heading.setStyleSheet("font-size:18px; font-weight:700;")
@@ -297,7 +388,7 @@ class MainWindow:
         self.avatar_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.avatar_preview.setMinimumHeight(260)
         self.avatar_preview.setStyleSheet(
-            "border:1px dashed #C8CDDA; border-radius:16px; background:#F8F9FC; color:#8B92A5;"
+            "border:1px solid #242424; border-radius:12px; background:#050505; color:#777777;"
         )
         self.avatar_edit = QLineEdit()
         self.avatar_edit.setReadOnly(True)
@@ -353,7 +444,7 @@ class MainWindow:
         self.style_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.style_preview.setMinimumHeight(240)
         self.style_preview.setStyleSheet(
-            "border:1px dashed #C8CDDA; border-radius:16px; background:#F8F9FC; color:#8B92A5;"
+            "border:1px solid #242424; border-radius:12px; background:#050505; color:#777777;"
         )
         style_layout.addWidget(self.art_style_combo)
         style_layout.addWidget(self.art_style_description)
@@ -399,7 +490,8 @@ class MainWindow:
         )
         notice.setWordWrap(True)
         notice.setStyleSheet(
-            "background:#FFF2D9; color:#7A4A00; border-radius:12px; padding:11px; font-weight:600;"
+            "background:#08131a; color:#a6a6a6; border:1px solid #17364a; "
+            "border-radius:10px; padding:11px; font-weight:500;"
         )
         layout.addWidget(notice)
 
@@ -605,6 +697,7 @@ class MainWindow:
         date_row.addStretch(1)
         layout.addLayout(date_row)
         self.records_list = QListWidget()
+        self.records_list.setObjectName("contentList")
         layout.addWidget(self.records_list, 1)
         self.records_hint = QLabel("只分析每个实际记录到的约 5 秒片段，不推断定时采样间隔内的活动。")
         self.records_hint.setWordWrap(True)
@@ -649,7 +742,7 @@ class MainWindow:
         top.addWidget(self.start_device_button)
         layout.addLayout(top)
         self.stage_label = QLabel("等待开始")
-        self.stage_label.setStyleSheet("font-size:18px; font-weight:700; color:#312A63;")
+        self.stage_label.setStyleSheet("font-size:18px; font-weight:600; color:#ffffff;")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1000)
         self.usage_label = QLabel(
@@ -697,6 +790,7 @@ class MainWindow:
         row.addStretch(1)
         layout.addLayout(row)
         self.history_list = QListWidget()
+        self.history_list.setObjectName("historyList")
         layout.addWidget(self.history_list, 1)
         refresh.clicked.connect(self.refresh_history)
         self.open_report_button.clicked.connect(self.open_selected_report)
@@ -1319,15 +1413,13 @@ class MainWindow:
         self.custom_style_counter.setVisible(custom)
         if custom:
             description = "用不超过 200 字定义独有的色彩、材质、笔触和情绪。系统仍会强制保持竖版、无文字与事实一致。"
-            accent = "#6C5CE7"
         else:
             style = get_art_style(style_id)
             description = f"{style.description}\n{style.tagline}"
-            accent = style.accent
         self.art_style_description.setText(description)
         self.art_style_description.setStyleSheet(
-            f"background:#F7F5FF; color:#30394D; border:2px solid {accent}; "
-            "border-radius:13px; padding:12px; font-weight:600;"
+            "background:#07131b; color:#d7d7d7; border:1px solid #17405b; "
+            "border-radius:10px; padding:12px; font-weight:500;"
         )
 
     def _limit_custom_style_prompt(self) -> None:
