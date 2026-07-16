@@ -11,6 +11,7 @@ class CredentialName(StrEnum):
     QWEN_API_KEY = "qwen_api_key"
     DEEPSEEK_API_KEY = "deepseek_api_key"
     VOLCENGINE_API_KEY = "volcengine_api_key"
+    RESEND_API_KEY = "resend_api_key"
     SMTP_PASSWORD = "smtp_password"
 
 

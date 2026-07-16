@@ -34,6 +34,7 @@ class SeedreamSettings:
     image_model: str = "doubao-seedream-5-0-pro"
     image_size: str = "2048x1365"
     response_format: str = "b64_json"
+    character_description: str = ""
 
 
 class QwenEvidenceProvider:
@@ -188,6 +189,8 @@ class SeedreamImageProvider:
         # configurable and use the common Images API. Reference images are represented
         # in the prompt until the account's Seedream edit endpoint is configured.
         reference_note = " Keep the same recurring protagonist and visual identity."
+        if self.settings.character_description.strip():
+            reference_note += " Character description: " + self.settings.character_description.strip()
         final_prompt = (
             "Modern cinematic diary comic, warm restrained colors, one coherent panel. "
             "No text, letters, subtitles, speech bubbles, watermark, or legible signage. "
@@ -196,11 +199,15 @@ class SeedreamImageProvider:
         )
 
         def request() -> Any:
+            extra_body: dict[str, Any] = {"sequential_image_generation": "disabled"}
+            if reference_images:
+                extra_body["image"] = [_data_url(Path(path)) for path in reference_images]
             return self.client.images.generate(
                 model=self.settings.image_model,
                 prompt=final_prompt,
                 size=self.settings.image_size,
                 response_format=self.settings.response_format,
+                extra_body=extra_body,
             )
 
         result = _retry(request, self.max_attempts)

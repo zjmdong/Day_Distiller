@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import shutil
 import threading
 import time
 import json
@@ -26,10 +27,11 @@ from .providers import (
     QwenSettings,
     SeedreamImageProvider,
     SeedreamSettings,
-    SmtpMailProvider,
-    SmtpSettings,
+    ResendMailProvider,
+    ResendSettings,
 )
 from .reporting import ReportRenderer, day_report_from_json
+from .resources import bundled_ffmpeg_paths
 from .windows import drive_letters, list_removable_drives, safe_eject, wait_for_new_drive
 
 
@@ -76,7 +78,8 @@ class MainWindow:
         self.active_job_id: str | None = None
 
         self._build_ui()
-        self._load_settings()
+        self._load_cloud_settings()
+        self._load_avatar_profile()
         self.refresh_ports()
         self.refresh_history()
 
@@ -92,12 +95,140 @@ class MainWindow:
         from PySide6.QtWidgets import QTabWidget
 
         self.tabs = QTabWidget()
+        self.tabs.addTab(self._guide_page(), "用户指引")
         self.tabs.addTab(self._device_page(), "设备")
         self.tabs.addTab(self._records_page(), "今日记录")
         self.tabs.addTab(self._distillation_page(), "蒸馏进度")
         self.tabs.addTab(self._history_page(), "报告历史")
-        self.tabs.addTab(self._settings_page(), "设置")
+        self.tabs.addTab(self._avatar_page(), "参考形象")
+        self.tabs.addTab(self._settings_page_v2(), "设置")
         self.window.setCentralWidget(self.tabs)
+
+    def _guide_page(self):
+        from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        title = QLabel("<h1>欢迎使用 AI 每日蒸馏</h1>")
+        guide = QLabel(
+            "<h3>首次配置</h3>"
+            "<ol><li>打开“设置”，填写百炼、DeepSeek、火山方舟和 Resend 参数。</li>"
+            "<li>打开“参考形象”，上传一张清晰的单人参考图并填写简短描述。</li>"
+            "<li>在 Resend 控制台验证发件域名；发件地址必须属于该域名。</li></ol>"
+            "<h3>每天使用</h3>"
+            "<ol><li>出门前携带并启动设备，让设备按计划无感记录。</li>"
+            "<li>回家后唤醒设备并连接电脑。</li>"
+            "<li>在“设备”确认连接，在“今日记录”选择日期。</li>"
+            "<li>进入“蒸馏进度”，点击从设备开始蒸馏。</li>"
+            "<li>邮件被 Resend 接受后，可在“报告历史”查看、修改或重新发送。</li></ol>"
+            "<p><b>隐私提示：</b>IMU和地点记忆留在本地；关键帧和音频发送到百炼，结构化证据发送给DeepSeek，参考形象和分镜发送到火山方舟。</p>"
+            "<p>FFmpeg和IMU分类器已内置，无需安装或配置。</p>"
+        )
+        guide.setWordWrap(True)
+        go_settings = QPushButton("前往设置")
+        go_settings.clicked.connect(lambda: self.tabs.setCurrentIndex(self.tabs.count() - 1))
+        layout.addWidget(title)
+        layout.addWidget(guide)
+        layout.addWidget(go_settings)
+        layout.addStretch(1)
+        return page
+
+    def _avatar_page(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import (
+            QFileDialog,
+            QLabel,
+            QLineEdit,
+            QPlainTextEdit,
+            QPushButton,
+            QVBoxLayout,
+            QWidget,
+        )
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        intro = QLabel(
+            "上传一张清晰、光线均匀、只有一名主体的正面或半身照片。"
+            "描述建议控制在20–100字，例如：短黑发、圆框眼镜、常穿深蓝夹克，漫画中保持温和自然的形象。"
+        )
+        intro.setWordWrap(True)
+        self.avatar_preview = QLabel("尚未选择参考形象")
+        self.avatar_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.avatar_preview.setMinimumHeight(320)
+        self.avatar_preview.setStyleSheet("border: 1px solid #888; background: #202020;")
+        self.avatar_edit = QLineEdit()
+        self.avatar_edit.setReadOnly(True)
+        self.avatar_description_edit = QPlainTextEdit()
+        self.avatar_description_edit.setPlaceholderText("简短描述你的发型、衣着、配饰和希望保持的漫画特征")
+        self.avatar_description_edit.setMaximumHeight(120)
+        choose = QPushButton("选择参考形象")
+        choose.clicked.connect(lambda: self._choose_avatar(QFileDialog))
+        save = QPushButton("保存参考形象")
+        save.clicked.connect(self.save_avatar_profile)
+        layout.addWidget(intro)
+        layout.addWidget(self.avatar_preview, 1)
+        layout.addWidget(self.avatar_edit)
+        layout.addWidget(self.avatar_description_edit)
+        layout.addWidget(choose)
+        layout.addWidget(save)
+        return page
+
+    def _settings_page_v2(self):
+        from PySide6.QtWidgets import QFormLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        notice = QLabel(
+            "API Key仅保存到Windows Credential Manager；Base URL、模型名、发件人与收件人保存在本地SQLite。"
+            " 留空密钥输入框不会删除已经保存的密钥。"
+        )
+        notice.setWordWrap(True)
+        form = QFormLayout()
+        self.api_key_edit = self._password_edit(QLineEdit)
+        self.deepseek_key_edit = self._password_edit(QLineEdit)
+        self.volcengine_key_edit = self._password_edit(QLineEdit)
+        self.resend_key_edit = self._password_edit(QLineEdit)
+        self.qwen_base_url_edit = QLineEdit("https://dashscope.aliyuncs.com/compatible-mode/v1")
+        self.deepseek_base_url_edit = QLineEdit("https://api.deepseek.com")
+        self.volcengine_base_url_edit = QLineEdit("https://ark.cn-beijing.volces.com/api/v3")
+        self.resend_base_url_edit = QLineEdit("https://api.resend.com")
+        self.scene_model_edit = QLineEdit("qwen3.7-plus")
+        self.omni_model_edit = QLineEdit("qwen3.5-omni-plus")
+        self.daily_model_edit = QLineEdit("deepseek-v4-pro")
+        self.image_model_edit = QLineEdit("doubao-seedream-5-0-pro")
+        self.resend_sender_edit = QLineEdit()
+        self.resend_recipient_edit = QLineEdit()
+        form.addRow("百炼 Base URL", self.qwen_base_url_edit)
+        form.addRow("百炼 API Key", self.api_key_edit)
+        form.addRow("关键帧模型", self.scene_model_edit)
+        form.addRow("批量音视频/OCR模型", self.omni_model_edit)
+        form.addRow("DeepSeek Base URL", self.deepseek_base_url_edit)
+        form.addRow("DeepSeek API Key", self.deepseek_key_edit)
+        form.addRow("日报模型", self.daily_model_edit)
+        form.addRow("火山方舟 Base URL", self.volcengine_base_url_edit)
+        form.addRow("火山方舟 API Key", self.volcengine_key_edit)
+        form.addRow("Seedream模型/Endpoint ID", self.image_model_edit)
+        form.addRow("Resend Base URL", self.resend_base_url_edit)
+        form.addRow("Resend API Key", self.resend_key_edit)
+        form.addRow("Resend发件地址", self.resend_sender_edit)
+        form.addRow("日报收件地址", self.resend_recipient_edit)
+        save = QPushButton("保存设置")
+        save.clicked.connect(self.save_cloud_settings)
+        layout.addWidget(notice)
+        layout.addLayout(form)
+        layout.addWidget(save)
+        self.data_usage_label = QLabel()
+        layout.addWidget(self.data_usage_label)
+        layout.addStretch(1)
+        self.refresh_data_usage()
+        return page
+
+    @staticmethod
+    def _password_edit(line_edit_class):
+        edit = line_edit_class()
+        edit.setEchoMode(line_edit_class.EchoMode.Password)
+        edit.setPlaceholderText("留空则保留已保存的密钥")
+        return edit
 
     def _device_page(self):
         from PySide6.QtWidgets import (
@@ -228,7 +359,7 @@ class MainWindow:
         top = QHBoxLayout()
         self.provider_combo = QComboBox()
         self.provider_combo.addItem("离线 Mock（零云端调用）", "mock")
-        self.provider_combo.addItem("中国大陆模型工作流 + SMTP", "mainland")
+        self.provider_combo.addItem("中国大陆模型工作流 + Resend", "mainland")
         self.delete_virtual_source = QCheckBox("邮件成功后删除所选虚拟卡记录")
         self.start_folder_button = QPushButton("从文件夹开始蒸馏")
         self.start_device_button = QPushButton("从当前设备一键蒸馏")
@@ -691,7 +822,7 @@ class MainWindow:
         self.motion_model_edit.setText(settings.get("motion_model", ""))
         self.avatar_edit.setText(settings.get("avatar", ""))
 
-    def _create_pipeline(self, provider_mode: str) -> DistillationPipeline:
+    def _legacy_create_pipeline(self, provider_mode: str) -> DistillationPipeline:
         settings = self.database.get_setting("desktop_v2", {})
         models = settings.get("models", {})
         if provider_mode == "mock":
@@ -757,6 +888,195 @@ class MainWindow:
         if path.is_dir():
             return path / "ffmpeg.exe", path / "ffprobe.exe"
         return path, path.with_name("ffprobe.exe")
+
+    def _legacy_avatar_references(self) -> list[Path]:
+        value = self.database.get_setting("desktop_v2", {}).get("avatar", "")
+        path = Path(value) if value else None
+        return [path] if path and path.is_file() else []
+
+    def _choose_avatar(self, file_dialog) -> None:
+        selected, _ = file_dialog.getOpenFileName(
+            self.window,
+            "选择漫画参考形象",
+            filter="Images (*.jpg *.jpeg *.png *.webp)",
+        )
+        if selected:
+            self.avatar_edit.setText(selected)
+            self._update_avatar_preview(Path(selected))
+
+    def save_avatar_profile(self) -> None:
+        from PIL import Image
+        from PySide6.QtWidgets import QMessageBox
+
+        source = Path(self.avatar_edit.text().strip()) if self.avatar_edit.text().strip() else None
+        description = self.avatar_description_edit.toPlainText().strip()
+        if source is None or not source.is_file():
+            QMessageBox.warning(self.window, "参考形象", "请先选择一张有效图片。")
+            return
+        if not description:
+            QMessageBox.warning(self.window, "参考形象", "请填写一段简短的形象描述。")
+            return
+        try:
+            with Image.open(source) as image:
+                image.verify()
+            profile_dir = self.paths.root / "profile"
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            destination = profile_dir / ("reference" + source.suffix.lower())
+            if source.resolve() != destination.resolve():
+                shutil.copy2(source, destination)
+            settings = self.database.get_setting("desktop_v2", {})
+            settings["avatar"] = str(destination)
+            settings["avatar_description"] = description
+            self.database.set_setting("desktop_v2", settings)
+            self.avatar_edit.setText(str(destination))
+            self._update_avatar_preview(destination)
+        except Exception as exc:
+            QMessageBox.warning(self.window, "参考形象保存失败", str(exc))
+            return
+        QMessageBox.information(self.window, "参考形象", "参考形象和描述已保存在本机。")
+
+    def _update_avatar_preview(self, path: Path) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QPixmap
+
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            self.avatar_preview.setText("无法预览该图片")
+            return
+        self.avatar_preview.setPixmap(
+            pixmap.scaled(
+                self.avatar_preview.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def save_cloud_settings(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        settings = self.database.get_setting("desktop_v2", {})
+        settings.update(
+            {
+                "models": {
+                    "scene": self.scene_model_edit.text().strip(),
+                    "omni": self.omni_model_edit.text().strip(),
+                    "daily": self.daily_model_edit.text().strip(),
+                    "image": self.image_model_edit.text().strip(),
+                },
+                "endpoints": {
+                    "qwen": self.qwen_base_url_edit.text().strip(),
+                    "deepseek": self.deepseek_base_url_edit.text().strip(),
+                    "volcengine": self.volcengine_base_url_edit.text().strip(),
+                    "resend": self.resend_base_url_edit.text().strip(),
+                },
+                "resend": {
+                    "sender": self.resend_sender_edit.text().strip(),
+                    "recipient": self.resend_recipient_edit.text().strip(),
+                },
+            }
+        )
+        self.database.set_setting("desktop_v2", settings)
+        try:
+            for field, credential in (
+                (self.api_key_edit, CredentialName.QWEN_API_KEY),
+                (self.deepseek_key_edit, CredentialName.DEEPSEEK_API_KEY),
+                (self.volcengine_key_edit, CredentialName.VOLCENGINE_API_KEY),
+                (self.resend_key_edit, CredentialName.RESEND_API_KEY),
+            ):
+                if field.text():
+                    self.credentials.set(credential, field.text())
+                    field.clear()
+        except Exception as exc:
+            QMessageBox.warning(self.window, "凭据保存失败", str(exc))
+            return
+        QMessageBox.information(self.window, "设置", "模型、Endpoint和Resend设置已保存。")
+
+    def _load_cloud_settings(self) -> None:
+        settings = self.database.get_setting("desktop_v2", {})
+        models = settings.get("models", {})
+        endpoints = settings.get("endpoints", {})
+        resend = settings.get("resend", {})
+        self.scene_model_edit.setText(models.get("scene", self.scene_model_edit.text()))
+        self.omni_model_edit.setText(models.get("omni", self.omni_model_edit.text()))
+        self.daily_model_edit.setText(models.get("daily", self.daily_model_edit.text()))
+        self.image_model_edit.setText(models.get("image", self.image_model_edit.text()))
+        self.qwen_base_url_edit.setText(endpoints.get("qwen", self.qwen_base_url_edit.text()))
+        self.deepseek_base_url_edit.setText(endpoints.get("deepseek", self.deepseek_base_url_edit.text()))
+        self.volcengine_base_url_edit.setText(endpoints.get("volcengine", self.volcengine_base_url_edit.text()))
+        self.resend_base_url_edit.setText(endpoints.get("resend", self.resend_base_url_edit.text()))
+        self.resend_sender_edit.setText(resend.get("sender", ""))
+        self.resend_recipient_edit.setText(resend.get("recipient", ""))
+
+    def _load_avatar_profile(self) -> None:
+        settings = self.database.get_setting("desktop_v2", {})
+        self.avatar_edit.setText(settings.get("avatar", ""))
+        self.avatar_description_edit.setPlainText(settings.get("avatar_description", ""))
+        path = Path(self.avatar_edit.text()) if self.avatar_edit.text() else None
+        if path and path.is_file():
+            self._update_avatar_preview(path)
+
+    def _create_pipeline(self, provider_mode: str) -> DistillationPipeline:
+        settings = self.database.get_setting("desktop_v2", {})
+        models = settings.get("models", {})
+        endpoints = settings.get("endpoints", {})
+        if provider_mode == "mock":
+            scene = story = batch = image = MockAIProvider()
+            mail = MockMailProvider(self.paths.root / "mock_outbox")
+        else:
+            qwen_key = self.credentials.get(CredentialName.QWEN_API_KEY)
+            deepseek_key = self.credentials.get(CredentialName.DEEPSEEK_API_KEY)
+            volcengine_key = self.credentials.get(CredentialName.VOLCENGINE_API_KEY)
+            resend_key = self.credentials.get(CredentialName.RESEND_API_KEY)
+            if not all((qwen_key, deepseek_key, volcengine_key, resend_key)):
+                raise RuntimeError("请先在设置页保存百炼、DeepSeek、火山方舟和Resend API Key")
+            scene = QwenEvidenceProvider(
+                api_key=qwen_key,
+                settings=QwenSettings(
+                    base_url=endpoints.get("qwen", QwenSettings.base_url),
+                    keyframe_model=models.get("scene", "qwen3.7-plus"),
+                    omni_model=models.get("omni", "qwen3.5-omni-plus"),
+                ),
+            )
+            batch = scene
+            story = DeepSeekStoryProvider(
+                api_key=deepseek_key,
+                settings=DeepSeekSettings(
+                    base_url=endpoints.get("deepseek", DeepSeekSettings.base_url),
+                    daily_model=models.get("daily", "deepseek-v4-pro"),
+                ),
+            )
+            image = SeedreamImageProvider(
+                api_key=volcengine_key,
+                settings=SeedreamSettings(
+                    base_url=endpoints.get("volcengine", SeedreamSettings.base_url),
+                    image_model=models.get("image", "doubao-seedream-5-0-pro"),
+                    character_description=settings.get("avatar_description", ""),
+                ),
+            )
+            resend = settings.get("resend", {})
+            mail = ResendMailProvider(
+                ResendSettings(
+                    sender=resend.get("sender", ""),
+                    recipient=resend.get("recipient", ""),
+                    base_url=endpoints.get("resend", "https://api.resend.com"),
+                ),
+                resend_key,
+            )
+        ffmpeg, ffprobe = bundled_ffmpeg_paths()
+        return DistillationPipeline(
+            self.paths,
+            self.database,
+            scene,
+            story,
+            batch,
+            image,
+            mail,
+            media_preprocessor=MediaPreprocessor(ffmpeg, ffprobe),
+            motion_model_path=None,
+            progress=lambda stage, progress, message: self.events.put(
+                ("progress", (stage, progress, message), None)
+            ),
+        )
 
     def _avatar_references(self) -> list[Path]:
         value = self.database.get_setting("desktop_v2", {}).get("avatar", "")
