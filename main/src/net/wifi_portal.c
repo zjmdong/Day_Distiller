@@ -19,6 +19,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "usb_link.h"
 
 #define WIFI_BIT_CONNECTED BIT0
 #define WIFI_BIT_FAIL BIT1
@@ -149,9 +150,18 @@ static esp_err_t connect_sta(const day_config_t *cfg)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
     set_wifi_low_latency();
     ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "connect failed");
-    EventBits_t bits = xEventGroupWaitBits(s_events, WIFI_BIT_CONNECTED | WIFI_BIT_FAIL,
-                                           pdTRUE, pdFALSE, pdMS_TO_TICKS(15000));
+    EventBits_t bits = 0;
+    int64_t deadline = esp_timer_get_time() + 6000000LL;
+    while (esp_timer_get_time() < deadline && !day_usb_link_maintenance_active()) {
+        bits = xEventGroupWaitBits(s_events, WIFI_BIT_CONNECTED | WIFI_BIT_FAIL,
+                                   pdTRUE, pdFALSE, pdMS_TO_TICKS(100));
+        if (bits) break;
+    }
     s_connecting = false;
+    if (day_usb_link_maintenance_active()) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
+        return ESP_ERR_INVALID_STATE;
+    }
     if (bits & WIFI_BIT_CONNECTED) {
         strlcpy(s_status.sta_ssid, cfg->wifi_ssid, sizeof(s_status.sta_ssid));
         return ESP_OK;
@@ -176,7 +186,7 @@ static esp_err_t sync_sntp(const day_config_t *cfg)
     esp_sntp_init();
     ESP_LOGI(TAG, "SNTP sync start server=%s timezone=%s", server, tz);
 
-    for (int i = 0; i < 20; ++i) {
+    for (int i = 0; i < 12 && !day_usb_link_maintenance_active(); ++i) {
         if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
             time_t now = 0;
             time(&now);
@@ -191,13 +201,14 @@ static esp_err_t sync_sntp(const day_config_t *cfg)
 
 esp_err_t day_wifi_sync_time(const day_config_t *cfg)
 {
+    if (!cfg || cfg->wifi_ssid[0] == '\0') return ESP_ERR_NOT_FOUND;
     esp_err_t ret = day_wifi_init();
     if (ret != ESP_OK) {
         s_status.last_error = ret;
         return ret;
     }
     s_status.retry_count = 0;
-    for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
+    for (uint8_t attempt = 1; attempt <= 1 && !day_usb_link_maintenance_active(); ++attempt) {
         s_status.retry_count = attempt - 1;
         ret = connect_sta(cfg);
         if (ret == ESP_OK) {
@@ -210,7 +221,6 @@ esp_err_t day_wifi_sync_time(const day_config_t *cfg)
         ESP_LOGW(TAG, "Wi-Fi/SNTP attempt %u failed: %s", attempt, esp_err_to_name(ret));
         s_status.retry_count = attempt;
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
-        vTaskDelay(pdMS_TO_TICKS(1000));
     }
     s_status.last_error = ret;
     return ret;
@@ -279,11 +289,13 @@ esp_err_t day_wifi_run_portal_window(uint32_t window_ms)
     ESP_LOGI(TAG, "portal AP running ssid=%s window_ms=%lu", s_status.ap_ssid, (unsigned long)window_ms);
 
     int64_t deadline = esp_timer_get_time() + (int64_t)window_ms * 1000;
-    while (esp_timer_get_time() < deadline) {
+    int64_t hard_deadline = esp_timer_get_time() + 300000000LL;
+    while (esp_timer_get_time() < deadline && esp_timer_get_time() < hard_deadline &&
+           !day_usb_link_maintenance_active()) {
         if (s_status.ap_clients > 0) {
             deadline = esp_timer_get_time() + 30000000LL;
         }
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
     return ESP_OK;
 }

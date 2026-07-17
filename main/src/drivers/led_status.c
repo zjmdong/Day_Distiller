@@ -23,6 +23,8 @@ static struct {
     uint8_t preview_r, preview_g, preview_b, preview_brightness;
     uint8_t brightness;
     uint8_t recording_r, recording_g, recording_b;
+    uint8_t low_battery_percent;
+    int64_t battery_pattern_start_us;
     int64_t battery_pattern_until_us;
     bool battery_lock;
 } s_state = {
@@ -31,6 +33,7 @@ static struct {
     .recording_r = DAY_LED_DEFAULT_RECORDING_R,
     .recording_g = DAY_LED_DEFAULT_RECORDING_G,
     .recording_b = DAY_LED_DEFAULT_RECORDING_B,
+    .low_battery_percent = 20,
 };
 
 static esp_err_t fill_all(uint8_t r, uint8_t g, uint8_t b)
@@ -99,6 +102,7 @@ esp_err_t day_led_apply_config(const day_config_t *config)
     s_state.recording_r = config->led_recording_r;
     s_state.recording_g = config->led_recording_g;
     s_state.recording_b = config->led_recording_b;
+    s_state.low_battery_percent = config->low_battery_percent;
     portEXIT_CRITICAL(&s_lock);
     return ESP_OK;
 }
@@ -123,8 +127,12 @@ esp_err_t day_led_show_battery(const day_battery_status_t *battery)
         return ESP_ERR_INVALID_ARG;
     }
     portENTER_CRITICAL(&s_lock);
-    s_state.battery_lock = battery->soc_percent > 0.1f && battery->soc_percent < 20.0f;
-    s_state.battery_pattern_until_us = esp_timer_get_time() + (s_state.battery_lock ? 5000000 : 1800000);
+    int64_t now = esp_timer_get_time();
+    s_state.battery_lock = battery->available && battery->last_error == ESP_OK &&
+                           battery->soc_percent < s_state.low_battery_percent;
+    bool warning = battery->available && battery->last_error == ESP_OK && battery->soc_percent < 40.0f;
+    s_state.battery_pattern_start_us = now;
+    s_state.battery_pattern_until_us = warning ? now + (s_state.battery_lock ? 5900000 : 900000) : 0;
     portEXIT_CRITICAL(&s_lock);
     return ESP_OK;
 }
@@ -139,7 +147,7 @@ esp_err_t day_led_get_snapshot(day_led_status_snapshot_t *out)
     if (!out) return ESP_ERR_INVALID_ARG;
     int64_t now = esp_timer_get_time(); day_led_mode_t mode;
     portENTER_CRITICAL(&s_lock);
-    mode = s_state.battery_lock ? DAY_LED_LOW_BATTERY : s_state.fatal_error ? DAY_LED_ERROR : s_state.recording ? DAY_LED_RECORDING : (s_state.preview && now < s_state.preview_until_us) ? DAY_LED_RECORDING : s_state.usb_handshake ? DAY_LED_USB_HANDSHAKE : s_state.usb_enumerated ? DAY_LED_USB_ENUMERATED : s_state.base_mode;
+    mode = s_state.battery_pattern_until_us > now ? DAY_LED_LOW_BATTERY : s_state.fatal_error ? DAY_LED_ERROR : s_state.recording ? DAY_LED_RECORDING : (s_state.preview && now < s_state.preview_until_us) ? DAY_LED_RECORDING : s_state.usb_handshake ? DAY_LED_USB_HANDSHAKE : s_state.usb_enumerated ? DAY_LED_USB_ENUMERATED : s_state.base_mode;
     out->brightness_percent = s_state.brightness; out->recording_r = s_state.recording_r; out->recording_g = s_state.recording_g; out->recording_b = s_state.recording_b;
     strlcpy(out->mode, (s_state.preview && now < s_state.preview_until_us) ? "preview" : mode_name(mode), sizeof(out->mode));
     portEXIT_CRITICAL(&s_lock); return ESP_OK;
@@ -148,24 +156,29 @@ esp_err_t day_led_get_snapshot(day_led_status_snapshot_t *out)
 static void led_task(void *arg)
 {
     while (true) {
-        int64_t now = esp_timer_get_time(); uint8_t r=0,g=0,b=0,brightness=100; day_led_mode_t mode;
+        int64_t now = esp_timer_get_time(); uint8_t r=0,g=0,b=0,brightness=100; day_led_mode_t mode; bool preview=false,battery_low=false; int64_t battery_elapsed=0;
         portENTER_CRITICAL(&s_lock);
         if (s_state.preview && now >= s_state.preview_until_us) s_state.preview = false;
-        if (s_state.battery_pattern_until_us && now >= s_state.battery_pattern_until_us) { s_state.battery_pattern_until_us=0; s_state.battery_lock=false; }
-        mode = s_state.battery_lock ? DAY_LED_LOW_BATTERY : s_state.fatal_error ? DAY_LED_ERROR : s_state.recording ? DAY_LED_RECORDING : s_state.preview ? DAY_LED_RECORDING : s_state.usb_handshake ? DAY_LED_USB_HANDSHAKE : s_state.usb_enumerated ? DAY_LED_USB_ENUMERATED : s_state.base_mode;
+        if (s_state.battery_pattern_until_us && now >= s_state.battery_pattern_until_us) s_state.battery_pattern_until_us=0;
+        bool battery_active = s_state.battery_pattern_until_us > now;
+        mode = battery_active ? DAY_LED_LOW_BATTERY : s_state.fatal_error ? DAY_LED_ERROR : s_state.recording ? DAY_LED_RECORDING : s_state.preview ? DAY_LED_RECORDING : s_state.usb_handshake ? DAY_LED_USB_HANDSHAKE : s_state.usb_enumerated ? DAY_LED_USB_ENUMERATED : s_state.base_mode;
+        preview=s_state.preview; battery_low=s_state.battery_lock; battery_elapsed=now-s_state.battery_pattern_start_us;
         brightness = s_state.preview ? s_state.preview_brightness : s_state.brightness;
-        if (s_state.preview) { r=s_state.preview_r;g=s_state.preview_g;b=s_state.preview_b; }
+        if (preview) { r=s_state.preview_r;g=s_state.preview_g;b=s_state.preview_b; }
         else if (mode==DAY_LED_RECORDING) {r=s_state.recording_r;g=s_state.recording_g;b=s_state.recording_b;}
         portEXIT_CRITICAL(&s_lock);
         uint32_t ms=(uint32_t)(now/1000);
-        if (!s_state.preview) {
+        if (!preview) {
             if (mode==DAY_LED_BOOT) r=g=b=24;
             else if (mode==DAY_LED_TIME_SYNC && ((ms/600)%2)==0) g=b=180;
             else if (mode==DAY_LED_WIFI_PORTAL && ((ms/150)%2)==0) b=255;
             else if (mode==DAY_LED_USB_ENUMERATED) { uint32_t phase=ms%2400; uint8_t level=(phase<1200)?(20+phase*180/1200):(200-(phase-1200)*180/1200); g=level; }
             else if (mode==DAY_LED_USB_HANDSHAKE) g=200;
             else if (mode==DAY_LED_ERROR) r=64;
-            else if (mode==DAY_LED_LOW_BATTERY) { if (((ms/150)%2)==0) r=255; }
+            else if (mode==DAY_LED_LOW_BATTERY) {
+                if (battery_elapsed < 900000) { if (((battery_elapsed/150000)%2)==0) { r=255; if (!battery_low) g=100; } }
+                else { uint32_t phase=(uint32_t)(battery_elapsed/1000)%2400; r=(phase<1200)?(20+phase*180/1200):(200-(phase-1200)*180/1200); }
+            }
         }
         fill_all(scale_channel(r,brightness),scale_channel(g,brightness),scale_channel(b,brightness));
         vTaskDelay(pdMS_TO_TICKS(33)); /* >= 30 FPS breathing animation */

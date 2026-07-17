@@ -146,15 +146,6 @@ static void sync_system_from_rtc_if_valid(void)
     }
 }
 
-static bool low_battery_blocking_record(void)
-{
-    day_battery_status_t battery;
-    if (day_battery_read(&battery) != ESP_OK) {
-        return false;
-    }
-    return battery.soc_percent > 0.1f && battery.soc_percent < s_config.low_battery_percent;
-}
-
 static bool is_automatic_wakeup(uint32_t wakeup_causes)
 {
     const uint32_t timer_wake = 1UL << ESP_SLEEP_WAKEUP_TIMER;
@@ -168,7 +159,9 @@ void day_app_run(void)
     ESP_ERROR_CHECK(day_settings_init());
     ESP_ERROR_CHECK(day_settings_get_config(&s_config, &s_config_revision));
     apply_runtime_config(&s_config);
+    day_power_init();
     ESP_ERROR_CHECK(day_status_service_init(&s_config, s_config_revision));
+    day_status_set_low_battery_latched(day_power_low_battery_latched());
     day_usb_link_set_config_apply_callback(apply_config_cb);
 
     if (day_usb_link_should_run_msc_mode()) {
@@ -182,6 +175,15 @@ void day_app_run(void)
     day_led_task_start();
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_apply_config(&s_config));
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_BOOT));
+
+    if (day_power_low_battery_latched()) {
+        ESP_LOGW(TAG, "low-battery sleep lock retained across reset; waiting briefly for USB maintenance");
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        if (!day_usb_link_maintenance_active()) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(day_power_enter_locked_sleep());
+            return;
+        }
+    }
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_battery_init());
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_rtc_init());
@@ -216,20 +218,34 @@ void day_app_run(void)
         };
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_web_start(&web));
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_WIFI_PORTAL));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_run_portal_window(30000));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_run_portal_window(10000));
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_web_stop());
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_stop_portal());
     } else {
         sync_system_from_rtc_if_valid();
     }
 
-    if (!day_usb_link_maintenance_active()) {
-        if (low_battery_blocking_record()) {
-            ESP_LOGW(TAG, "battery below threshold, skipping record");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_LOW_BATTERY));
-            vTaskDelay(pdMS_TO_TICKS(1200));
-        } else if (s_config.auto_record_enabled) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(record_once_cb());
+    if (!day_usb_link_maintenance_active() && s_config.auto_record_enabled) {
+        bool automatic_wakeup = is_automatic_wakeup(wakeup_causes);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(record_once_cb());
+        if (automatic_wakeup) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            day_battery_status_t battery;
+            esp_err_t battery_result = day_battery_read(&battery);
+            if (battery_result != ESP_OK || !battery.available || battery.last_error != ESP_OK) {
+                ESP_LOGW(TAG, "post-record battery read failed; continuing normal sleep");
+            } else if (battery.soc_percent < s_config.low_battery_percent) {
+                ESP_LOGW(TAG, "post-record battery below threshold; latching locked sleep");
+                day_power_latch_low_battery();
+                day_status_set_low_battery_latched(true);
+                ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_show_battery(&battery));
+                vTaskDelay(pdMS_TO_TICKS(5900));
+                ESP_ERROR_CHECK_WITHOUT_ABORT(day_power_enter_locked_sleep());
+                return;
+            } else if (battery.soc_percent < 40.0f) {
+                ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_show_battery(&battery));
+                vTaskDelay(pdMS_TO_TICKS(900));
+            }
         }
     }
 
