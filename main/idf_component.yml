@@ -2,3 +2,5 @@ dependencies:
   espressif/esp_tinyusb: "^2.0.1~1"
   espressif/esp32-camera: "^2.1.6"
   espressif/led_strip: "^3.0.3"
+  espressif/cjson: "^1.7.19"
+  espressif/tinyusb: "0.19.0~3"

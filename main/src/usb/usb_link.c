@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "device_identity.h"
 #include "day_pins.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
@@ -24,12 +25,8 @@
 #include "tinyusb_default_config.h"
 #include "tinyusb_msc.h"
 #include "tusb.h"
+#include "usb_protocol.h"
 
-#define DAY_USB_PROTO_VERSION 1
-#define DAY_USB_PROTO_MAGIC0 'D'
-#define DAY_USB_PROTO_MAGIC1 'D'
-#define DAY_USB_FRAME_MAX 2048
-#define DAY_USB_PAYLOAD_MAX 1600
 #define DAY_USB_MAINTENANCE_TIMEOUT_US (300LL * 1000LL * 1000LL)
 #define DAY_USB_MSC_IDLE_TIMEOUT_US (900LL * 1000LL * 1000LL)
 #define DAY_USB_BOOT_MAGIC 0x44595553UL
@@ -39,45 +36,6 @@ typedef enum {
     DAY_USB_MODE_SERIAL = 0,
     DAY_USB_MODE_MSC,
 } day_usb_mode_t;
-
-typedef enum {
-    DAY_USB_FRAME_REQUEST = 1,
-    DAY_USB_FRAME_RESPONSE = 2,
-    DAY_USB_FRAME_EVENT = 3,
-} day_usb_frame_type_t;
-
-typedef enum {
-    DAY_USB_CMD_HELLO = 1,
-    DAY_USB_CMD_PING = 2,
-    DAY_USB_CMD_GET_STATUS = 3,
-    DAY_USB_CMD_ENTER_MSC = 4,
-    DAY_USB_CMD_EXIT_MSC = 5,
-} day_usb_command_t;
-
-typedef enum {
-    DAY_USB_STATUS_OK = 0,
-    DAY_USB_STATUS_BAD_FRAME = 1,
-    DAY_USB_STATUS_UNSUPPORTED_VERSION = 2,
-    DAY_USB_STATUS_UNSUPPORTED_CMD = 3,
-    DAY_USB_STATUS_INVALID_ARG = 4,
-    DAY_USB_STATUS_BUSY = 5,
-    DAY_USB_STATUS_STORAGE_ERROR = 6,
-    DAY_USB_STATUS_BAD_STATE = 7,
-    DAY_USB_STATUS_TIMEOUT = 8,
-} day_usb_status_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t magic[2];
-    uint8_t version;
-    uint8_t type;
-    uint8_t flags;
-    uint8_t reserved;
-    uint16_t header_len;
-    uint32_t seq;
-    uint16_t cmd;
-    uint16_t status;
-    uint32_t payload_len;
-} day_usb_frame_header_t;
 
 typedef struct {
     uint8_t data[DAY_USB_FRAME_MAX];
@@ -204,19 +162,6 @@ static const char *s_string_desc[] = {
     "Day Distiller TF",
 };
 
-static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
-{
-    crc = ~crc;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int bit = 0; bit < 8; ++bit) {
-            uint32_t mask = -(crc & 1U);
-            crc = (crc >> 1) ^ (0xEDB88320U & mask);
-        }
-    }
-    return ~crc;
-}
-
 static void put_u32_le(uint8_t *dst, uint32_t value)
 {
     dst[0] = (uint8_t)(value & 0xff);
@@ -228,22 +173,6 @@ static void put_u32_le(uint8_t *dst, uint32_t value)
 static uint32_t get_u32_le(const uint8_t *src)
 {
     return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
-}
-
-static const char *status_name(day_usb_status_t status)
-{
-    switch (status) {
-    case DAY_USB_STATUS_OK: return "OK";
-    case DAY_USB_STATUS_BAD_FRAME: return "BAD_FRAME";
-    case DAY_USB_STATUS_UNSUPPORTED_VERSION: return "UNSUPPORTED_VERSION";
-    case DAY_USB_STATUS_UNSUPPORTED_CMD: return "UNSUPPORTED_CMD";
-    case DAY_USB_STATUS_INVALID_ARG: return "INVALID_ARG";
-    case DAY_USB_STATUS_BUSY: return "BUSY";
-    case DAY_USB_STATUS_STORAGE_ERROR: return "STORAGE_ERROR";
-    case DAY_USB_STATUS_BAD_STATE: return "BAD_STATE";
-    case DAY_USB_STATUS_TIMEOUT: return "TIMEOUT";
-    default: return "UNKNOWN";
-    }
 }
 
 static bool boot_flag_valid(void)
@@ -361,7 +290,7 @@ static esp_err_t send_response(uint32_t seq, day_usb_command_t cmd, day_usb_stat
     if (hdr.payload_len) {
         memcpy(frame + sizeof(hdr), json, hdr.payload_len);
     }
-    uint32_t crc = crc32_update(0, frame, sizeof(hdr) + hdr.payload_len);
+    uint32_t crc = day_usb_crc32(0, frame, sizeof(hdr) + hdr.payload_len);
     put_u32_le(frame + sizeof(hdr) + hdr.payload_len, crc);
     return send_slip_bytes(frame, sizeof(hdr) + hdr.payload_len + 4);
 }
@@ -411,13 +340,19 @@ static char *make_status_payload(void)
     }
     bool recording = s_mode == DAY_USB_MODE_SERIAL ? day_recorder_is_active() : false;
     int written = snprintf(payload, DAY_USB_PAYLOAD_MAX,
-                           "{\"protocol\":%d,\"device\":\"Day Distiller\",\"mode\":\"%s\","
-                           "\"maintenance\":%s,\"recording\":%s,\"usb_full_speed\":true,"
+                           "{\"protocol\":%d,\"firmware_version\":\"%s\","
+                           "\"device\":\"Day Distiller\",\"device_id\":\"%s\",\"mode\":\"%s\","
+                           "\"runtime_state\":\"%s\",\"maintenance\":%s,\"recording\":%s,"
+                           "\"usb_full_speed\":true,\"metadata_schemas\":[1],"
                            "\"storage\":%s,"
                            "\"capabilities\":[\"enter_msc\",\"exit_msc\",\"msc_rw\","
                            "\"msc_ro\",\"slip_crc32_json\"]}",
                            DAY_USB_PROTO_VERSION,
+                           DAY_USB_FIRMWARE_VERSION,
+                           day_device_id(),
                            day_usb_link_mode_name(),
+                           s_mode == DAY_USB_MODE_MSC ? "msc_read_only" :
+                           (s_maintenance_active ? "serial_maintenance" : "normal_boot"),
                            s_maintenance_active ? "true" : "false",
                            recording ? "true" : "false",
                            storage);
@@ -434,44 +369,6 @@ static void mark_protocol_activity(void)
     s_last_protocol_us = esp_timer_get_time();
 }
 
-static day_usb_link_access_t parse_access(const uint8_t *payload, size_t len)
-{
-    day_usb_link_access_t access = DAY_USB_LINK_ACCESS_RW;
-    if (!payload || len == 0) {
-        return access;
-    }
-    char *copy = calloc(1, len + 1);
-    if (!copy) {
-        return access;
-    }
-    memcpy(copy, payload, len);
-    const char *access_key = strstr(copy, "\"access\"");
-    if (access_key && strstr(access_key, "\"ro\"")) {
-        access = DAY_USB_LINK_ACCESS_RO;
-    }
-    free(copy);
-    return access;
-}
-
-static bool parse_force(const uint8_t *payload, size_t len)
-{
-    bool force = false;
-    if (!payload || len == 0) {
-        return false;
-    }
-    char *copy = calloc(1, len + 1);
-    if (!copy) {
-        return false;
-    }
-    memcpy(copy, payload, len);
-    const char *force_key = strstr(copy, "\"force\"");
-    if (force_key && strstr(force_key, "true")) {
-        force = true;
-    }
-    free(copy);
-    return force;
-}
-
 static void restart_after_response(void)
 {
     tinyusb_cdcacm_write_flush(s_protocol_port, pdMS_TO_TICKS(200));
@@ -485,11 +382,16 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
     day_usb_command_t cmd = (day_usb_command_t)hdr->cmd;
     day_usb_status_t status = DAY_USB_STATUS_OK;
     char *response = NULL;
+    char reason[64] = "invalid_argument";
 
     switch (cmd) {
     case DAY_USB_CMD_HELLO:
     case DAY_USB_CMD_GET_STATUS:
     case DAY_USB_CMD_PING:
+        if (day_usb_validate_empty_args(payload, hdr->payload_len, reason, sizeof(reason)) != ESP_OK) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
         response = make_status_payload();
         if (!response) {
             status = DAY_USB_STATUS_STORAGE_ERROR;
@@ -504,8 +406,13 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
             status = DAY_USB_STATUS_BUSY;
             break;
         }
-        day_usb_link_access_t access = parse_access(payload, hdr->payload_len);
-        set_boot_flag(access);
+        day_usb_enter_msc_args_t args;
+        if (day_usb_parse_enter_msc_args(payload, hdr->payload_len, &args,
+                                         reason, sizeof(reason)) != ESP_OK) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
+        set_boot_flag((day_usb_link_access_t)args.access);
         response = make_status_payload();
         send_response(hdr->seq, cmd, status, response ? response : "{\"accepted\":true}");
         free(response);
@@ -519,8 +426,13 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
             response = make_status_payload();
             break;
         }
-        bool force = parse_force(payload, hdr->payload_len);
-        if (!s_msc_ejected && !force) {
+        day_usb_exit_msc_args_t args;
+        if (day_usb_parse_exit_msc_args(payload, hdr->payload_len, &args,
+                                        reason, sizeof(reason)) != ESP_OK) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
+        if (!s_msc_ejected && !args.force) {
             status = DAY_USB_STATUS_BAD_STATE;
             response = strdup("{\"error\":\"MSC volume must be ejected before EXIT_MSC\"}");
             break;
@@ -538,8 +450,10 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
     }
 
     if (!response && status != DAY_USB_STATUS_OK) {
-        char fallback[96];
-        snprintf(fallback, sizeof(fallback), "{\"error\":\"%s\"}", status_name(status));
+        char fallback[192];
+        snprintf(fallback, sizeof(fallback),
+                 "{\"error\":\"%s\",\"reason\":\"%s\",\"message\":\"request rejected\"}",
+                 day_usb_status_name(status), reason);
         send_response(hdr->seq, cmd, status, fallback);
     } else {
         send_response(hdr->seq, cmd, status, response ? response : "{}");
@@ -553,7 +467,7 @@ static void process_frame(const uint8_t *frame, size_t len)
         return;
     }
     uint32_t expected_crc = get_u32_le(frame + len - 4);
-    uint32_t actual_crc = crc32_update(0, frame, len - 4);
+    uint32_t actual_crc = day_usb_crc32(0, frame, len - 4);
     if (expected_crc != actual_crc) {
         return;
     }
@@ -657,6 +571,11 @@ static esp_err_t install_tinyusb(day_usb_mode_t mode)
     if (s_tinyusb_started) {
         return ESP_OK;
     }
+    esp_err_t identity_ret = day_device_identity_init();
+    if (identity_ret != ESP_OK) {
+        return identity_ret;
+    }
+    s_string_desc[3] = day_device_usb_serial();
     tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
     tusb_cfg.descriptor.device = mode == DAY_USB_MODE_MSC ? &s_msc_device_desc : &s_serial_device_desc;
     tusb_cfg.descriptor.full_speed_config = mode == DAY_USB_MODE_MSC ? s_msc_fs_desc : s_serial_fs_desc;
