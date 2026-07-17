@@ -4,6 +4,8 @@
 #include <string.h>
 #include <time.h>
 #include "app_config.h"
+#include "device_settings.h"
+#include "device_status.h"
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -122,6 +124,7 @@ esp_err_t day_wifi_init(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     s_initialized = true;
+    s_status.available = true;
     s_status.last_error = ESP_OK;
     return ESP_OK;
 }
@@ -366,9 +369,24 @@ esp_err_t day_wifi_save_credentials_and_connect(day_config_t *cfg, const char *s
     if (!cfg || !ssid) {
         return ESP_ERR_INVALID_ARG;
     }
-    strlcpy(cfg->wifi_ssid, ssid, sizeof(cfg->wifi_ssid));
-    strlcpy(cfg->wifi_password, password ? password : "", sizeof(cfg->wifi_password));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(day_config_save(cfg));
+    if (strnlen(ssid, DAY_WIFI_SSID_MAX + 1) > DAY_WIFI_SSID_MAX ||
+        strnlen(password ? password : "", 64) > 63) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    day_config_t candidate = *cfg;
+    strlcpy(candidate.wifi_ssid, ssid, sizeof(candidate.wifi_ssid));
+    strlcpy(candidate.wifi_password, password ? password : "", sizeof(candidate.wifi_password));
+    day_settings_result_t save_result;
+    esp_err_t save_status = day_settings_replace(&candidate, DAY_SETTINGS_ANY_REVISION, &save_result);
+    if (save_status != ESP_OK) {
+        return save_status;
+    }
+    uint32_t revision = 0;
+    save_status = day_settings_get_config(cfg, &revision);
+    if (save_status != ESP_OK) {
+        return save_status;
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_status_set_config(cfg, revision));
     esp_err_t ret = day_wifi_sync_time(cfg);
     s_status.last_error = ret;
     return ret;

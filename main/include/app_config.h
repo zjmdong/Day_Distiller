@@ -6,5 +6,5 @@
 void day_config_defaults(day_config_t *cfg);
 uint32_t day_config_camera_max_fps(int framesize);
 void day_config_normalize(day_config_t *cfg);
-esp_err_t day_config_load(day_config_t *cfg);
-esp_err_t day_config_save(const day_config_t *cfg);
+bool day_config_record_framesize_valid(int framesize);
+bool day_config_record_fps_valid(uint32_t fps);

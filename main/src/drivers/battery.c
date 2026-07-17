@@ -83,6 +83,7 @@ esp_err_t day_battery_read(day_battery_status_t *status)
     }
     memset(status, 0, sizeof(*status));
     if (!s_dev) {
+        status->available = false;
         status->last_error = ESP_ERR_INVALID_STATE;
         s_last = *status;
         return status->last_error;
@@ -95,6 +96,7 @@ esp_err_t day_battery_read(day_battery_status_t *status)
         ret = read_be16(REG_SOC, &soc);
     }
     if (ret != ESP_OK) {
+        status->available = false;
         status->last_error = ret;
         s_last = *status;
         return ret;
@@ -106,6 +108,7 @@ esp_err_t day_battery_read(day_battery_status_t *status)
         status->soc_percent = 100.0f;
     }
     update_charge_estimate(status);
+    status->available = true;
     status->last_error = ESP_OK;
     s_last = *status;
     return ESP_OK;

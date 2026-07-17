@@ -52,6 +52,7 @@ esp_err_t day_rtc_read(day_rtc_status_t *status)
     }
     memset(status, 0, sizeof(*status));
     if (!s_dev) {
+        status->available = false;
         status->last_error = ESP_ERR_INVALID_STATE;
         s_last = *status;
         return status->last_error;
@@ -60,6 +61,7 @@ esp_err_t day_rtc_read(day_rtc_status_t *status)
     uint8_t raw[7] = {0};
     esp_err_t ret = day_i2c_read_reg(s_dev, REG_SECONDS, raw, sizeof(raw));
     if (ret != ESP_OK) {
+        status->available = false;
         status->last_error = ret;
         s_last = *status;
         return ret;
@@ -98,12 +100,11 @@ esp_err_t day_rtc_read(day_rtc_status_t *status)
                           tm.tm_min == requested.tm_min && tm.tm_hour == requested.tm_hour &&
                           tm.tm_mday == requested.tm_mday && tm.tm_mon == requested.tm_mon &&
                           tm.tm_year == requested.tm_year;
+    status->available = true;
     status->valid = !voltage_low && fields_valid && calendar_exact;
     status->unix_time = status->valid ? now : 0;
     if (status->valid) {
         strftime(status->iso8601, sizeof(status->iso8601), "%Y-%m-%dT%H:%M:%S", &tm);
-    } else {
-        snprintf(status->iso8601, sizeof(status->iso8601), "invalid");
     }
     status->last_error = ESP_OK;
     s_last = *status;

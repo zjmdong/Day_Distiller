@@ -9,6 +9,8 @@
 #include "battery.h"
 #include "board.h"
 #include "camera_service.h"
+#include "device_settings.h"
+#include "device_status.h"
 #include "imu.h"
 #include "led_status.h"
 #include "power_manager.h"
@@ -18,6 +20,7 @@
 #include "usb_link.h"
 #include "web_server.h"
 #include "wifi_portal.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
@@ -28,12 +31,7 @@
 static const char *TAG = "day_app";
 
 static day_config_t s_config;
-static day_battery_status_t s_cached_battery;
-static day_rtc_status_t s_cached_rtc;
-static day_storage_status_t s_cached_storage;
-static int64_t s_battery_status_us;
-static int64_t s_rtc_status_us;
-static int64_t s_storage_status_us;
+static uint32_t s_config_revision;
 
 static void apply_runtime_config(const day_config_t *config)
 {
@@ -57,50 +55,7 @@ static esp_err_t init_nvs(void)
 
 static esp_err_t collect_status(day_device_status_t *status)
 {
-    if (!status) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    memset(status, 0, sizeof(*status));
-    int64_t now_us = esp_timer_get_time();
-    status->config = s_config;
-    status->recording_active = day_recorder_is_active();
-    if (now_us - s_battery_status_us > 1500000LL || s_battery_status_us == 0) {
-        day_battery_read(&s_cached_battery);
-        s_battery_status_us = now_us;
-    }
-    if (now_us - s_rtc_status_us > 1000000LL || s_rtc_status_us == 0) {
-        day_rtc_read(&s_cached_rtc);
-        s_rtc_status_us = now_us;
-    }
-    if (now_us - s_storage_status_us > 2500000LL || s_storage_status_us == 0) {
-        s_cached_storage = day_storage_get_status();
-        s_storage_status_us = now_us;
-    }
-    status->battery = s_cached_battery;
-    status->rtc = s_cached_rtc;
-    status->storage = s_cached_storage;
-    status->camera = day_camera_get_status();
-
-    bool fast_sensors_enabled = !status->recording_active && !status->camera.streaming;
-    if (fast_sensors_enabled) {
-        day_imu_sample_t sample;
-        if (day_imu_read(&sample) == ESP_OK) {
-            (void)sample;
-        }
-        int16_t audio_samples[64];
-        size_t got = 0;
-        if (day_audio_start(s_config.audio_sample_rate_hz) == ESP_OK) {
-            esp_err_t ret = day_audio_read_pcm16(audio_samples, 64, &got, 8);
-            if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) {
-                ESP_LOGD(TAG, "audio status sample failed: %s", esp_err_to_name(ret));
-            }
-        }
-    }
-    status->imu = day_imu_get_status();
-    status->audio = day_audio_get_status();
-    status->wifi = day_wifi_get_status();
-    status->last_record_error = day_recorder_get_last_error();
-    return ESP_OK;
+    return day_status_get_snapshot(status);
 }
 
 static esp_err_t save_config_cb(const day_config_t *config)
@@ -108,8 +63,14 @@ static esp_err_t save_config_cb(const day_config_t *config)
     if (!config) {
         return ESP_ERR_INVALID_ARG;
     }
+    day_config_t previous;
+    uint32_t previous_revision = 0;
+    ESP_RETURN_ON_ERROR(day_settings_get_config(&previous, &previous_revision), TAG,
+                        "settings snapshot failed");
     day_config_t next = *config;
-    day_config_normalize(&next);
+    if (day_recorder_is_active() && day_settings_recording_fields_changed(&previous, &next)) {
+        return ESP_ERR_INVALID_STATE;
+    }
     bool camera_changed = next.camera_framesize != s_config.camera_framesize ||
                           next.camera_preview_framesize != s_config.camera_preview_framesize ||
                           next.camera_record_framesize != s_config.camera_record_framesize ||
@@ -117,8 +78,13 @@ static esp_err_t save_config_cb(const day_config_t *config)
     bool audio_changed = next.audio_sample_rate_hz != s_config.audio_sample_rate_hz;
     bool imu_changed = next.imu_sample_rate_hz != s_config.imu_sample_rate_hz ||
                        next.imu_orientation != s_config.imu_orientation;
-    s_config = next;
+    day_settings_result_t save_result;
+    ESP_RETURN_ON_ERROR(day_settings_replace(&next, previous_revision, &save_result), TAG,
+                        "settings save failed");
+    ESP_RETURN_ON_ERROR(day_settings_get_config(&s_config, &s_config_revision), TAG,
+                        "settings refresh failed");
     apply_runtime_config(&s_config);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_status_set_config(&s_config, s_config_revision));
     if (!day_recorder_is_active()) {
         if (camera_changed) {
             day_camera_deinit();
@@ -130,7 +96,7 @@ static esp_err_t save_config_cb(const day_config_t *config)
             ESP_ERROR_CHECK_WITHOUT_ABORT(day_imu_init(s_config.imu_sample_rate_hz));
         }
     }
-    return day_config_save(&s_config);
+    return ESP_OK;
 }
 
 static esp_err_t record_once_cb(void)
@@ -138,6 +104,8 @@ static esp_err_t record_once_cb(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_RECORDING));
     day_record_paths_t paths;
     esp_err_t ret = day_recorder_record_once(&s_config, &paths);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_status_refresh(DAY_STATUS_REFRESH_BATTERY |
+                                                     DAY_STATUS_REFRESH_STORAGE));
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(ret == ESP_OK ? DAY_LED_BOOT : DAY_LED_ERROR));
     return ret;
 }
@@ -148,6 +116,7 @@ static void sync_rtc_from_system_if_valid(void)
     time(&now);
     if (now > 1609459200) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_rtc_write_time(now));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(day_status_refresh(DAY_STATUS_REFRESH_RTC));
     }
 }
 
@@ -183,16 +152,18 @@ static bool is_automatic_wakeup(uint32_t wakeup_causes)
 
 void day_app_run(void)
 {
+    ESP_ERROR_CHECK(init_nvs());
+    ESP_ERROR_CHECK(day_settings_init());
+    ESP_ERROR_CHECK(day_settings_get_config(&s_config, &s_config_revision));
+    apply_runtime_config(&s_config);
+    ESP_ERROR_CHECK(day_status_service_init(&s_config, s_config_revision));
+
     if (day_usb_link_should_run_msc_mode()) {
         day_usb_link_run_msc_mode();
         return;
     }
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_usb_link_start_serial_mode());
-
-    ESP_ERROR_CHECK(init_nvs());
-    ESP_ERROR_CHECK(day_config_load(&s_config));
-    apply_runtime_config(&s_config);
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_board_init());
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_init());
     day_led_task_start();
@@ -202,6 +173,7 @@ void day_app_run(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_rtc_init());
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_imu_init(s_config.imu_sample_rate_hz));
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_storage_init());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_status_refresh(DAY_STATUS_REFRESH_ALL));
 
     uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
     bool cold_boot = !is_automatic_wakeup(wakeup_causes);

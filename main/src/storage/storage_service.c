@@ -71,6 +71,7 @@ esp_err_t day_storage_init(void)
 
     ret = esp_vfs_fat_sdspi_mount(DAY_SD_MOUNT_POINT, &s_host, &slot_config, &mount_config, &s_card);
     s_status.mounted = ret == ESP_OK;
+    s_status.available = ret == ESP_OK;
     s_status.last_error = ret;
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "TF card mounted");
@@ -108,6 +109,7 @@ esp_err_t day_storage_refresh_status(day_storage_status_t *status)
     }
     esp_err_t ret = esp_vfs_fat_info(DAY_SD_MOUNT_POINT, &status->total_bytes, &status->free_bytes);
     status->mounted = ret == ESP_OK;
+    status->available = ret == ESP_OK;
     status->last_error = ret;
     s_status = *status;
     return ret;
@@ -115,9 +117,7 @@ esp_err_t day_storage_refresh_status(day_storage_status_t *status)
 
 day_storage_status_t day_storage_get_status(void)
 {
-    day_storage_status_t status;
-    day_storage_refresh_status(&status);
-    return status;
+    return s_status;
 }
 
 esp_err_t day_storage_require_free_bytes(uint64_t required_bytes)
@@ -359,6 +359,7 @@ void day_storage_deinit(void)
     if (s_status.mounted) {
         esp_vfs_fat_sdcard_unmount(DAY_SD_MOUNT_POINT, s_card);
         s_status.mounted = false;
+        s_status.available = false;
         s_card = NULL;
         s_partial_records_scanned = false;
     }
