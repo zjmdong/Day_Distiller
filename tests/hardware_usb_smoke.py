@@ -142,6 +142,7 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--log-output", type=Path, required=True)
+    parser.add_argument("--expected-firmware")
     args = parser.parse_args()
 
     assert args.iterations > 0
@@ -150,48 +151,56 @@ def main() -> int:
     captured_log = bytearray()
     sequence = 1
 
-    with serial.Serial(args.log_port, 115200, timeout=0.05) as log_port, serial.Serial(
-        args.protocol_port, 115200, timeout=0.05, write_timeout=1.0
-    ) as protocol_port:
-        log_port.dtr = False
-        log_port.rts = False
-        protocol_port.dtr = False
-        protocol_port.rts = False
-        time.sleep(0.2)
-        captured_log.extend(drain_log(log_port))
+    try:
+        with serial.Serial(args.log_port, 115200, timeout=0.05) as log_port, serial.Serial(
+            args.protocol_port, 115200, timeout=0.05, write_timeout=1.0
+        ) as protocol_port:
+            log_port.dtr = False
+            log_port.rts = False
+            protocol_port.dtr = False
+            protocol_port.rts = False
+            time.sleep(0.2)
+            captured_log.extend(drain_log(log_port))
 
-        hello, elapsed, size = transact(protocol_port, sequence, 1)
-        sequence += 1
-        latencies.append(elapsed)
-        frame_sizes.append(size)
-        assert hello.get("protocol") == 1
-        assert hello.get("device") == "Day Distiller"
-        assert hello.get("mode") == "serial"
-        assert hello.get("maintenance") is True
-
-        ping, elapsed, size = transact(protocol_port, sequence, 2)
-        sequence += 1
-        latencies.append(elapsed)
-        frame_sizes.append(size)
-        assert ping.get("protocol") == 1
-
-        last_status: dict[str, Any] = {}
-        for index in range(args.iterations):
-            last_status, elapsed, size = transact(protocol_port, sequence, 3)
+            hello, elapsed, size = transact(protocol_port, sequence, 1)
             sequence += 1
             latencies.append(elapsed)
             frame_sizes.append(size)
-            assert last_status.get("protocol") == 1
-            forbidden = {"password", "wifi_password", "passphrase", "psk"}.intersection(walk_keys(last_status))
-            assert not forbidden, f"sensitive keys in normal status: {sorted(forbidden)}"
+            assert hello.get("protocol") == 1
+            assert hello.get("device") == "Day Distiller"
+            assert hello.get("mode") == "serial"
+            assert hello.get("maintenance") is True
+            if args.expected_firmware:
+                assert hello.get("firmware_version") == args.expected_firmware
+
+            ping, elapsed, size = transact(protocol_port, sequence, 2)
+            sequence += 1
+            latencies.append(elapsed)
+            frame_sizes.append(size)
+            assert ping.get("protocol") == 1
+
+            last_status: dict[str, Any] = {}
+            for index in range(args.iterations):
+                try:
+                    last_status, elapsed, size = transact(protocol_port, sequence, 3)
+                except Exception as error:
+                    raise AssertionError(f"GET_STATUS iteration {index + 1} failed") from error
+                sequence += 1
+                latencies.append(elapsed)
+                frame_sizes.append(size)
+                assert last_status.get("protocol") == 1
+                for required in ("battery", "rtc", "clock", "wifi", "power", "led"):
+                    assert isinstance(last_status.get(required), dict), f"missing status object: {required}"
+                forbidden = {"password", "wifi_password", "passphrase", "psk"}.intersection(walk_keys(last_status))
+                assert not forbidden, f"sensitive keys in normal status: {sorted(forbidden)}"
+                captured_log.extend(drain_log(log_port))
+                if index + 1 < args.iterations:
+                    time.sleep(args.interval)
+
             captured_log.extend(drain_log(log_port))
-            if index + 1 < args.iterations:
-                time.sleep(args.interval)
-
-        captured_log.extend(drain_log(log_port))
-
-    args.log_output.parent.mkdir(parents=True, exist_ok=True)
-    args.log_output.write_bytes(captured_log)
+    finally:
+        args.log_output.parent.mkdir(parents=True, exist_ok=True)
+        args.log_output.write_bytes(captured_log)
     decoded_log = captured_log.decode("utf-8", errors="replace")
     fatal_markers = ("stack overflow", "guru meditation", "panic'ed", "abort() was called")
     matched = [marker for marker in fatal_markers if marker in decoded_log.lower()]

@@ -1,6 +1,7 @@
 #include "usb_protocol.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include "cJSON.h"
@@ -12,6 +13,13 @@ static void set_reason(char *reason, size_t len, const char *value)
 {
     if (reason && len > 0) {
         snprintf(reason, len, "%s", value ? value : "invalid_argument");
+    }
+}
+
+static void set_field(char *field, size_t len, const char *value)
+{
+    if (field && len > 0) {
+        snprintf(field, len, "%s", value ? value : "");
     }
 }
 
@@ -189,6 +197,125 @@ static bool parse_u32_field(const cJSON *root, const char *name, uint32_t defaul
     return true;
 }
 
+static bool parse_config_u32(const cJSON *root, const char *name, uint32_t *value,
+                             bool *present, const char *path,
+                             char *field, size_t field_len,
+                             char *reason, size_t reason_len)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    *present = item != NULL;
+    if (!item) {
+        return true;
+    }
+    if (!cJSON_IsNumber(item) || item->valuedouble < 0 || item->valuedouble > UINT32_MAX) {
+        set_field(field, field_len, path);
+        set_reason(reason, reason_len, "must_be_unsigned_integer");
+        return false;
+    }
+    uint32_t parsed = (uint32_t)item->valuedouble;
+    if ((double)parsed != item->valuedouble) {
+        set_field(field, field_len, path);
+        set_reason(reason, reason_len, "must_be_unsigned_integer");
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
+static bool parse_config_bool(const cJSON *root, const char *name, bool *value,
+                              bool *present, const char *path,
+                              char *field, size_t field_len,
+                              char *reason, size_t reason_len)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    *present = item != NULL;
+    if (!item) {
+        return true;
+    }
+    if (!cJSON_IsBool(item)) {
+        set_field(field, field_len, path);
+        set_reason(reason, reason_len, "must_be_boolean");
+        return false;
+    }
+    *value = cJSON_IsTrue(item);
+    return true;
+}
+
+static bool parse_config_string(const cJSON *root, const char *name,
+                                char *value, size_t value_len, bool *present,
+                                const char *path, char *field, size_t field_len,
+                                char *reason, size_t reason_len)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    *present = item != NULL;
+    if (!item) {
+        return true;
+    }
+    if (!cJSON_IsString(item) || !item->valuestring || strlen(item->valuestring) >= value_len) {
+        set_field(field, field_len, path);
+        set_reason(reason, reason_len, "must_be_string_within_limit");
+        return false;
+    }
+    strlcpy(value, item->valuestring, value_len);
+    return true;
+}
+
+static bool parse_config_group(const cJSON *patch, const char *name,
+                               const char *const *allowed, size_t allowed_count,
+                               const cJSON **group, char *field, size_t field_len,
+                               char *reason, size_t reason_len)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(patch, name);
+    *group = item;
+    if (!item) {
+        return true;
+    }
+    if (!cJSON_IsObject(item)) {
+        set_field(field, field_len, name);
+        set_reason(reason, reason_len, "must_be_object");
+        return false;
+    }
+    if (!validate_fields(item, allowed, allowed_count, reason, reason_len)) {
+        set_field(field, field_len, name);
+        return false;
+    }
+    return true;
+}
+
+static bool parse_hex_color(const cJSON *root, const char *name,
+                            uint8_t *red, uint8_t *green, uint8_t *blue,
+                            bool *present, const char *path,
+                            char *field, size_t field_len,
+                            char *reason, size_t reason_len)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    *present = item != NULL;
+    if (!item) {
+        return true;
+    }
+    const char *text = cJSON_IsString(item) ? item->valuestring : NULL;
+    if (!text || strlen(text) != 7 || text[0] != '#') {
+        set_field(field, field_len, path);
+        set_reason(reason, reason_len, "must_be_hex_color");
+        return false;
+    }
+    for (size_t i = 1; i < 7; ++i) {
+        if (!isxdigit((unsigned char)text[i])) {
+            set_field(field, field_len, path);
+            set_reason(reason, reason_len, "must_be_hex_color");
+            return false;
+        }
+    }
+    char channel[3] = {0};
+    channel[0] = text[1]; channel[1] = text[2];
+    *red = (uint8_t)strtoul(channel, NULL, 16);
+    channel[0] = text[3]; channel[1] = text[4];
+    *green = (uint8_t)strtoul(channel, NULL, 16);
+    channel[0] = text[5]; channel[1] = text[6];
+    *blue = (uint8_t)strtoul(channel, NULL, 16);
+    return true;
+}
+
 const char *day_usb_status_name(day_usb_status_t status)
 {
     switch (status) {
@@ -288,6 +415,259 @@ esp_err_t day_usb_parse_enter_msc_args(const uint8_t *payload, size_t len,
     }
     cJSON_Delete(root);
     return ESP_OK;
+}
+
+esp_err_t day_usb_parse_get_config_args(const uint8_t *payload, size_t len,
+                                        day_usb_get_config_args_t *args,
+                                        char *field, size_t field_len,
+                                        char *reason, size_t reason_len)
+{
+    if (!args) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(args, 0, sizeof(*args));
+    set_field(field, field_len, "");
+    cJSON *root = parse_object(payload, len, reason, reason_len);
+    if (!root) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    static const char *const allowed[] = {"include_secrets"};
+    bool present = false;
+    bool valid = validate_fields(root, allowed, 1, reason, reason_len) &&
+                 parse_config_bool(root, "include_secrets", &args->include_secrets, &present,
+                                   "include_secrets", field, field_len, reason, reason_len);
+    if (!valid && field && field_len > 0 && field[0] == '\0') {
+        set_field(field, field_len, "request");
+    }
+    cJSON_Delete(root);
+    return valid ? ESP_OK : ESP_ERR_INVALID_ARG;
+}
+
+esp_err_t day_usb_parse_set_config_args(const uint8_t *payload, size_t len,
+                                        const day_config_t *current,
+                                        day_usb_set_config_args_t *args,
+                                        char *field, size_t field_len,
+                                        char *reason, size_t reason_len)
+{
+    if (!current || !args) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(args, 0, sizeof(*args));
+    args->candidate = *current;
+    args->expected_revision = UINT32_MAX;
+    set_field(field, field_len, "");
+    cJSON *root = parse_object(payload, len, reason, reason_len);
+    if (!root) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    static const char *const root_allowed[] = {"expected_revision", "patch"};
+    if (!validate_fields(root, root_allowed, 2, reason, reason_len)) {
+        set_field(field, field_len, "request");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    bool present = false;
+    if (!parse_config_u32(root, "expected_revision", &args->expected_revision, &present,
+                          "expected_revision", field, field_len, reason, reason_len)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    const cJSON *patch = cJSON_GetObjectItemCaseSensitive(root, "patch");
+    if (!patch || !cJSON_IsObject(patch)) {
+        set_field(field, field_len, "patch");
+        set_reason(reason, reason_len, "must_be_object");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    static const char *const patch_allowed[] = {"video", "wifi", "time", "system", "led", "audio", "imu"};
+    if (!validate_fields(patch, patch_allowed, 7, reason, reason_len)) {
+        set_field(field, field_len, "patch");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const cJSON *group = NULL;
+    uint32_t number = 0;
+    bool boolean = false;
+    bool touched = false;
+
+    static const char *const video_allowed[] = {
+        "record_framesize", "jpeg_quality", "record_fps", "preview_framesize", "preview_fps"
+    };
+    if (!parse_config_group(patch, "video", video_allowed, 5, &group,
+                            field, field_len, reason, reason_len)) goto invalid;
+    if (group) {
+        if (!parse_config_u32(group, "record_framesize", &number, &present,
+                              "video.record_framesize", field, field_len, reason, reason_len)) goto invalid;
+        if (present) {
+            if (number > INT32_MAX) {
+                set_field(field, field_len, "video.record_framesize");
+                goto integer_range;
+            }
+            args->candidate.camera_framesize = (int)number;
+            args->candidate.camera_record_framesize = (int)number;
+            touched = true;
+        }
+        if (!parse_config_u32(group, "jpeg_quality", &number, &present,
+                              "video.jpeg_quality", field, field_len, reason, reason_len)) goto invalid;
+        if (present) {
+            if (number > INT32_MAX) {
+                set_field(field, field_len, "video.jpeg_quality");
+                goto integer_range;
+            }
+            args->candidate.camera_jpeg_quality = (int)number;
+            touched = true;
+        }
+        if (!parse_config_u32(group, "record_fps", &number, &present,
+                              "video.record_fps", field, field_len, reason, reason_len)) goto invalid;
+        if (present) { args->candidate.camera_record_fps = number; touched = true; }
+        if (!parse_config_u32(group, "preview_framesize", &number, &present,
+                              "video.preview_framesize", field, field_len, reason, reason_len)) goto invalid;
+        if (present) {
+            if (number > INT32_MAX) {
+                set_field(field, field_len, "video.preview_framesize");
+                goto integer_range;
+            }
+            args->candidate.camera_preview_framesize = (int)number;
+            touched = true;
+        }
+        if (!parse_config_u32(group, "preview_fps", &number, &present,
+                              "video.preview_fps", field, field_len, reason, reason_len)) goto invalid;
+        if (present) { args->candidate.camera_preview_fps = number; touched = true; }
+        if (touched) args->applied_groups |= DAY_USB_CONFIG_GROUP_VIDEO;
+    }
+
+    touched = false;
+    static const char *const wifi_allowed[] = {"ssid", "password"};
+    if (!parse_config_group(patch, "wifi", wifi_allowed, 2, &group,
+                            field, field_len, reason, reason_len)) goto invalid;
+    if (group) {
+        if (!parse_config_string(group, "ssid", args->candidate.wifi_ssid,
+                                 sizeof(args->candidate.wifi_ssid), &present,
+                                 "wifi.ssid", field, field_len, reason, reason_len)) goto invalid;
+        touched |= present;
+        if (!parse_config_string(group, "password", args->candidate.wifi_password,
+                                 sizeof(args->candidate.wifi_password), &present,
+                                 "wifi.password", field, field_len, reason, reason_len)) goto invalid;
+        touched |= present;
+        if (touched) args->applied_groups |= DAY_USB_CONFIG_GROUP_WIFI;
+    }
+
+    touched = false;
+    static const char *const time_allowed[] = {"timezone", "ntp_server"};
+    if (!parse_config_group(patch, "time", time_allowed, 2, &group,
+                            field, field_len, reason, reason_len)) goto invalid;
+    if (group) {
+        if (!parse_config_string(group, "timezone", args->candidate.timezone,
+                                 sizeof(args->candidate.timezone), &present,
+                                 "time.timezone", field, field_len, reason, reason_len)) goto invalid;
+        touched |= present;
+        if (!parse_config_string(group, "ntp_server", args->candidate.ntp_server,
+                                 sizeof(args->candidate.ntp_server), &present,
+                                 "time.ntp_server", field, field_len, reason, reason_len)) goto invalid;
+        touched |= present;
+        if (touched) args->applied_groups |= DAY_USB_CONFIG_GROUP_TIME;
+    }
+
+    touched = false;
+    static const char *const system_allowed[] = {
+        "wake_interval_sec", "auto_record_enabled", "shake_trigger_enabled", "low_battery_percent"
+    };
+    if (!parse_config_group(patch, "system", system_allowed, 4, &group,
+                            field, field_len, reason, reason_len)) goto invalid;
+    if (group) {
+        if (!parse_config_u32(group, "wake_interval_sec", &number, &present,
+                              "system.wake_interval_sec", field, field_len, reason, reason_len)) goto invalid;
+        if (present) { args->candidate.wake_interval_sec = number; touched = true; }
+        if (!parse_config_bool(group, "auto_record_enabled", &boolean, &present,
+                               "system.auto_record_enabled", field, field_len, reason, reason_len)) goto invalid;
+        if (present) { args->candidate.auto_record_enabled = boolean; touched = true; }
+        if (!parse_config_bool(group, "shake_trigger_enabled", &boolean, &present,
+                               "system.shake_trigger_enabled", field, field_len, reason, reason_len)) goto invalid;
+        if (present) { args->candidate.shake_trigger_enabled = boolean; touched = true; }
+        if (!parse_config_u32(group, "low_battery_percent", &number, &present,
+                              "system.low_battery_percent", field, field_len, reason, reason_len)) goto invalid;
+        if (present) {
+            if (number > UINT8_MAX) {
+                set_field(field, field_len, "system.low_battery_percent");
+                goto integer_range;
+            }
+            args->candidate.low_battery_percent = (uint8_t)number;
+            touched = true;
+        }
+        if (touched) args->applied_groups |= DAY_USB_CONFIG_GROUP_SYSTEM;
+    }
+
+    touched = false;
+    static const char *const led_allowed[] = {"brightness_percent", "recording_color"};
+    if (!parse_config_group(patch, "led", led_allowed, 2, &group,
+                            field, field_len, reason, reason_len)) goto invalid;
+    if (group) {
+        if (!parse_config_u32(group, "brightness_percent", &number, &present,
+                              "led.brightness_percent", field, field_len, reason, reason_len)) goto invalid;
+        if (present) {
+            if (number > UINT8_MAX) {
+                set_field(field, field_len, "led.brightness_percent");
+                goto integer_range;
+            }
+            args->candidate.led_brightness_percent = (uint8_t)number;
+            touched = true;
+        }
+        if (!parse_hex_color(group, "recording_color",
+                             &args->candidate.led_recording_r,
+                             &args->candidate.led_recording_g,
+                             &args->candidate.led_recording_b,
+                             &present, "led.recording_color",
+                             field, field_len, reason, reason_len)) goto invalid;
+        touched |= present;
+        if (touched) args->applied_groups |= DAY_USB_CONFIG_GROUP_LED;
+    }
+
+    touched = false;
+    static const char *const audio_allowed[] = {"sample_rate_hz"};
+    if (!parse_config_group(patch, "audio", audio_allowed, 1, &group,
+                            field, field_len, reason, reason_len)) goto invalid;
+    if (group) {
+        if (!parse_config_u32(group, "sample_rate_hz", &number, &present,
+                              "audio.sample_rate_hz", field, field_len, reason, reason_len)) goto invalid;
+        if (present) { args->candidate.audio_sample_rate_hz = number; touched = true; }
+        if (touched) args->applied_groups |= DAY_USB_CONFIG_GROUP_AUDIO;
+    }
+
+    touched = false;
+    static const char *const imu_allowed[] = {"sample_rate_hz", "orientation"};
+    if (!parse_config_group(patch, "imu", imu_allowed, 2, &group,
+                            field, field_len, reason, reason_len)) goto invalid;
+    if (group) {
+        if (!parse_config_u32(group, "sample_rate_hz", &number, &present,
+                              "imu.sample_rate_hz", field, field_len, reason, reason_len)) goto invalid;
+        if (present) { args->candidate.imu_sample_rate_hz = number; touched = true; }
+        if (!parse_config_u32(group, "orientation", &number, &present,
+                              "imu.orientation", field, field_len, reason, reason_len)) goto invalid;
+        if (present) {
+            if (number > UINT8_MAX) {
+                set_field(field, field_len, "imu.orientation");
+                goto integer_range;
+            }
+            args->candidate.imu_orientation = (uint8_t)number;
+            touched = true;
+        }
+        if (touched) args->applied_groups |= DAY_USB_CONFIG_GROUP_IMU;
+    }
+
+    if (args->applied_groups == 0) {
+        set_field(field, field_len, "patch");
+        set_reason(reason, reason_len, "empty_patch");
+        goto invalid;
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
+
+integer_range:
+    set_reason(reason, reason_len, "out_of_range");
+invalid:
+    cJSON_Delete(root);
+    return ESP_ERR_INVALID_ARG;
 }
 
 esp_err_t day_usb_parse_begin_export_args(const uint8_t *payload, size_t len,

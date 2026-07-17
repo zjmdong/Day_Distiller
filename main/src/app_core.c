@@ -58,7 +58,9 @@ static esp_err_t collect_status(day_device_status_t *status)
     return day_status_get_snapshot(status);
 }
 
-static esp_err_t save_config_cb(const day_config_t *config)
+static esp_err_t apply_config_cb(const day_config_t *config,
+                                 uint32_t expected_revision,
+                                 day_settings_result_t *save_result)
 {
     if (!config) {
         return ESP_ERR_INVALID_ARG;
@@ -78,8 +80,12 @@ static esp_err_t save_config_cb(const day_config_t *config)
     bool audio_changed = next.audio_sample_rate_hz != s_config.audio_sample_rate_hz;
     bool imu_changed = next.imu_sample_rate_hz != s_config.imu_sample_rate_hz ||
                        next.imu_orientation != s_config.imu_orientation;
-    day_settings_result_t save_result;
-    ESP_RETURN_ON_ERROR(day_settings_replace(&next, previous_revision, &save_result), TAG,
+    day_settings_result_t local_result;
+    day_settings_result_t *result = save_result ? save_result : &local_result;
+    uint32_t revision_guard = expected_revision == DAY_SETTINGS_ANY_REVISION
+                                  ? previous_revision
+                                  : expected_revision;
+    ESP_RETURN_ON_ERROR(day_settings_replace(&next, revision_guard, result), TAG,
                         "settings save failed");
     ESP_RETURN_ON_ERROR(day_settings_get_config(&s_config, &s_config_revision), TAG,
                         "settings refresh failed");
@@ -97,6 +103,11 @@ static esp_err_t save_config_cb(const day_config_t *config)
         }
     }
     return ESP_OK;
+}
+
+static esp_err_t save_config_cb(const day_config_t *config)
+{
+    return apply_config_cb(config, DAY_SETTINGS_ANY_REVISION, NULL);
 }
 
 static esp_err_t record_once_cb(void)
@@ -157,6 +168,7 @@ void day_app_run(void)
     ESP_ERROR_CHECK(day_settings_get_config(&s_config, &s_config_revision));
     apply_runtime_config(&s_config);
     ESP_ERROR_CHECK(day_status_service_init(&s_config, s_config_revision));
+    day_usb_link_set_config_apply_callback(apply_config_cb);
 
     if (day_usb_link_should_run_msc_mode()) {
         day_usb_link_run_msc_mode();

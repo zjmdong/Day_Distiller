@@ -103,6 +103,15 @@ class UsbProtocolContractTests(unittest.TestCase):
         self.assertIn("day_usb_rx_msg_t *msg = malloc(sizeof(*msg))", source)
         self.assertIn('xTaskCreate(protocol_task, "day_usb_proto", 8192', source)
 
+    def test_cdc_transmit_handles_frames_larger_than_tinyusb_queue(self):
+        source = (ROOT / "main/src/usb/usb_link.c").read_text(encoding="utf-8")
+        defaults = (ROOT / "sdkconfig.defaults").read_text(encoding="utf-8")
+        self.assertIn("CONFIG_TINYUSB_CDC_TX_BUFSIZE=1024", defaults)
+        self.assertIn("size_t queued = tinyusb_cdcacm_write_queue(", source)
+        self.assertIn("offset += queued", source)
+        self.assertIn("offset < encoded_len && queued == 0", source)
+        self.assertIn("free(encoded)", source)
+
     def test_arguments_use_structured_json_not_substring_matching(self):
         link = (ROOT / "main/src/usb/usb_link.c").read_text(encoding="utf-8")
         parser = (ROOT / "main/src/usb/usb_protocol.c").read_text(encoding="utf-8")
@@ -127,7 +136,7 @@ class UsbProtocolContractTests(unittest.TestCase):
             "runtime_state",
             "metadata_schemas",
         ):
-            self.assertIn(f'\\"{field}\\"', source)
+            self.assertIn(f'"{field}"', source)
 
 
 if __name__ == "__main__":

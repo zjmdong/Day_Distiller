@@ -10,7 +10,7 @@ import serial
 from hardware_usb_smoke import transact
 
 
-READ_ONLY_COMMANDS = {1, 2, 3, 4, 5, 10, 11}
+READ_ONLY_COMMANDS = {1, 2, 3, 4, 5, 10, 11, 12}
 
 
 def main() -> int:
@@ -33,6 +33,8 @@ def main() -> int:
         assert not payload.get("export_ids"), "hardware test does not select export transactions"
     if args.command == 5:
         assert payload.get("force") is False, "hardware test requires host ejection before EXIT_MSC"
+    if args.command == 12:
+        assert payload.get("include_secrets") is not True, "generic request tool never prints secrets"
 
     with serial.Serial(args.port, 115200, timeout=0.05, write_timeout=1.0) as port:
         port.dtr = False

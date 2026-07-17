@@ -128,7 +128,8 @@ class AtomicRecordingContractTests(unittest.TestCase):
         self.assertIn('strcmp(device->valuestring, day_device_id())', source)
         self.assertIn('cJSON_AddStringToObject(record, "record_id", records[i].record_id)', source)
         status = (ROOT / "main/src/usb/usb_link.c").read_text(encoding="utf-8")
-        self.assertIn("metadata_schemas\\\":[1,2]", status)
+        self.assertIn("cJSON_CreateIntArray((const int[]){1, 2}, 2)", status)
+        self.assertIn('json_add_item(root, "metadata_schemas", schemas)', status)
 
     def test_avi_uses_observed_frame_span_not_configured_duration(self):
         recorder = (ROOT / "main/src/media/recorder.c").read_text(encoding="utf-8")

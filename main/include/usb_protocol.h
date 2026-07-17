@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "day_types.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -15,7 +16,7 @@ extern "C" {
 #define DAY_USB_FRAME_MAX 2048
 #define DAY_USB_PAYLOAD_MAX 1600
 #define DAY_USB_FRAME_HEADER_LEN 20
-#define DAY_USB_FIRMWARE_VERSION "2.0.1"
+#define DAY_USB_FIRMWARE_VERSION "2.1.0"
 #define DAY_USB_EXPORT_ID_MAX 40
 #define DAY_USB_CLIENT_REQUEST_ID_MAX 64
 #define DAY_USB_EXPORT_IDS_MAX 32
@@ -38,6 +39,9 @@ typedef enum {
     DAY_USB_CMD_END_SESSION = 9,
     DAY_USB_CMD_GET_EXPORT_STATUS = 10,
     DAY_USB_CMD_LIST_RECORD_DATES = 11,
+    DAY_USB_CMD_GET_CONFIG = 12,
+    DAY_USB_CMD_SET_CONFIG = 13,
+    DAY_USB_CMD_PREVIEW_LED = 14,
 } day_usb_command_t;
 
 typedef enum {
@@ -113,6 +117,26 @@ typedef struct {
     char export_id[DAY_USB_EXPORT_ID_MAX];
 } day_usb_export_id_args_t;
 
+typedef struct {
+    bool include_secrets;
+} day_usb_get_config_args_t;
+
+enum {
+    DAY_USB_CONFIG_GROUP_VIDEO = 1U << 0,
+    DAY_USB_CONFIG_GROUP_WIFI = 1U << 1,
+    DAY_USB_CONFIG_GROUP_TIME = 1U << 2,
+    DAY_USB_CONFIG_GROUP_SYSTEM = 1U << 3,
+    DAY_USB_CONFIG_GROUP_LED = 1U << 4,
+    DAY_USB_CONFIG_GROUP_AUDIO = 1U << 5,
+    DAY_USB_CONFIG_GROUP_IMU = 1U << 6,
+};
+
+typedef struct {
+    day_config_t candidate;
+    uint32_t expected_revision;
+    uint32_t applied_groups;
+} day_usb_set_config_args_t;
+
 const char *day_usb_status_name(day_usb_status_t status);
 uint32_t day_usb_crc32(uint32_t crc, const uint8_t *data, size_t len);
 esp_err_t day_usb_validate_empty_args(const uint8_t *payload, size_t len, char *reason, size_t reason_len);
@@ -120,6 +144,15 @@ esp_err_t day_usb_parse_enter_msc_args(const uint8_t *payload, size_t len,
                                        day_usb_enter_msc_args_t *args, char *reason, size_t reason_len);
 esp_err_t day_usb_parse_exit_msc_args(const uint8_t *payload, size_t len,
                                       day_usb_exit_msc_args_t *args, char *reason, size_t reason_len);
+esp_err_t day_usb_parse_get_config_args(const uint8_t *payload, size_t len,
+                                        day_usb_get_config_args_t *args,
+                                        char *field, size_t field_len,
+                                        char *reason, size_t reason_len);
+esp_err_t day_usb_parse_set_config_args(const uint8_t *payload, size_t len,
+                                        const day_config_t *current,
+                                        day_usb_set_config_args_t *args,
+                                        char *field, size_t field_len,
+                                        char *reason, size_t reason_len);
 bool day_usb_export_id_valid(const char *value);
 esp_err_t day_usb_parse_begin_export_args(const uint8_t *payload, size_t len,
                                           day_usb_begin_export_args_t *args, char *reason, size_t reason_len);

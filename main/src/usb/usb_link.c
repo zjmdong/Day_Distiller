@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "cJSON.h"
+#include "device_settings.h"
+#include "device_status.h"
 #include "device_identity.h"
 #include "day_pins.h"
 #include "driver/sdspi_host.h"
@@ -70,6 +73,7 @@ static bool s_msc_read_only;
 static sdmmc_card_t *s_msc_card;
 static tinyusb_msc_storage_handle_t s_msc_storage;
 static bool s_msc_bus_initialized;
+static day_usb_config_apply_callback_t s_config_apply_callback;
 
 enum {
     ITF_NUM_CDC0 = 0,
@@ -186,6 +190,11 @@ const char *day_usb_link_mode_name(void)
     return s_mode == DAY_USB_MODE_MSC ? "msc" : "serial";
 }
 
+void day_usb_link_set_config_apply_callback(day_usb_config_apply_callback_t callback)
+{
+    s_config_apply_callback = callback;
+}
+
 static int usb_log_vprintf(const char *fmt, va_list args)
 {
     if (!s_tinyusb_started || s_mode != DAY_USB_MODE_SERIAL || !tinyusb_cdcacm_initialized(TINYUSB_CDC_ACM_1)) {
@@ -226,25 +235,46 @@ static void cdc_rx_callback(int itf, cdcacm_event_t *event)
 
 static esp_err_t send_slip_bytes(const uint8_t *data, size_t len)
 {
-    static const uint8_t end = 0xC0;
-    static const uint8_t esc = 0xDB;
-    static const uint8_t esc_end = 0xDC;
-    static const uint8_t esc_esc = 0xDD;
-
-    tinyusb_cdcacm_write_queue(s_protocol_port, &end, 1);
+    if (!data || len > DAY_USB_FRAME_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t *encoded = malloc(len * 2 + 2);
+    if (!encoded) {
+        return ESP_ERR_NO_MEM;
+    }
+    size_t encoded_len = 0;
+    encoded[encoded_len++] = 0xC0;
     for (size_t i = 0; i < len; ++i) {
-        if (data[i] == end) {
-            tinyusb_cdcacm_write_queue(s_protocol_port, &esc, 1);
-            tinyusb_cdcacm_write_queue(s_protocol_port, &esc_end, 1);
-        } else if (data[i] == esc) {
-            tinyusb_cdcacm_write_queue(s_protocol_port, &esc, 1);
-            tinyusb_cdcacm_write_queue(s_protocol_port, &esc_esc, 1);
+        if (data[i] == 0xC0) {
+            encoded[encoded_len++] = 0xDB;
+            encoded[encoded_len++] = 0xDC;
+        } else if (data[i] == 0xDB) {
+            encoded[encoded_len++] = 0xDB;
+            encoded[encoded_len++] = 0xDD;
         } else {
-            tinyusb_cdcacm_write_queue(s_protocol_port, &data[i], 1);
+            encoded[encoded_len++] = data[i];
         }
     }
-    tinyusb_cdcacm_write_queue(s_protocol_port, &end, 1);
-    return tinyusb_cdcacm_write_flush(s_protocol_port, pdMS_TO_TICKS(100));
+    encoded[encoded_len++] = 0xC0;
+
+    esp_err_t result = ESP_OK;
+    size_t offset = 0;
+    while (offset < encoded_len) {
+        size_t queued = tinyusb_cdcacm_write_queue(
+            s_protocol_port, encoded + offset, encoded_len - offset);
+        offset += queued;
+        if (offset < encoded_len && queued == 0) {
+            result = tinyusb_cdcacm_write_flush(s_protocol_port, pdMS_TO_TICKS(100));
+            if (result != ESP_OK) {
+                break;
+            }
+        }
+    }
+    if (result == ESP_OK) {
+        result = tinyusb_cdcacm_write_flush(s_protocol_port, pdMS_TO_TICKS(100));
+    }
+    free(encoded);
+    return result;
 }
 
 static esp_err_t send_response(uint32_t seq, day_usb_command_t cmd, day_usb_status_t status, const char *json)
@@ -279,79 +309,405 @@ static esp_err_t send_response(uint32_t seq, day_usb_command_t cmd, day_usb_stat
     return result;
 }
 
-static int storage_status_json(char *buffer, size_t len)
+static bool json_add_bool(cJSON *object, const char *name, bool value)
 {
+    return cJSON_AddBoolToObject(object, name, value) != NULL;
+}
+
+static bool json_add_number(cJSON *object, const char *name, double value)
+{
+    return cJSON_AddNumberToObject(object, name, value) != NULL;
+}
+
+static bool json_add_string(cJSON *object, const char *name, const char *value)
+{
+    return cJSON_AddStringToObject(object, name, value ? value : "") != NULL;
+}
+
+static bool json_add_null(cJSON *object, const char *name)
+{
+    return cJSON_AddNullToObject(object, name) != NULL;
+}
+
+static bool json_add_item(cJSON *object, const char *name, cJSON *item)
+{
+    if (!item) {
+        return false;
+    }
+    if (!cJSON_AddItemToObject(object, name, item)) {
+        cJSON_Delete(item);
+        return false;
+    }
+    return true;
+}
+
+static char *json_print_limited(cJSON *root)
+{
+    if (!root) {
+        return NULL;
+    }
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!payload) {
+        return NULL;
+    }
+    if (strlen(payload) > DAY_USB_PAYLOAD_MAX) {
+        cJSON_free(payload);
+        return NULL;
+    }
+    return payload;
+}
+
+static cJSON *make_storage_object(const day_device_status_t *snapshot)
+{
+    cJSON *storage = cJSON_CreateObject();
+    if (!storage) {
+        return NULL;
+    }
+    bool ok = true;
     if (s_mode == DAY_USB_MODE_MSC) {
         bool ready = s_msc_card != NULL;
         uint32_t sector_size = ready ? s_msc_card->csd.sector_size : 0;
         uint32_t sector_count = ready ? s_msc_card->csd.capacity : 0;
-        uint64_t total_bytes = (uint64_t)sector_count * sector_size;
-        return snprintf(buffer, len,
-                        "{\"ready\":%s,\"mounted\":false,\"usb_exposed\":%s,"
-                        "\"read_only\":%s,\"ejected\":%s,\"sector_size\":%" PRIu32 ","
-                        "\"sector_count\":%" PRIu32 ",\"total_bytes\":%" PRIu64 "}",
-                        ready ? "true" : "false",
-                        ready ? "true" : "false",
-                        s_msc_read_only ? "true" : "false",
-                        s_msc_ejected ? "true" : "false",
-                        sector_size,
-                        sector_count,
-                        total_bytes);
+        ok = json_add_bool(storage, "ready", ready) &&
+             json_add_bool(storage, "mounted", false) &&
+             json_add_bool(storage, "usb_exposed", ready) &&
+             json_add_bool(storage, "read_only", s_msc_read_only) &&
+             json_add_bool(storage, "ejected", s_msc_ejected) &&
+             json_add_number(storage, "sector_size", sector_size) &&
+             json_add_number(storage, "sector_count", sector_count) &&
+             json_add_number(storage, "total_bytes", (double)((uint64_t)sector_count * sector_size));
+        if (snapshot) {
+            ok = ok && json_add_bool(storage, "available", ready) &&
+                 json_add_number(storage, "sample_age_ms", snapshot->storage.sample_age_ms) &&
+                 json_add_number(storage, "last_error", ready ? ESP_OK : ESP_ERR_INVALID_STATE);
+        }
     } else {
-        day_storage_status_t status = day_storage_get_status();
-        return snprintf(buffer, len,
-                        "{\"ready\":%s,\"mounted\":%s,\"usb_exposed\":false,"
-                        "\"total_bytes\":%" PRIu64 ",\"free_bytes\":%" PRIu64 ","
-                        "\"last_error\":%d}",
-                        status.mounted ? "true" : "false",
-                        status.mounted ? "true" : "false",
-                        status.total_bytes,
-                        status.free_bytes,
-                        (int)status.last_error);
+        day_storage_status_t status = snapshot ? snapshot->storage : day_storage_get_status();
+        ok = json_add_bool(storage, "ready", status.mounted) &&
+             json_add_bool(storage, "mounted", status.mounted) &&
+             json_add_bool(storage, "usb_exposed", false) &&
+             json_add_number(storage, "total_bytes", (double)status.total_bytes) &&
+             json_add_number(storage, "free_bytes", (double)status.free_bytes) &&
+             json_add_number(storage, "last_error", status.last_error);
+        if (snapshot) {
+            ok = ok && json_add_bool(storage, "available", status.available) &&
+                 json_add_number(storage, "sample_age_ms", status.sample_age_ms);
+        }
+    }
+    if (!ok) {
+        cJSON_Delete(storage);
+        return NULL;
+    }
+    return storage;
+}
+
+static bool add_capabilities(cJSON *root)
+{
+    static const char *const names[] = {
+        "enter_msc", "exit_msc", "msc_rw", "msc_ro", "slip_crc32_json",
+        "transactional_export_v2", "export_transactions", "export_manifest_v2",
+        "list_record_dates", "get_export_status", "commit_export_delete",
+        "abort_export", "exit_to_maintenance", "end_session",
+        "device_status_v2", "battery_status", "rtc_status",
+        "wifi_status", "power_status", "device_config_v1", "device_config_write",
+        "config_secrets_over_usb", "led_settings",
+    };
+    cJSON *array = cJSON_CreateArray();
+    if (!array) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        cJSON *name = cJSON_CreateString(names[i]);
+        if (!name || !cJSON_AddItemToArray(array, name)) {
+            cJSON_Delete(name);
+            cJSON_Delete(array);
+            return false;
+        }
+    }
+    return json_add_item(root, "capabilities", array);
+}
+
+static const char *charge_state_name(day_charge_state_t state)
+{
+    switch (state) {
+    case DAY_CHARGE_NOT_CHARGING: return "not_charging";
+    case DAY_CHARGE_ESTIMATED: return "estimated";
+    default: return "unknown";
     }
 }
 
-static char *make_status_payload(void)
+static bool add_status_details(cJSON *root, const day_device_status_t *status)
 {
-    char storage[384];
-    int storage_len = storage_status_json(storage, sizeof(storage));
-    if (storage_len < 0 || storage_len >= (int)sizeof(storage)) {
+    if (!json_add_number(root, "status_schema", status->schema_version) ||
+        !json_add_number(root, "config_revision", status->config_revision) ||
+        !json_add_number(root, "snapshot_monotonic_ms", (double)status->snapshot_monotonic_ms) ||
+        !json_add_number(root, "last_record_error", status->last_record_error)) {
+        return false;
+    }
+
+    cJSON *battery = cJSON_CreateObject();
+    if (!battery) {
+        return false;
+    }
+    if (!json_add_bool(battery, "available", status->battery.available) ||
+        !(status->battery.available ? json_add_number(battery, "soc_percent", status->battery.soc_percent)
+                                   : json_add_null(battery, "soc_percent")) ||
+        !(status->battery.available ? json_add_number(battery, "voltage_v", status->battery.voltage_v)
+                                   : json_add_null(battery, "voltage_v")) ||
+        !json_add_string(battery, "charge_state", charge_state_name(status->battery.charge_state)) ||
+        !json_add_number(battery, "confidence", status->battery.charge_confidence) ||
+        !json_add_number(battery, "sample_age_ms", status->battery.sample_age_ms) ||
+        !json_add_number(battery, "last_error", status->battery.last_error)) {
+        cJSON_Delete(battery);
+        return false;
+    }
+    if (!json_add_item(root, "battery", battery)) return false;
+
+    cJSON *rtc = cJSON_CreateObject();
+    if (!rtc) {
+        return false;
+    }
+    if (!json_add_bool(rtc, "available", status->rtc.available) ||
+        !json_add_bool(rtc, "valid", status->rtc.valid) ||
+        !(status->rtc.valid ? json_add_number(rtc, "unix_time", (double)status->rtc.unix_time)
+                            : json_add_null(rtc, "unix_time")) ||
+        !(status->rtc.valid ? json_add_string(rtc, "iso8601", status->rtc.iso8601)
+                            : json_add_null(rtc, "iso8601")) ||
+        !json_add_number(rtc, "sample_age_ms", status->rtc.sample_age_ms) ||
+        !json_add_number(rtc, "last_error", status->rtc.last_error)) {
+        cJSON_Delete(rtc);
+        return false;
+    }
+    if (!json_add_item(root, "rtc", rtc)) return false;
+
+    cJSON *clock = cJSON_CreateObject();
+    if (!clock) {
+        return false;
+    }
+    if (!json_add_bool(clock, "system_valid", status->clock.system_valid) ||
+        !json_add_string(clock, "timezone", status->clock.timezone) ||
+        !json_add_string(clock, "source", status->clock.source) ||
+        !json_add_string(clock, "last_sync_source", status->clock.last_sync_source) ||
+        !(status->clock.last_sync_unix > 0
+              ? json_add_number(clock, "last_sync_unix", (double)status->clock.last_sync_unix)
+              : json_add_null(clock, "last_sync_unix"))) {
+        cJSON_Delete(clock);
+        return false;
+    }
+    if (!json_add_item(root, "clock", clock)) return false;
+
+    cJSON *wifi = cJSON_CreateObject();
+    if (!wifi) {
+        return false;
+    }
+    if (!json_add_bool(wifi, "available", status->wifi.available) ||
+        !json_add_bool(wifi, "configured", status->config.wifi_ssid[0] != '\0') ||
+        !json_add_bool(wifi, "sta_connected", status->wifi.sta_connected) ||
+        !json_add_bool(wifi, "ap_running", status->wifi.ap_running) ||
+        !json_add_number(wifi, "ap_clients", status->wifi.ap_clients) ||
+        !json_add_bool(wifi, "time_synced", status->wifi.time_synced) ||
+        !json_add_string(wifi, "ssid", status->config.wifi_ssid) ||
+        !json_add_string(wifi, "ip", status->wifi.ip_addr) ||
+        !json_add_null(wifi, "rssi") ||
+        !json_add_number(wifi, "last_error", status->wifi.last_error)) {
+        cJSON_Delete(wifi);
+        return false;
+    }
+    if (!json_add_item(root, "wifi", wifi)) return false;
+
+    cJSON *power = cJSON_CreateObject();
+    if (!power) {
+        return false;
+    }
+    if (!json_add_string(power, "wake_reason", status->power.wake_reason) ||
+        !json_add_string(power, "reset_reason", status->power.reset_reason) ||
+        !json_add_bool(power, "low_battery_latched", status->power.low_battery_latched) ||
+        !json_add_bool(power, "timer_wake_enabled", status->power.timer_wake_enabled) ||
+        !json_add_number(power, "next_wake_sec", status->power.next_wake_sec)) {
+        cJSON_Delete(power);
+        return false;
+    }
+    if (!json_add_item(root, "power", power)) return false;
+
+    char color[8];
+    day_settings_format_recording_color(&status->config, color);
+    cJSON *led = cJSON_CreateObject();
+    if (!led) {
+        return false;
+    }
+    if (!json_add_string(led, "mode", status->led.mode) ||
+        !json_add_number(led, "brightness_percent", status->led.brightness_percent) ||
+        !json_add_string(led, "recording_color", color)) {
+        cJSON_Delete(led);
+        return false;
+    }
+    if (!json_add_item(root, "led", led)) return false;
+
+    return true;
+}
+
+static char *make_status_payload(bool detailed)
+{
+    day_device_status_t snapshot;
+    day_device_status_t *status = NULL;
+    if (detailed) {
+        if (day_status_get_snapshot(&snapshot) != ESP_OK) {
+            return NULL;
+        }
+        status = &snapshot;
+    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON *schemas = cJSON_CreateIntArray((const int[]){1, 2}, 2);
+    char session_id[17];
+    snprintf(session_id, sizeof(session_id), "%016" PRIx64, day_usb_session_id());
+    bool recording = status ? status->recording_active
+                            : (s_mode == DAY_USB_MODE_SERIAL ? day_recorder_is_active() : false);
+    if (!root || !schemas ||
+        !json_add_number(root, "protocol", DAY_USB_PROTO_VERSION) ||
+        !json_add_string(root, "firmware_version", DAY_USB_FIRMWARE_VERSION) ||
+        !json_add_string(root, "device", "Day Distiller") ||
+        !json_add_string(root, "device_id", day_device_id()) ||
+        !json_add_string(root, "mode", day_usb_link_mode_name()) ||
+        !json_add_string(root, "runtime_state",
+                         s_mode == DAY_USB_MODE_MSC ? "msc_read_only" :
+                         (s_maintenance_active ? "serial_maintenance" : "normal_boot")) ||
+        !json_add_string(root, "session_id", session_id) ||
+        !json_add_bool(root, "maintenance", s_maintenance_active) ||
+        !json_add_bool(root, "recording", recording) ||
+        !json_add_bool(root, "usb_full_speed", true)) {
+        cJSON_Delete(schemas);
+        cJSON_Delete(root);
         return NULL;
     }
-    char *payload = malloc(DAY_USB_PAYLOAD_MAX);
-    if (!payload) {
+    if (!json_add_item(root, "metadata_schemas", schemas)) {
+        cJSON_Delete(root);
         return NULL;
     }
-    bool recording = s_mode == DAY_USB_MODE_SERIAL ? day_recorder_is_active() : false;
-    int written = snprintf(payload, DAY_USB_PAYLOAD_MAX,
-                           "{\"protocol\":%d,\"firmware_version\":\"%s\","
-                           "\"device\":\"Day Distiller\",\"device_id\":\"%s\",\"mode\":\"%s\","
-                           "\"runtime_state\":\"%s\",\"session_id\":\"%016" PRIx64 "\","
-                           "\"maintenance\":%s,\"recording\":%s,"
-                           "\"usb_full_speed\":true,\"metadata_schemas\":[1,2],\"active_exports\":%u,"
-                           "\"storage\":%s,"
-                           "\"capabilities\":[\"enter_msc\",\"exit_msc\",\"msc_rw\","
-                           "\"msc_ro\",\"slip_crc32_json\",\"transactional_export_v2\","
-                           "\"export_transactions\",\"export_manifest_v2\","
-                           "\"list_record_dates\",\"get_export_status\","
-                           "\"commit_export_delete\",\"abort_export\",\"exit_to_maintenance\","
-                           "\"end_session\"]}",
-                           DAY_USB_PROTO_VERSION,
-                           DAY_USB_FIRMWARE_VERSION,
-                           day_device_id(),
-                           day_usb_link_mode_name(),
-                           s_mode == DAY_USB_MODE_MSC ? "msc_read_only" :
-                           (s_maintenance_active ? "serial_maintenance" : "normal_boot"),
-                           day_usb_session_id(),
-                           s_maintenance_active ? "true" : "false",
-                           recording ? "true" : "false",
-                           (unsigned)day_export_active_count(),
-                           storage);
-    if (written < 0 || written >= DAY_USB_PAYLOAD_MAX) {
-        free(payload);
+    if (!json_add_number(root, "active_exports", day_export_active_count()) ||
+        !json_add_item(root, "storage", make_storage_object(status)) ||
+        (!detailed && !add_capabilities(root)) ||
+        (detailed && !add_status_details(root, status))) {
+        cJSON_Delete(root);
         return NULL;
     }
-    return payload;
+    return json_print_limited(root);
+}
+
+static bool add_config_group(cJSON *root, const char *name, cJSON *group)
+{
+    if (!group) {
+        return false;
+    }
+    return json_add_item(root, name, group);
+}
+
+static char *make_config_payload(bool include_secrets)
+{
+    day_settings_snapshot_t settings;
+    if (day_settings_get(&settings) != ESP_OK) {
+        return NULL;
+    }
+    cJSON *root = cJSON_CreateObject();
+    if (!root || !json_add_number(root, "schema_version", settings.schema_version) ||
+        !json_add_number(root, "revision", settings.revision)) {
+        cJSON_Delete(root);
+        return NULL;
+    }
+
+    cJSON *group = cJSON_CreateObject();
+    if (!group || !json_add_number(group, "record_framesize", settings.config.camera_record_framesize) ||
+        !json_add_number(group, "jpeg_quality", settings.config.camera_jpeg_quality) ||
+        !json_add_number(group, "record_fps", settings.config.camera_record_fps) ||
+        !json_add_number(group, "preview_framesize", settings.config.camera_preview_framesize) ||
+        !json_add_number(group, "preview_fps", settings.config.camera_preview_fps)) {
+        cJSON_Delete(group); cJSON_Delete(root); return NULL;
+    }
+    if (!add_config_group(root, "video", group)) { cJSON_Delete(root); return NULL; }
+
+    group = cJSON_CreateObject();
+    if (!group || !json_add_string(group, "ssid", settings.config.wifi_ssid) ||
+        !json_add_bool(group, "password_set", settings.config.wifi_password[0] != '\0') ||
+        (include_secrets && !json_add_string(group, "password", settings.config.wifi_password))) {
+        cJSON_Delete(group); cJSON_Delete(root); return NULL;
+    }
+    if (!add_config_group(root, "wifi", group)) { cJSON_Delete(root); return NULL; }
+
+    group = cJSON_CreateObject();
+    if (!group || !json_add_string(group, "timezone", settings.config.timezone) ||
+        !json_add_string(group, "ntp_server", settings.config.ntp_server)) {
+        cJSON_Delete(group); cJSON_Delete(root); return NULL;
+    }
+    if (!add_config_group(root, "time", group)) { cJSON_Delete(root); return NULL; }
+
+    group = cJSON_CreateObject();
+    if (!group || !json_add_number(group, "wake_interval_sec", settings.config.wake_interval_sec) ||
+        !json_add_bool(group, "auto_record_enabled", settings.config.auto_record_enabled) ||
+        !json_add_bool(group, "shake_trigger_enabled", settings.config.shake_trigger_enabled) ||
+        !json_add_number(group, "low_battery_percent", settings.config.low_battery_percent)) {
+        cJSON_Delete(group); cJSON_Delete(root); return NULL;
+    }
+    if (!add_config_group(root, "system", group)) { cJSON_Delete(root); return NULL; }
+
+    char color[8];
+    day_settings_format_recording_color(&settings.config, color);
+    group = cJSON_CreateObject();
+    if (!group || !json_add_number(group, "brightness_percent", settings.config.led_brightness_percent) ||
+        !json_add_string(group, "recording_color", color)) {
+        cJSON_Delete(group); cJSON_Delete(root); return NULL;
+    }
+    if (!add_config_group(root, "led", group)) { cJSON_Delete(root); return NULL; }
+
+    group = cJSON_CreateObject();
+    if (!group || !json_add_number(group, "sample_rate_hz", settings.config.audio_sample_rate_hz)) {
+        cJSON_Delete(group); cJSON_Delete(root); return NULL;
+    }
+    if (!add_config_group(root, "audio", group)) { cJSON_Delete(root); return NULL; }
+
+    group = cJSON_CreateObject();
+    if (!group || !json_add_number(group, "sample_rate_hz", settings.config.imu_sample_rate_hz) ||
+        !json_add_number(group, "orientation", settings.config.imu_orientation)) {
+        cJSON_Delete(group); cJSON_Delete(root); return NULL;
+    }
+    if (!add_config_group(root, "imu", group)) { cJSON_Delete(root); return NULL; }
+    return json_print_limited(root);
+}
+
+static char *make_set_config_payload(const day_settings_result_t *result, uint32_t groups)
+{
+    static const struct {
+        uint32_t bit;
+        const char *name;
+    } group_names[] = {
+        {DAY_USB_CONFIG_GROUP_VIDEO, "video"},
+        {DAY_USB_CONFIG_GROUP_WIFI, "wifi"},
+        {DAY_USB_CONFIG_GROUP_TIME, "time"},
+        {DAY_USB_CONFIG_GROUP_SYSTEM, "system"},
+        {DAY_USB_CONFIG_GROUP_LED, "led"},
+        {DAY_USB_CONFIG_GROUP_AUDIO, "audio"},
+        {DAY_USB_CONFIG_GROUP_IMU, "imu"},
+    };
+    cJSON *root = cJSON_CreateObject();
+    cJSON *applied = cJSON_CreateArray();
+    if (!root || !applied || !json_add_bool(root, "ok", true) ||
+        !json_add_number(root, "revision", result->revision) ||
+        !json_add_bool(root, "changed", result->changed) ||
+        !json_add_bool(root, "reboot_required", false)) {
+        cJSON_Delete(applied); cJSON_Delete(root); return NULL;
+    }
+    for (size_t i = 0; i < sizeof(group_names) / sizeof(group_names[0]); ++i) {
+        if ((groups & group_names[i].bit) == 0) {
+            continue;
+        }
+        cJSON *name = cJSON_CreateString(group_names[i].name);
+        if (!name || !cJSON_AddItemToArray(applied, name)) {
+            cJSON_Delete(name); cJSON_Delete(applied); cJSON_Delete(root); return NULL;
+        }
+    }
+    if (!json_add_item(root, "applied", applied)) {
+        cJSON_Delete(root); return NULL;
+    }
+    return json_print_limited(root);
 }
 
 static void mark_protocol_activity(void)
@@ -389,25 +745,50 @@ static day_usb_status_t export_error_status(esp_err_t error, const char *reason)
     return DAY_USB_STATUS_STORAGE_ERROR;
 }
 
+static day_usb_status_t config_error_status(esp_err_t error)
+{
+    if (error == ESP_ERR_INVALID_ARG) {
+        return DAY_USB_STATUS_INVALID_ARG;
+    }
+    if (error == ESP_ERR_INVALID_STATE) {
+        return DAY_USB_STATUS_BAD_STATE;
+    }
+    if (error == ESP_ERR_TIMEOUT) {
+        return DAY_USB_STATUS_TIMEOUT;
+    }
+    return DAY_USB_STATUS_STORAGE_ERROR;
+}
+
 static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *payload)
 {
     mark_protocol_activity();
     day_usb_command_t cmd = (day_usb_command_t)hdr->cmd;
     day_usb_status_t status = DAY_USB_STATUS_OK;
     char *response = NULL;
+    char field[DAY_SETTINGS_FIELD_MAX] = "";
     char reason[64] = "invalid_argument";
 
     switch (cmd) {
     case DAY_USB_CMD_HELLO:
-    case DAY_USB_CMD_GET_STATUS:
     case DAY_USB_CMD_PING:
         if (day_usb_validate_empty_args(payload, hdr->payload_len, reason, sizeof(reason)) != ESP_OK) {
             status = DAY_USB_STATUS_INVALID_ARG;
             break;
         }
-        response = make_status_payload();
+        response = make_status_payload(false);
         if (!response) {
             status = DAY_USB_STATUS_STORAGE_ERROR;
+        }
+        break;
+    case DAY_USB_CMD_GET_STATUS:
+        if (day_usb_validate_empty_args(payload, hdr->payload_len, reason, sizeof(reason)) != ESP_OK) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
+        response = make_status_payload(true);
+        if (!response) {
+            status = DAY_USB_STATUS_STORAGE_ERROR;
+            snprintf(reason, sizeof(reason), "status_payload_unavailable");
         }
         break;
     case DAY_USB_CMD_ENTER_MSC: {
@@ -440,7 +821,7 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
             status = DAY_USB_STATUS_STORAGE_ERROR;
             break;
         }
-        response = make_status_payload();
+        response = make_status_payload(false);
         send_response(hdr->seq, cmd, status, response ? response : "{\"accepted\":true}");
         free(response);
         day_storage_deinit();
@@ -580,6 +961,76 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
         }
         break;
     }
+    case DAY_USB_CMD_GET_CONFIG: {
+        if (s_mode != DAY_USB_MODE_SERIAL) {
+            status = DAY_USB_STATUS_BAD_STATE;
+            snprintf(reason, sizeof(reason), "serial_maintenance_required");
+            break;
+        }
+        day_usb_get_config_args_t args;
+        if (day_usb_parse_get_config_args(payload, hdr->payload_len, &args,
+                                          field, sizeof(field), reason, sizeof(reason)) != ESP_OK) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
+        response = make_config_payload(args.include_secrets);
+        if (!response) {
+            status = DAY_USB_STATUS_STORAGE_ERROR;
+            snprintf(reason, sizeof(reason), "config_payload_unavailable");
+        }
+        break;
+    }
+    case DAY_USB_CMD_SET_CONFIG: {
+        if (s_mode != DAY_USB_MODE_SERIAL) {
+            status = DAY_USB_STATUS_BAD_STATE;
+            snprintf(reason, sizeof(reason), "serial_maintenance_required");
+            break;
+        }
+        if (day_recorder_is_active()) {
+            status = DAY_USB_STATUS_BUSY;
+            snprintf(reason, sizeof(reason), "recording_active");
+            break;
+        }
+        if (!s_config_apply_callback) {
+            status = DAY_USB_STATUS_BAD_STATE;
+            snprintf(reason, sizeof(reason), "config_apply_unavailable");
+            break;
+        }
+        day_settings_snapshot_t settings;
+        esp_err_t result = day_settings_get(&settings);
+        if (result != ESP_OK) {
+            status = config_error_status(result);
+            snprintf(reason, sizeof(reason), "settings_snapshot_failed");
+            break;
+        }
+        day_usb_set_config_args_t args;
+        if (day_usb_parse_set_config_args(payload, hdr->payload_len, &settings.config, &args,
+                                          field, sizeof(field), reason, sizeof(reason)) != ESP_OK) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
+        uint32_t expected_revision = args.expected_revision == UINT32_MAX
+                                         ? settings.revision
+                                         : args.expected_revision;
+        day_settings_result_t applied = {0};
+        result = s_config_apply_callback(&args.candidate, expected_revision, &applied);
+        if (result != ESP_OK) {
+            status = config_error_status(result);
+            if (applied.field[0]) {
+                strlcpy(field, applied.field, sizeof(field));
+            }
+            if (applied.reason[0]) {
+                strlcpy(reason, applied.reason, sizeof(reason));
+            }
+            break;
+        }
+        response = make_set_config_payload(&applied, args.applied_groups);
+        if (!response) {
+            status = DAY_USB_STATUS_STORAGE_ERROR;
+            snprintf(reason, sizeof(reason), "config_result_unavailable");
+        }
+        break;
+    }
     case DAY_USB_CMD_EXIT_MSC: {
         day_usb_exit_msc_args_t args;
         if (day_usb_parse_exit_msc_args(payload, hdr->payload_len, &args,
@@ -594,7 +1045,7 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
                 day_usb_session_end();
                 s_maintenance_active = false;
             }
-            response = make_status_payload();
+            response = make_status_payload(false);
             break;
         }
         if (!s_msc_ejected && !args.force) {
@@ -607,7 +1058,7 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
         } else {
             day_usb_session_end();
         }
-        response = make_status_payload();
+        response = make_status_payload(false);
         send_response(hdr->seq, cmd, status, response ? response : "{\"accepted\":true}");
         free(response);
         restart_after_response();
@@ -622,7 +1073,7 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
             status = DAY_USB_STATUS_INVALID_ARG;
             break;
         }
-        response = make_status_payload();
+        response = make_status_payload(false);
         send_response(hdr->seq, cmd, status, response ? response : "{\"ended\":true}");
         free(response);
         tinyusb_cdcacm_write_flush(s_protocol_port, pdMS_TO_TICKS(200));
@@ -635,10 +1086,11 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
     }
 
     if (!response && status != DAY_USB_STATUS_OK) {
-        char fallback[192];
+        char fallback[256];
         snprintf(fallback, sizeof(fallback),
-                 "{\"error\":\"%s\",\"reason\":\"%s\",\"message\":\"request rejected\"}",
-                 day_usb_status_name(status), reason);
+                 "{\"error\":\"%s\",\"field\":\"%s\",\"reason\":\"%s\","
+                 "\"message\":\"request rejected\"}",
+                 day_usb_status_name(status), field, reason);
         send_response(hdr->seq, cmd, status, fallback);
     } else {
         send_response(hdr->seq, cmd, status, response ? response : "{}");
