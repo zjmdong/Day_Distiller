@@ -78,7 +78,7 @@ class UsbConfigStatusV21ContractTests(unittest.TestCase):
             "led_settings",
         ):
             self.assertIn(f'"{capability}"', source)
-        self.assertNotIn('"led_preview"', source)
+        self.assertIn('"led_preview"', source)
         self.assertIn("strlen(payload) > DAY_USB_PAYLOAD_MAX", source)
         self.assertIn("cJSON_free(payload)", source)
 

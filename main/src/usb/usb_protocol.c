@@ -443,6 +443,35 @@ esp_err_t day_usb_parse_get_config_args(const uint8_t *payload, size_t len,
     return valid ? ESP_OK : ESP_ERR_INVALID_ARG;
 }
 
+esp_err_t day_usb_parse_preview_led_args(const uint8_t *payload, size_t len,
+                                         day_usb_preview_led_args_t *args,
+                                         char *field, size_t field_len,
+                                         char *reason, size_t reason_len)
+{
+    if (!args) return ESP_ERR_INVALID_ARG;
+    memset(args, 0, sizeof(*args)); set_field(field, field_len, "");
+    cJSON *root = parse_object(payload, len, reason, reason_len);
+    if (!root) return ESP_ERR_INVALID_ARG;
+    static const char *const allowed[] = {"color", "brightness_percent", "duration_ms"};
+    bool color_present=false, brightness_present=false, duration_present=false;
+    uint32_t brightness=0, duration=0;
+    bool valid = validate_fields(root, allowed, 3, reason, reason_len) &&
+        parse_hex_color(root, "color", &args->red, &args->green, &args->blue,
+                        &color_present, "color", field, field_len, reason, reason_len) &&
+        parse_config_u32(root, "brightness_percent", &brightness, &brightness_present,
+                         "brightness_percent", field, field_len, reason, reason_len) &&
+        parse_config_u32(root, "duration_ms", &duration, &duration_present,
+                         "duration_ms", field, field_len, reason, reason_len);
+    if (valid && (!color_present || !brightness_present || !duration_present)) {
+        set_field(field, field_len, "request"); set_reason(reason, reason_len, "missing_required_field"); valid=false;
+    }
+    if (valid && args->red==0 && args->green==0 && args->blue==0) { set_field(field,field_len,"color");set_reason(reason,reason_len,"must_not_be_black");valid=false; }
+    if (valid && (brightness<5 || brightness>100)) { set_field(field,field_len,"brightness_percent");set_reason(reason,reason_len,"out_of_range");valid=false; }
+    if (valid && (duration<250 || duration>5000)) { set_field(field,field_len,"duration_ms");set_reason(reason,reason_len,"out_of_range");valid=false; }
+    args->brightness_percent=(uint8_t)brightness; args->duration_ms=duration;
+    cJSON_Delete(root); return valid ? ESP_OK : ESP_ERR_INVALID_ARG;
+}
+
 esp_err_t day_usb_parse_set_config_args(const uint8_t *payload, size_t len,
                                         const day_config_t *current,
                                         day_usb_set_config_args_t *args,

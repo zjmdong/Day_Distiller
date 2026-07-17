@@ -90,6 +90,7 @@ static esp_err_t apply_config_cb(const day_config_t *config,
     ESP_RETURN_ON_ERROR(day_settings_get_config(&s_config, &s_config_revision), TAG,
                         "settings refresh failed");
     apply_runtime_config(&s_config);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_apply_config(&s_config));
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_status_set_config(&s_config, s_config_revision));
     if (!day_recorder_is_active()) {
         if (camera_changed) {
@@ -179,6 +180,7 @@ void day_app_run(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_board_init());
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_init());
     day_led_task_start();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_apply_config(&s_config));
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_BOOT));
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_battery_init());

@@ -121,6 +121,14 @@ typedef struct {
     bool include_secrets;
 } day_usb_get_config_args_t;
 
+typedef struct {
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+    uint8_t brightness_percent;
+    uint32_t duration_ms;
+} day_usb_preview_led_args_t;
+
 enum {
     DAY_USB_CONFIG_GROUP_VIDEO = 1U << 0,
     DAY_USB_CONFIG_GROUP_WIFI = 1U << 1,
@@ -153,6 +161,10 @@ esp_err_t day_usb_parse_set_config_args(const uint8_t *payload, size_t len,
                                         day_usb_set_config_args_t *args,
                                         char *field, size_t field_len,
                                         char *reason, size_t reason_len);
+esp_err_t day_usb_parse_preview_led_args(const uint8_t *payload, size_t len,
+                                         day_usb_preview_led_args_t *args,
+                                         char *field, size_t field_len,
+                                         char *reason, size_t reason_len);
 bool day_usb_export_id_valid(const char *value);
 esp_err_t day_usb_parse_begin_export_args(const uint8_t *payload, size_t len,
                                           day_usb_begin_export_args_t *args, char *reason, size_t reason_len);

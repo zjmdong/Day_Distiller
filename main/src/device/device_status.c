@@ -7,6 +7,7 @@
 #include "battery.h"
 #include "camera_service.h"
 #include "imu.h"
+#include "led_status.h"
 #include "recorder.h"
 #include "rtc_clock.h"
 #include "storage_service.h"
@@ -168,6 +169,8 @@ static void cache_nonblocking_driver_state(void)
     day_storage_status_t storage = day_storage_get_status();
     bool recording = day_recorder_is_active();
     esp_err_t record_error = day_recorder_get_last_error();
+    day_led_status_snapshot_t led;
+    bool led_valid = day_led_get_snapshot(&led) == ESP_OK;
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         return;
     }
@@ -186,6 +189,7 @@ static void cache_nonblocking_driver_state(void)
     }
     s_status.recording_active = recording;
     s_status.last_record_error = record_error;
+    if (led_valid) s_status.led = led;
     update_clock_locked();
     xSemaphoreGive(s_mutex);
 }

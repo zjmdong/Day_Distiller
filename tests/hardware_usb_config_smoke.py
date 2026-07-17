@@ -100,7 +100,7 @@ def main() -> int:
             assert isinstance(capabilities, list)
             for capability in ("device_status_v2", "device_config_v1", "device_config_write"):
                 assert capability in capabilities
-            assert "led_preview" not in capabilities
+            assert "led_preview" in capabilities
 
             dates_before, latency, frame = request_ok(
                 protocol_port, sequence, 11, {"cursor": 0, "limit": 20}
@@ -116,6 +116,35 @@ def main() -> int:
             assert "password" not in public_config.get("wifi", {})
             original_brightness = int(public_config["led"]["brightness_percent"])
             current_revision = int(public_config["revision"])
+
+            preview_invalid = (
+                ({"color": "#000000", "brightness_percent": 35, "duration_ms": 500}, "color"),
+                ({"color": "#00FF40", "brightness_percent": 4, "duration_ms": 500}, "brightness_percent"),
+                ({"color": "#00FF40", "brightness_percent": 35, "duration_ms": 249}, "duration_ms"),
+                ({"color": "#00FF40", "brightness_percent": 35, "duration_ms": 5001}, "duration_ms"),
+            )
+            for payload, expected_field in preview_invalid:
+                status, response, latency, frame = transact_status(protocol_port, sequence, 14, payload)
+                sequence += 1; latencies.append(latency); frames.append(frame)
+                assert status == INVALID_ARG and response.get("field") == expected_field, response
+
+            preview, latency, frame = request_ok(
+                protocol_port, sequence, 14,
+                {"color": "#00FF40", "brightness_percent": 35, "duration_ms": 500},
+            )
+            sequence += 1; latencies.append(latency); frames.append(frame)
+            assert preview.get("previewing") is True
+            time.sleep(0.3)
+            preview_status, latency, frame = request_ok(protocol_port, sequence, 3, {})
+            sequence += 1; latencies.append(latency); frames.append(frame)
+            assert preview_status.get("led", {}).get("mode") == "preview", preview_status.get("led")
+            time.sleep(0.6)
+            restored_status, latency, frame = request_ok(protocol_port, sequence, 3, {})
+            sequence += 1; latencies.append(latency); frames.append(frame)
+            assert restored_status.get("led", {}).get("mode") == "usb_handshake", restored_status.get("led")
+            config_after_preview, latency, frame = request_ok(protocol_port, sequence, 12, {})
+            sequence += 1; latencies.append(latency); frames.append(frame)
+            assert int(config_after_preview["revision"]) == current_revision
 
             private_config, latency, frame = request_ok(
                 protocol_port, sequence, 12, {"include_secrets": True}

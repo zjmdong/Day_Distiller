@@ -21,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "led_status.h"
 #include "recorder.h"
 #include "sdmmc_cmd.h"
 #include "storage_service.h"
@@ -412,6 +413,7 @@ static bool add_capabilities(cJSON *root)
         "device_status_v2", "battery_status", "rtc_status",
         "wifi_status", "power_status", "device_config_v1", "device_config_write",
         "config_secrets_over_usb", "led_settings",
+        "led_preview",
     };
     cJSON *array = cJSON_CreateArray();
     if (!array) {
@@ -1031,6 +1033,16 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
         }
         break;
     }
+    case DAY_USB_CMD_PREVIEW_LED: {
+        if (s_mode != DAY_USB_MODE_SERIAL) { status=DAY_USB_STATUS_BAD_STATE; snprintf(reason,sizeof(reason),"serial_maintenance_required"); break; }
+        if (day_recorder_is_active()) { status=DAY_USB_STATUS_BUSY; snprintf(reason,sizeof(reason),"recording_active"); break; }
+        day_usb_preview_led_args_t args;
+        if (day_usb_parse_preview_led_args(payload, hdr->payload_len, &args, field, sizeof(field), reason, sizeof(reason)) != ESP_OK) { status=DAY_USB_STATUS_INVALID_ARG; break; }
+        if (day_led_preview(args.red,args.green,args.blue,args.brightness_percent,args.duration_ms) != ESP_OK) { status=DAY_USB_STATUS_BAD_STATE; snprintf(reason,sizeof(reason),"led_unavailable"); break; }
+        response=strdup("{\"previewing\":true}");
+        if (!response) status=DAY_USB_STATUS_STORAGE_ERROR;
+        break;
+    }
     case DAY_USB_CMD_EXIT_MSC: {
         day_usb_exit_msc_args_t args;
         if (day_usb_parse_exit_msc_args(payload, hdr->payload_len, &args,
@@ -1079,12 +1091,16 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
         tinyusb_cdcacm_write_flush(s_protocol_port, pdMS_TO_TICKS(200));
         day_usb_session_end();
         s_maintenance_active = false;
+        (void)day_led_set_usb_handshake(false);
         return;
     default:
         status = DAY_USB_STATUS_UNSUPPORTED_CMD;
         break;
     }
 
+    if (status == DAY_USB_STATUS_OK && cmd != DAY_USB_CMD_END_SESSION) {
+        (void)day_led_set_usb_handshake(true);
+    }
     if (!response && status != DAY_USB_STATUS_OK) {
         char fallback[256];
         snprintf(fallback, sizeof(fallback),
@@ -1188,6 +1204,7 @@ static void protocol_task(void *arg)
         if (s_maintenance_active && s_last_protocol_us > 0 &&
             now - s_last_protocol_us > DAY_USB_MAINTENANCE_TIMEOUT_US) {
             s_maintenance_active = false;
+            (void)day_led_set_usb_handshake(false);
             if (s_mode == DAY_USB_MODE_SERIAL) {
                 day_usb_session_end();
             }
@@ -1198,6 +1215,14 @@ static void protocol_task(void *arg)
             esp_restart();
         }
     }
+}
+
+static void usb_device_event(tinyusb_event_t *event, void *arg)
+{
+    (void)arg;
+    if (!event) return;
+    if (event->id == TINYUSB_EVENT_ATTACHED) (void)day_led_set_usb_enumerated(true);
+    else if (event->id == TINYUSB_EVENT_DETACHED) (void)day_led_set_usb_enumerated(false);
 }
 
 static esp_err_t init_cdc_port(tinyusb_cdcacm_itf_t port, bool rx_callback)
@@ -1222,7 +1247,7 @@ static esp_err_t install_tinyusb(day_usb_mode_t mode)
         return identity_ret;
     }
     s_string_desc[3] = day_device_usb_serial();
-    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG(usb_device_event);
     tusb_cfg.descriptor.device = mode == DAY_USB_MODE_MSC ? &s_msc_device_desc : &s_serial_device_desc;
     tusb_cfg.descriptor.full_speed_config = mode == DAY_USB_MODE_MSC ? s_msc_fs_desc : s_serial_fs_desc;
     tusb_cfg.descriptor.string = s_string_desc;
