@@ -3154,13 +3154,18 @@ class MainWindow:
         self.v2_end_session_button.setEnabled(enabled and "end_session" in profile.capabilities)
         rw_index = self.access_combo.findData("rw")
         rw_item = self.access_combo.model().item(rw_index) if rw_index >= 0 else None
+        rw_supported = not enabled or "msc_rw" in profile.capabilities
         if rw_item is not None:
-            rw_item.setEnabled(not enabled)
-        if enabled:
+            rw_item.setEnabled(rw_supported)
+        if enabled and rw_supported:
+            self.access_combo.setToolTip(
+                "手动调试可选择只读或读写；一键同步和事务化导出仍始终使用只读 MSC。"
+            )
+        elif enabled:
             self.access_combo.setCurrentIndex(self.access_combo.findData("ro"))
-            self.access_combo.setToolTip("固件 2.0 事务化工作流强制使用只读 MSC。")
+            self.access_combo.setToolTip("当前固件未声明 msc_rw 能力，仅支持只读 MSC。")
         else:
-            self.access_combo.setToolTip("旧固件清理阶段需要兼容的读写 MSC。")
+            self.access_combo.setToolTip("可选择只读或读写 MSC；修改设备文件前请确认已有备份。")
 
     def _set_busy(self, busy: bool) -> None:
         self.start_folder_button.setDisabled(busy)
