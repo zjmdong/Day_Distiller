@@ -33,7 +33,7 @@ $NuitkaArgs = @(
     "--output-dir=$BuildPath",
     "--mingw64",
     "--assume-yes-for-downloads",
-    "--lto=yes",
+    "--lto=no",
     "--python-flag=no_docstrings",
     "--noinclude-pytest-mode=nofollow",
     "--noinclude-setuptools-mode=nofollow",

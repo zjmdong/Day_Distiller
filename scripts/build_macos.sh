@@ -30,7 +30,7 @@ mkdir -p "$BUILD" "$DIST"
   --macos-signed-app-name=com.daydistiller.desktop \
   --macos-app-icon="$ICON" \
   --enable-plugin=pyside6 \
-  --lto=yes \
+  --lto=no \
   --python-flag=no_docstrings \
   --noinclude-pytest-mode=nofollow \
   --noinclude-setuptools-mode=nofollow \

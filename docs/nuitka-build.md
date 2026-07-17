@@ -8,7 +8,7 @@
 .\scripts\build.ps1
 ```
 
-脚本创建/更新 `.venv`，运行 Nuitka standalone 编译，启用 PySide6 插件、LTO、无控制台 GUI 模式和无 docstring 优化，并把图标、FFmpeg、FFprobe及许可证放入应用目录。最终分发 `dist\DayDistiller-Windows-x64.zip`，不能只复制 EXE。
+脚本创建/更新 `.venv`，运行 Nuitka standalone 原生编译，启用 PySide6 插件、无控制台 GUI 模式和无 docstring 优化，并把图标、FFmpeg、FFprobe及许可证放入应用目录。为适配 GitHub 标准构建机的内存上限，显式关闭链接期优化；Nuitka 的 C 编译优化仍然生效。最终分发 `dist\DayDistiller-Windows-x64.zip`，不能只复制 EXE。
 
 ## Apple Silicon macOS
 
