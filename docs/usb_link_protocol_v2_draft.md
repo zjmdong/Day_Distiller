@@ -2,6 +2,13 @@
 
 Status: design only; the current firmware still implements USB Link protocol 1.
 
+Implementation note: the executable firmware plan is now maintained in
+`firmware_v2_implementation_plan_zh.md`. That plan takes precedence where this
+early draft is incomplete. In particular, firmware advertises the canonical
+capability `transactional_export_v2` together with the legacy draft alias
+`export_transactions`, and the implementation plan adds recovery/status and
+multi-day discovery commands without changing protocol-v1 framing.
+
 This document defines additive commands for transactional day export. It does
 not change the existing SLIP framing, 20-byte header, CRC32, command IDs 1-5,
 or serial/MSC USB descriptors described in `usb_link_protocol.md`.
@@ -127,4 +134,3 @@ zero.
 | v2 | v1 | Legacy read-only import and verified host-managed cleanup. |
 | v1 | v2 | Existing command IDs 1-5 continue to work. |
 | v2 | v2 | Transactional export and device-managed commit/delete. |
-
