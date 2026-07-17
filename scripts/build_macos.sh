@@ -14,8 +14,8 @@ if [[ "$(uname -m)" != "arm64" ]]; then
 fi
 
 PYTHON="${DAY_DISTILLER_PYTHON:-python3}"
-FFMPEG="$(command -v ffmpeg)"
-FFPROBE="$(command -v ffprobe)"
+FFMPEG="$($PYTHON -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$(command -v ffmpeg)")"
+FFPROBE="$($PYTHON -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$(command -v ffprobe)")"
 ICON="$ROOT/assets/day-distiller-icon.png"
 BUILD="$ROOT/build/nuitka/macos-arm64"
 DIST="$ROOT/dist"
@@ -30,6 +30,7 @@ mkdir -p "$BUILD" "$DIST"
   --macos-signed-app-name=com.daydistiller.desktop \
   --macos-app-icon="$ICON" \
   --enable-plugin=pyside6 \
+  --assume-yes-for-downloads \
   --lto=no \
   --python-flag=no_docstrings \
   --noinclude-pytest-mode=nofollow \
