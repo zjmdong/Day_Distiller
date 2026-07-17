@@ -1508,7 +1508,8 @@ class MainWindow:
         for port in self.ports:
             role_text = {
                 "protocol": "协议端口",
-                "log": "日志端口（不可连接）",
+                "compat": "兼容接口（自动检测）",
+                "log": "辅助接口（自动检测）",
                 "unknown": "待检测",
             }[port.role]
             self.port_combo.addItem(
@@ -1516,10 +1517,6 @@ class MainWindow:
                 f"{' · 推荐' if port.role == 'protocol' else ''}",
                 port.device,
             )
-            if port.role == "log":
-                item = self.port_combo.model().item(self.port_combo.count() - 1)
-                if item is not None:
-                    item.setEnabled(False)
         self._device_log(f"发现 {len(self.ports)} 个串口。")
 
     def connect_selected(self) -> None:
@@ -1527,11 +1524,6 @@ class MainWindow:
         if not port:
             self._device_log("没有选择串口。")
             return
-        candidate = self._selected_port_candidate()
-        if candidate and candidate.role == "log":
-            self._device_log(f"{candidate.device} 是日志 CDC，请选择标有“协议端口”的串口。")
-            return
-
         def work():
             self._close_device()
             self.device = UsbLinkDevice(port)

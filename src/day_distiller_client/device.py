@@ -3,7 +3,7 @@ from __future__ import annotations
 import itertools
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .protocol import (
@@ -235,16 +235,24 @@ def _interface_number(hwid: str, location: str | None = None) -> int | None:
     match = re.search(r"(?:MI_|interface\s*)([0-9a-f]{2})", text, re.IGNORECASE)
     if match:
         return int(match.group(1), 16)
+    # pyserial on current Windows usbser.sys omits MI_XX from hwid and
+    # exposes the interface only as a location suffix such as 1-1:x.2.
+    match = re.search(r":x\.([0-9a-f]+)$", str(location or ""), re.IGNORECASE)
+    if match:
+        return int(match.group(1), 16)
     return None
 
 
 def _port_role(pid: int | None, interface_number: int | None) -> str:
     if pid == 0x4020:
-        if interface_number == 2:
-            return "protocol"
         if interface_number == 0:
-            return "log"
-    if pid == 0x4021 and interface_number == 0:
+            # Firmware 2.0.1 and later use interface 0 for the protocol.
+            return "protocol"
+        if interface_number == 2:
+            # Firmware 2.0.0 used interface 2 for the protocol. Keep probing
+            # it as a compatibility fallback after the current primary port.
+            return "compat"
+    if pid == 0x4021:
         return "protocol"
     return "unknown"
 
@@ -309,7 +317,23 @@ def list_serial_ports() -> list[PortCandidate]:
                 role=role,
             )
         )
-    role_order = {"protocol": 0, "unknown": 1, "log": 2}
+    # Windows can omit the interface number for MI_00. Infer it only inside
+    # one Day Distiller composite-device group when MI_02 is also present.
+    groups: dict[tuple[int | None, str | None], list[int]] = {}
+    for index, item in enumerate(candidates):
+        groups.setdefault((item.pid, item.serial_number), []).append(index)
+    for (pid, _serial), indexes in groups.items():
+        if pid != 0x4020 or not any(candidates[index].interface_number == 2 for index in indexes):
+            continue
+        for index in indexes:
+            if candidates[index].interface_number is None:
+                candidates[index] = replace(
+                    candidates[index],
+                    interface_number=0,
+                    role="protocol",
+                )
+
+    role_order = {"protocol": 0, "compat": 1, "unknown": 2, "log": 3}
     return sorted(
         candidates,
         key=lambda item: (not item.likely, role_order[item.role], item.device),
@@ -318,8 +342,6 @@ def list_serial_ports() -> list[PortCandidate]:
 
 def find_device(timeout_per_port: float = 0.8) -> tuple[PortCandidate, dict[str, Any]] | None:
     for candidate in list_serial_ports():
-        if candidate.role == "log":
-            continue
         try:
             timeout = max(timeout_per_port, 1.1) if candidate.role == "protocol" else timeout_per_port
             with UsbLinkDevice(candidate.device, timeout=timeout) as device:
