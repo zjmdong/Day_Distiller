@@ -1,4 +1,6 @@
-# Day Distiller 固件 2.1：完整设备状态接口更新计划
+# Day Distiller 固件 2.1：设备状态接口早期草案
+
+> 本文档已由 `firmware_v2_1_implementation_plan_zh.md` 取代。后续实现必须以新的完整计划书为准；本文仅保留用于追溯早期状态接口设计。
 
 文档状态：后续版本计划
 基线固件：2.0.0
