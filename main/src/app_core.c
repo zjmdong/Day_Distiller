@@ -207,7 +207,12 @@ void day_app_run(void)
     bool cold_boot = !is_automatic_wakeup(wakeup_causes);
     ESP_LOGI(TAG, "boot wake causes=0x%08lx cold=%d", (unsigned long)wakeup_causes, cold_boot);
 
-    if (cold_boot) {
+    if (cold_boot && !day_usb_link_should_resume_maintenance()) {
+        vTaskDelay(pdMS_TO_TICKS(1500));
+    }
+    bool maintenance_start = day_usb_link_maintenance_active();
+
+    if (cold_boot && !maintenance_start) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_TIME_SYNC));
         esp_err_t sync_ret = day_wifi_sync_time(&s_config);
         if (sync_ret == ESP_OK) {
@@ -232,12 +237,14 @@ void day_app_run(void)
         sync_system_from_rtc_if_valid();
     }
 
-    if (low_battery_blocking_record()) {
-        ESP_LOGW(TAG, "battery below threshold, skipping record");
-        ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_LOW_BATTERY));
-        vTaskDelay(pdMS_TO_TICKS(1200));
-    } else if (s_config.auto_record_enabled && !day_usb_link_maintenance_active()) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(record_once_cb());
+    if (!day_usb_link_maintenance_active()) {
+        if (low_battery_blocking_record()) {
+            ESP_LOGW(TAG, "battery below threshold, skipping record");
+            ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_LOW_BATTERY));
+            vTaskDelay(pdMS_TO_TICKS(1200));
+        } else if (s_config.auto_record_enabled) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(record_once_cb());
+        }
     }
 
     if (day_usb_link_maintenance_active()) {

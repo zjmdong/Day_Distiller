@@ -26,11 +26,10 @@
 #include "tinyusb_msc.h"
 #include "tusb.h"
 #include "usb_protocol.h"
+#include "usb_session.h"
 
 #define DAY_USB_MAINTENANCE_TIMEOUT_US (300LL * 1000LL * 1000LL)
 #define DAY_USB_MSC_IDLE_TIMEOUT_US (900LL * 1000LL * 1000LL)
-#define DAY_USB_BOOT_MAGIC 0x44595553UL
-#define DAY_USB_BOOT_MAGIC_INV 0xBBA6AAACUL
 
 typedef enum {
     DAY_USB_MODE_SERIAL = 0,
@@ -49,16 +48,8 @@ typedef struct {
     int itf;
 } day_usb_rx_msg_t;
 
-typedef struct {
-    uint32_t magic;
-    uint32_t magic_inv;
-    uint8_t access;
-    uint8_t reserved[3];
-} day_usb_boot_flag_t;
-
 static const char *TAG = "day_usb_link";
 
-static RTC_NOINIT_ATTR day_usb_boot_flag_t s_boot_flag;
 static QueueHandle_t s_rx_queue;
 static TaskHandle_t s_protocol_task;
 static day_usb_slip_decoder_t s_decoder;
@@ -175,33 +166,14 @@ static uint32_t get_u32_le(const uint8_t *src)
     return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
 }
 
-static bool boot_flag_valid(void)
-{
-    return s_boot_flag.magic == DAY_USB_BOOT_MAGIC &&
-           s_boot_flag.magic_inv == DAY_USB_BOOT_MAGIC_INV &&
-           (s_boot_flag.access == DAY_USB_LINK_ACCESS_RW || s_boot_flag.access == DAY_USB_LINK_ACCESS_RO);
-}
-
-static day_usb_link_access_t boot_flag_access(void)
-{
-    return boot_flag_valid() ? (day_usb_link_access_t)s_boot_flag.access : DAY_USB_LINK_ACCESS_RW;
-}
-
-static void set_boot_flag(day_usb_link_access_t access)
-{
-    s_boot_flag.magic = DAY_USB_BOOT_MAGIC;
-    s_boot_flag.magic_inv = DAY_USB_BOOT_MAGIC_INV;
-    s_boot_flag.access = (uint8_t)access;
-}
-
-static void clear_boot_flag(void)
-{
-    memset(&s_boot_flag, 0, sizeof(s_boot_flag));
-}
-
 bool day_usb_link_should_run_msc_mode(void)
 {
-    return boot_flag_valid();
+    return day_usb_session_boot_target() == DAY_USB_BOOT_TARGET_MSC;
+}
+
+bool day_usb_link_should_resume_maintenance(void)
+{
+    return day_usb_session_boot_target() == DAY_USB_BOOT_TARGET_SERIAL_MAINTENANCE;
 }
 
 const char *day_usb_link_mode_name(void)
@@ -342,17 +314,20 @@ static char *make_status_payload(void)
     int written = snprintf(payload, DAY_USB_PAYLOAD_MAX,
                            "{\"protocol\":%d,\"firmware_version\":\"%s\","
                            "\"device\":\"Day Distiller\",\"device_id\":\"%s\",\"mode\":\"%s\","
-                           "\"runtime_state\":\"%s\",\"maintenance\":%s,\"recording\":%s,"
+                           "\"runtime_state\":\"%s\",\"session_id\":\"%016" PRIx64 "\","
+                           "\"maintenance\":%s,\"recording\":%s,"
                            "\"usb_full_speed\":true,\"metadata_schemas\":[1],"
                            "\"storage\":%s,"
                            "\"capabilities\":[\"enter_msc\",\"exit_msc\",\"msc_rw\","
-                           "\"msc_ro\",\"slip_crc32_json\"]}",
+                           "\"msc_ro\",\"slip_crc32_json\",\"exit_to_maintenance\","
+                           "\"end_session\"]}",
                            DAY_USB_PROTO_VERSION,
                            DAY_USB_FIRMWARE_VERSION,
                            day_device_id(),
                            day_usb_link_mode_name(),
                            s_mode == DAY_USB_MODE_MSC ? "msc_read_only" :
                            (s_maintenance_active ? "serial_maintenance" : "normal_boot"),
+                           day_usb_session_id(),
                            s_maintenance_active ? "true" : "false",
                            recording ? "true" : "false",
                            storage);
@@ -365,6 +340,9 @@ static char *make_status_payload(void)
 
 static void mark_protocol_activity(void)
 {
+    if (s_mode == DAY_USB_MODE_SERIAL) {
+        day_usb_session_begin_maintenance();
+    }
     s_maintenance_active = true;
     s_last_protocol_us = esp_timer_get_time();
 }
@@ -412,7 +390,10 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
             status = DAY_USB_STATUS_INVALID_ARG;
             break;
         }
-        set_boot_flag((day_usb_link_access_t)args.access);
+        if (day_usb_session_prepare_msc(args.access, NULL) != ESP_OK) {
+            status = DAY_USB_STATUS_STORAGE_ERROR;
+            break;
+        }
         response = make_status_payload();
         send_response(hdr->seq, cmd, status, response ? response : "{\"accepted\":true}");
         free(response);
@@ -421,15 +402,20 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
         return;
     }
     case DAY_USB_CMD_EXIT_MSC: {
-        if (s_mode != DAY_USB_MODE_MSC) {
-            clear_boot_flag();
-            response = make_status_payload();
-            break;
-        }
         day_usb_exit_msc_args_t args;
         if (day_usb_parse_exit_msc_args(payload, hdr->payload_len, &args,
                                         reason, sizeof(reason)) != ESP_OK) {
             status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
+        if (s_mode != DAY_USB_MODE_MSC) {
+            if (args.next_mode == DAY_USB_NEXT_MODE_MAINTENANCE) {
+                (void)day_usb_session_prepare_serial_maintenance();
+            } else {
+                day_usb_session_end();
+                s_maintenance_active = false;
+            }
+            response = make_status_payload();
             break;
         }
         if (!s_msc_ejected && !args.force) {
@@ -437,13 +423,33 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
             response = strdup("{\"error\":\"MSC volume must be ejected before EXIT_MSC\"}");
             break;
         }
-        clear_boot_flag();
+        if (args.next_mode == DAY_USB_NEXT_MODE_MAINTENANCE) {
+            (void)day_usb_session_prepare_serial_maintenance();
+        } else {
+            day_usb_session_end();
+        }
         response = make_status_payload();
         send_response(hdr->seq, cmd, status, response ? response : "{\"accepted\":true}");
         free(response);
         restart_after_response();
         return;
     }
+    case DAY_USB_CMD_END_SESSION:
+        if (s_mode != DAY_USB_MODE_SERIAL) {
+            status = DAY_USB_STATUS_BAD_STATE;
+            break;
+        }
+        if (day_usb_validate_empty_args(payload, hdr->payload_len, reason, sizeof(reason)) != ESP_OK) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
+        response = make_status_payload();
+        send_response(hdr->seq, cmd, status, response ? response : "{\"ended\":true}");
+        free(response);
+        tinyusb_cdcacm_write_flush(s_protocol_port, pdMS_TO_TICKS(200));
+        day_usb_session_end();
+        s_maintenance_active = false;
+        return;
     default:
         status = DAY_USB_STATUS_UNSUPPORTED_CMD;
         break;
@@ -545,10 +551,13 @@ static void protocol_task(void *arg)
         if (s_maintenance_active && s_last_protocol_us > 0 &&
             now - s_last_protocol_us > DAY_USB_MAINTENANCE_TIMEOUT_US) {
             s_maintenance_active = false;
+            if (s_mode == DAY_USB_MODE_SERIAL) {
+                day_usb_session_end();
+            }
         }
         if (s_mode == DAY_USB_MODE_MSC && s_msc_ejected && s_last_msc_activity_us > 0 &&
             now - s_last_msc_activity_us > DAY_USB_MSC_IDLE_TIMEOUT_US) {
-            clear_boot_flag();
+            day_usb_session_end();
             esp_restart();
         }
     }
@@ -592,6 +601,10 @@ static esp_err_t install_tinyusb(day_usb_mode_t mode)
 static esp_err_t start_protocol(day_usb_mode_t mode)
 {
     s_mode = mode;
+    if (mode == DAY_USB_MODE_SERIAL && day_usb_link_should_resume_maintenance()) {
+        s_maintenance_active = true;
+        s_last_protocol_us = esp_timer_get_time();
+    }
     s_protocol_port = mode == DAY_USB_MODE_MSC ? TINYUSB_CDC_ACM_0 : TINYUSB_CDC_ACM_1;
     s_rx_queue = xQueueCreate(8, sizeof(day_usb_rx_msg_t));
     if (!s_rx_queue) {
@@ -775,29 +788,29 @@ static void msc_storage_deinit(void)
 void day_usb_link_run_msc_mode(void)
 {
 #if CONFIG_DAY_USB_LINK_ENABLED
-    s_msc_read_only = boot_flag_access() == DAY_USB_LINK_ACCESS_RO;
+    s_msc_read_only = day_usb_session_msc_access() == DAY_USB_ACCESS_RO;
     if (msc_card_init() != ESP_OK) {
-        clear_boot_flag();
+        day_usb_session_end();
         esp_restart();
     }
     esp_err_t ret = msc_storage_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "MSC storage init failed: %s", esp_err_to_name(ret));
         msc_card_deinit();
-        clear_boot_flag();
+        day_usb_session_end();
         esp_restart();
     }
     if (start_protocol(DAY_USB_MODE_MSC) != ESP_OK) {
         msc_storage_deinit();
         msc_card_deinit();
-        clear_boot_flag();
+        day_usb_session_end();
         esp_restart();
     }
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 #else
-    clear_boot_flag();
+    day_usb_session_end();
     esp_restart();
 #endif
 }
