@@ -23,8 +23,7 @@ PACKAGE="$DIST/DayDistiller-macOS-AppleSilicon.zip"
 
 mkdir -p "$BUILD" "$DIST"
 "$PYTHON" -m nuitka \
-  --mode=standalone \
-  --macos-create-app-bundle \
+  --mode=app \
   --macos-target-arch=arm64 \
   --macos-app-name="Day Distiller" \
   --macos-app-version=0.3.0 \

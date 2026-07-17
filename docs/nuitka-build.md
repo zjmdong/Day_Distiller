@@ -19,6 +19,6 @@ python3 -m pip install -e '.[dev]'
 ./scripts/build_macos.sh
 ```
 
-脚本会拒绝 x86_64 主机，显式指定 `--macos-target-arch=arm64`，构建 `.app` 后再次用 `file` 检查可执行文件包含 arm64，并执行 ad-hoc codesign。发布到其他用户前仍建议使用 Apple Developer ID 正式签名并公证。
+脚本会拒绝 x86_64 主机，使用 Nuitka `--mode=app` 并显式指定 `--macos-target-arch=arm64`，构建 `.app` 后再次用 `file` 检查可执行文件包含 arm64，并执行 ad-hoc codesign。发布到其他用户前仍建议使用 Apple Developer ID 正式签名并公证。
 
 `.github/workflows/build-desktop.yml` 使用 GitHub 的 M1 arm64 macOS runner，分别生成 Windows x64 和 macOS Apple Silicon 构建产物。FFmpeg 是两个平台体积最大的组件；为保证无需用户安装和一致的媒体处理能力，生产包仍完整内置。
