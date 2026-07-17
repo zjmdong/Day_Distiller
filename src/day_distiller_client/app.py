@@ -335,7 +335,9 @@ class MainWindow:
         self._load_avatar_profile()
         self.refresh_ports()
         self.refresh_history()
-        QTimer.singleShot(80, self._play_landing_intro)
+        # Let the native Windows window-opening animation finish before the
+        # landing content begins its own reveal.
+        QTimer.singleShot(500, self._play_landing_intro)
 
         self.timer = QTimer()
         self.timer.setInterval(100)
@@ -1543,18 +1545,18 @@ class MainWindow:
                 blur_animation = QPropertyAnimation(effect, b"blurRadius", group)
                 blur_animation.setStartValue(16.0)
                 blur_animation.setEndValue(0.0)
-                blur_animation.setDuration(680)
+                blur_animation.setDuration(960)
                 blur_animation.setEasingCurve(QEasingCurve.Type.OutQuart)
                 opacity_animation = QPropertyAnimation(effect, b"revealOpacity", group)
                 opacity_animation.setStartValue(0.0)
                 opacity_animation.setEndValue(1.0)
-                opacity_animation.setDuration(620)
+                opacity_animation.setDuration(900)
                 opacity_animation.setEasingCurve(QEasingCurve.Type.OutQuart)
                 group.finished.connect(lambda content=content: content.setGraphicsEffect(None))
                 self._landing_animation_groups.append(group)
                 group.start()
 
-            QTimer.singleShot(index * 145, start_reveal)
+            QTimer.singleShot(index * 220, start_reveal)
 
     def start_guided_workflow(self) -> None:
         """Enter the production one-click flow and begin 1 Hz device discovery."""
