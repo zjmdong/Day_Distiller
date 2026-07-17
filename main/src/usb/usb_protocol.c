@@ -386,6 +386,91 @@ esp_err_t day_usb_parse_get_export_status_args(const uint8_t *payload, size_t le
     return ESP_OK;
 }
 
+static bool parse_required_export_id(const cJSON *root, char *out, size_t out_len,
+                                     char *reason, size_t reason_len)
+{
+    const cJSON *export_id = cJSON_GetObjectItemCaseSensitive(root, "export_id");
+    if (!cJSON_IsString(export_id) || !day_usb_export_id_valid(export_id->valuestring)) {
+        set_reason(reason, reason_len, "invalid_export_id");
+        return false;
+    }
+    strlcpy(out, export_id->valuestring, out_len);
+    return true;
+}
+
+esp_err_t day_usb_parse_commit_export_args(const uint8_t *payload, size_t len,
+                                           day_usb_commit_export_args_t *args,
+                                           char *reason, size_t reason_len)
+{
+    if (!args) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(args, 0, sizeof(*args));
+    cJSON *root = parse_object(payload, len, reason, reason_len);
+    if (!root) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    static const char *const allowed[] = {
+        "export_id", "manifest_sha256", "confirm_record_count"
+    };
+    if (!validate_fields(root, allowed, 3, reason, reason_len) ||
+        !parse_required_export_id(root, args->export_id, sizeof(args->export_id),
+                                  reason, reason_len)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    const cJSON *sha = cJSON_GetObjectItemCaseSensitive(root, "manifest_sha256");
+    if (!cJSON_IsString(sha) || !sha->valuestring || strlen(sha->valuestring) != 64) {
+        set_reason(reason, reason_len, "invalid_manifest_sha256");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t i = 0; i < 64; ++i) {
+        unsigned char value = (unsigned char)sha->valuestring[i];
+        if (!isxdigit(value)) {
+            set_reason(reason, reason_len, "invalid_manifest_sha256");
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_ARG;
+        }
+        args->manifest_sha256[i] = (char)tolower(value);
+    }
+    args->manifest_sha256[64] = '\0';
+    const cJSON *count = cJSON_GetObjectItemCaseSensitive(root, "confirm_record_count");
+    if (!cJSON_IsNumber(count) || count->valuedouble < 0 || count->valuedouble > UINT32_MAX) {
+        set_reason(reason, reason_len, "invalid_confirm_record_count");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    args->confirm_record_count = (uint32_t)count->valuedouble;
+    if ((double)args->confirm_record_count != count->valuedouble) {
+        set_reason(reason, reason_len, "invalid_confirm_record_count");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+esp_err_t day_usb_parse_export_id_args(const uint8_t *payload, size_t len,
+                                       day_usb_export_id_args_t *args,
+                                       char *reason, size_t reason_len)
+{
+    if (!args) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(args, 0, sizeof(*args));
+    cJSON *root = parse_object(payload, len, reason, reason_len);
+    if (!root) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    static const char *const allowed[] = {"export_id"};
+    bool valid = validate_fields(root, allowed, 1, reason, reason_len) &&
+                 parse_required_export_id(root, args->export_id, sizeof(args->export_id),
+                                          reason, reason_len);
+    cJSON_Delete(root);
+    return valid ? ESP_OK : ESP_ERR_INVALID_ARG;
+}
+
 esp_err_t day_usb_parse_exit_msc_args(const uint8_t *payload, size_t len,
                                       day_usb_exit_msc_args_t *args, char *reason, size_t reason_len)
 {

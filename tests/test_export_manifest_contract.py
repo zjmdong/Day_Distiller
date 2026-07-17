@@ -100,11 +100,11 @@ class ExportManifestContractTests(unittest.TestCase):
         self.assertIn("date_already_prepared", source)
         self.assertIn("DAY_EXPORT_MAX_ACTIVE 32", source)
 
-    def test_manifest_milestone_contains_no_record_deletion(self):
+    def test_begin_export_path_contains_no_record_deletion(self):
         source = (ROOT / "main/src/export/export_service.c").read_text(encoding="utf-8")
-        self.assertNotIn("rmdir(", source)
-        self.assertNotIn("recursive", source.lower())
-        self.assertNotIn("COMMIT_EXPORT_DELETE", source)
+        begin = source[source.index("esp_err_t day_export_begin("):source.index("esp_err_t day_export_get_status(")]
+        self.assertNotIn("rmdir(", begin)
+        self.assertNotIn("delete_one_record", begin)
 
     def test_paginated_wire_responses_stay_below_protocol_limit(self):
         items = [

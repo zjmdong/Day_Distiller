@@ -294,7 +294,10 @@ static cJSON *read_json_file(const char *path)
         fclose(file);
         return NULL;
     }
-    bool ok = fread(data, 1, len, file) == len && fclose(file) == 0;
+    bool ok = fread(data, 1, len, file) == len;
+    if (fclose(file) != 0) {
+        ok = false;
+    }
     if (!ok) {
         free(data);
         return NULL;
@@ -474,6 +477,383 @@ static esp_err_t transaction_response(const transaction_info_t *info, char *resp
     esp_err_t result = json_to_response(root, response, response_len);
     cJSON_Delete(root);
     return result;
+}
+
+static bool json_fields_are_exact(const cJSON *object, const char *const *allowed, size_t allowed_count)
+{
+    if (!cJSON_IsObject(object)) {
+        return false;
+    }
+    size_t count = 0;
+    for (const cJSON *item = object->child; item; item = item->next) {
+        if (!item->string) {
+            return false;
+        }
+        bool known = false;
+        for (size_t i = 0; i < allowed_count; ++i) {
+            if (strcmp(item->string, allowed[i]) == 0) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            return false;
+        }
+        for (const cJSON *other = item->next; other; other = other->next) {
+            if (other->string && strcmp(item->string, other->string) == 0) {
+                return false;
+            }
+        }
+        ++count;
+    }
+    return count == allowed_count;
+}
+
+static cJSON *read_json_text_file(const char *path, char **out_text, size_t *out_len)
+{
+    *out_text = NULL;
+    *out_len = 0;
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        st.st_size > DAY_EXPORT_JSON_MAX) {
+        return NULL;
+    }
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return NULL;
+    }
+    size_t len = (size_t)st.st_size;
+    char *text = malloc(len + 1);
+    if (!text) {
+        fclose(file);
+        return NULL;
+    }
+    bool ok = fread(text, 1, len, file) == len;
+    if (fclose(file) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        free(text);
+        return NULL;
+    }
+    text[len] = '\0';
+    const char *end = NULL;
+    cJSON *json = cJSON_ParseWithLengthOpts(text, len, &end, false);
+    if (!json || end != text + len || !cJSON_IsObject(json)) {
+        cJSON_Delete(json);
+        free(text);
+        return NULL;
+    }
+    *out_text = text;
+    *out_len = len;
+    return json;
+}
+
+static cJSON *read_json_text_with_backup(const char *path, char **out_text, size_t *out_len)
+{
+    cJSON *json = read_json_text_file(path, out_text, out_len);
+    if (json) {
+        return json;
+    }
+    char backup[160];
+    if (snprintf(backup, sizeof(backup), "%s.bak", path) >= (int)sizeof(backup)) {
+        return NULL;
+    }
+    return read_json_text_file(backup, out_text, out_len);
+}
+
+static int record_file_index(const char *name)
+{
+    if (!name) {
+        return -1;
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        if (strcmp(name, s_record_files[i]) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static esp_err_t parse_verified_manifest(const char *export_id, const char *expected_sha,
+                                         uint32_t expected_count, record_info_t **out_records,
+                                         size_t *out_count, char *reason, size_t reason_len)
+{
+    *out_records = NULL;
+    *out_count = 0;
+    char manifest_path[128];
+    char state_path[128];
+    if (!transaction_paths(export_id, manifest_path, state_path)) {
+        set_reason(reason, reason_len, "invalid_export_id");
+        return ESP_ERR_INVALID_ARG;
+    }
+    char *text = NULL;
+    size_t text_len = 0;
+    cJSON *manifest = read_json_text_with_backup(manifest_path, &text, &text_len);
+    if (!manifest) {
+        set_reason(reason, reason_len, "invalid_export_manifest");
+        return ESP_ERR_INVALID_CRC;
+    }
+    char actual_sha[65];
+    esp_err_t result = sha256_text(text, text_len, actual_sha);
+    free(text);
+    if (result != ESP_OK || strcmp(actual_sha, expected_sha) != 0) {
+        cJSON_Delete(manifest);
+        set_reason(reason, reason_len, "manifest_sha256_mismatch");
+        return ESP_ERR_INVALID_CRC;
+    }
+    static const char *const manifest_fields[] = {
+        "schema_version", "export_id", "client_request_id", "device_id", "date",
+        "created_at_utc_ms", "state", "record_count", "total_bytes", "records"
+    };
+    const cJSON *schema = cJSON_GetObjectItemCaseSensitive(manifest, "schema_version");
+    const cJSON *manifest_export_id = cJSON_GetObjectItemCaseSensitive(manifest, "export_id");
+    const cJSON *device_id = cJSON_GetObjectItemCaseSensitive(manifest, "device_id");
+    const cJSON *date = cJSON_GetObjectItemCaseSensitive(manifest, "date");
+    const cJSON *manifest_state = cJSON_GetObjectItemCaseSensitive(manifest, "state");
+    const cJSON *records_json = cJSON_GetObjectItemCaseSensitive(manifest, "records");
+    uint32_t record_count = 0;
+    uint64_t declared_total = 0;
+    bool valid = json_fields_are_exact(manifest, manifest_fields,
+                                       sizeof(manifest_fields) / sizeof(manifest_fields[0])) &&
+                 cJSON_IsNumber(schema) && schema->valuedouble == 2 &&
+                 cJSON_IsString(manifest_export_id) &&
+                 strcmp(manifest_export_id->valuestring, export_id) == 0 &&
+                 cJSON_IsString(device_id) && strcmp(device_id->valuestring, day_device_id()) == 0 &&
+                 cJSON_IsString(date) && strlen(date->valuestring) == 10 &&
+                 cJSON_IsString(manifest_state) && strcmp(manifest_state->valuestring, "prepared") == 0 &&
+                 copy_json_u32(manifest, "record_count", &record_count) &&
+                 copy_json_u64(manifest, "total_bytes", &declared_total) &&
+                 record_count == expected_count && record_count > 0 &&
+                 cJSON_IsArray(records_json) && cJSON_GetArraySize(records_json) == (int)record_count;
+    if (!valid || record_count > DAY_EXPORT_JSON_MAX / sizeof(record_info_t)) {
+        cJSON_Delete(manifest);
+        set_reason(reason, reason_len, "invalid_export_manifest");
+        return ESP_ERR_INVALID_CRC;
+    }
+    record_info_t *records = calloc(record_count, sizeof(*records));
+    if (!records) {
+        cJSON_Delete(manifest);
+        return ESP_ERR_NO_MEM;
+    }
+    static const char *const record_fields[] = {"name", "record_id", "files"};
+    static const char *const file_fields[] = {"name", "size"};
+    uint64_t calculated_total = 0;
+    for (uint32_t i = 0; valid && i < record_count; ++i) {
+        const cJSON *record = cJSON_GetArrayItem(records_json, (int)i);
+        const cJSON *name = cJSON_GetObjectItemCaseSensitive(record, "name");
+        const cJSON *record_id = cJSON_GetObjectItemCaseSensitive(record, "record_id");
+        const cJSON *files = cJSON_GetObjectItemCaseSensitive(record, "files");
+        char record_date[11];
+        valid = json_fields_are_exact(record, record_fields,
+                                      sizeof(record_fields) / sizeof(record_fields[0])) &&
+                cJSON_IsString(name) && record_name_parse(name->valuestring, record_date) &&
+                strcmp(record_date, date->valuestring) == 0 &&
+                cJSON_IsString(record_id) && record_id->valuestring && record_id->valuestring[0] != '\0' &&
+                cJSON_IsArray(files) && cJSON_GetArraySize(files) == 4;
+        if (!valid) {
+            break;
+        }
+        for (uint32_t previous = 0; previous < i; ++previous) {
+            if (strcmp(records[previous].name, name->valuestring) == 0) {
+                valid = false;
+                break;
+            }
+        }
+        strlcpy(records[i].name, name->valuestring, sizeof(records[i].name));
+        bool seen[4] = {false, false, false, false};
+        for (int file_number = 0; valid && file_number < 4; ++file_number) {
+            const cJSON *file = cJSON_GetArrayItem(files, file_number);
+            const cJSON *file_name = cJSON_GetObjectItemCaseSensitive(file, "name");
+            uint64_t size = 0;
+            int index = cJSON_IsString(file_name) ? record_file_index(file_name->valuestring) : -1;
+            valid = json_fields_are_exact(file, file_fields,
+                                          sizeof(file_fields) / sizeof(file_fields[0])) &&
+                    index >= 0 && !seen[index] && copy_json_u64(file, "size", &size);
+            if (valid) {
+                seen[index] = true;
+                records[i].file_sizes[index] = size;
+                if (UINT64_MAX - records[i].total_bytes < size ||
+                    UINT64_MAX - calculated_total < size) {
+                    valid = false;
+                } else {
+                    records[i].total_bytes += size;
+                    calculated_total += size;
+                }
+            }
+        }
+    }
+    cJSON_Delete(manifest);
+    if (!valid || calculated_total != declared_total) {
+        free(records);
+        set_reason(reason, reason_len, "invalid_export_manifest");
+        return ESP_ERR_INVALID_CRC;
+    }
+    *out_records = records;
+    *out_count = record_count;
+    return ESP_OK;
+}
+
+static esp_err_t write_transaction_state(const transaction_info_t *info, const char *state_path)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddNumberToObject(root, "schema_version", 1);
+    cJSON_AddStringToObject(root, "export_id", info->export_id);
+    cJSON_AddStringToObject(root, "state", info->state);
+    cJSON_AddNumberToObject(root, "record_count", info->record_count);
+    cJSON_AddNumberToObject(root, "deleted_count", info->deleted_count);
+    cJSON_AddStringToObject(root, "manifest_sha256", info->manifest_sha256);
+    cJSON_AddStringToObject(root, "last_error", info->last_error);
+    cJSON_AddNumberToObject(root, "updated_at_utc_ms", (double)utc_now_ms());
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!text) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t result = atomic_write(state_path, text, strlen(text));
+    free(text);
+    return result;
+}
+
+static esp_err_t check_record_directory(const record_info_t *record, bool allow_missing,
+                                        bool require_absent, char *reason, size_t reason_len)
+{
+    char directory[128];
+    if (snprintf(directory, sizeof(directory), DAY_SD_MOUNT_POINT "/%s", record->name) >=
+        (int)sizeof(directory)) {
+        set_reason(reason, reason_len, "record_path_too_long");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    struct stat st;
+    if (stat(directory, &st) != 0) {
+        if (errno == ENOENT && (allow_missing || require_absent)) {
+            return ESP_OK;
+        }
+        set_reason(reason, reason_len, "manifest_record_missing");
+        return ESP_FAIL;
+    }
+    if (require_absent || !S_ISDIR(st.st_mode)) {
+        set_reason(reason, reason_len, require_absent ? "deleted_record_reappeared" : "record_not_directory");
+        return ESP_FAIL;
+    }
+    DIR *dir = opendir(directory);
+    if (!dir) {
+        set_reason(reason, reason_len, "cannot_open_record_directory");
+        return ESP_FAIL;
+    }
+    bool valid = true;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (record_file_index(entry->d_name) < 0) {
+            valid = false;
+            break;
+        }
+    }
+    closedir(dir);
+    if (!valid) {
+        set_reason(reason, reason_len, "record_contains_unlisted_file");
+        return ESP_FAIL;
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        char path[160];
+        if (snprintf(path, sizeof(path), "%s/%s", directory, s_record_files[i]) >= (int)sizeof(path)) {
+            set_reason(reason, reason_len, "record_path_too_long");
+            return ESP_ERR_INVALID_SIZE;
+        }
+        struct stat file_stat;
+        if (stat(path, &file_stat) != 0) {
+            if (allow_missing && errno == ENOENT) {
+                continue;
+            }
+            set_reason(reason, reason_len, "manifest_file_missing_or_invalid");
+            return ESP_FAIL;
+        }
+        if (!S_ISREG(file_stat.st_mode)) {
+            set_reason(reason, reason_len, "manifest_file_missing_or_invalid");
+            return ESP_FAIL;
+        }
+        if ((uint64_t)file_stat.st_size != record->file_sizes[i]) {
+            set_reason(reason, reason_len, "manifest_file_size_changed");
+            return ESP_FAIL;
+        }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t preflight_records(const record_info_t *records, size_t count,
+                                   uint32_t deleted_count, bool resuming,
+                                   char *reason, size_t reason_len)
+{
+    if (deleted_count > count) {
+        set_reason(reason, reason_len, "invalid_deleted_count");
+        return ESP_ERR_INVALID_CRC;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        bool require_absent = resuming && i < deleted_count;
+        bool allow_missing = resuming && i == deleted_count;
+        esp_err_t result = check_record_directory(&records[i], allow_missing, require_absent,
+                                                  reason, reason_len);
+        if (result != ESP_OK) {
+            return result;
+        }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t delete_one_record(const record_info_t *record, char *reason, size_t reason_len)
+{
+    char directory[128];
+    if (snprintf(directory, sizeof(directory), DAY_SD_MOUNT_POINT "/%s", record->name) >=
+        (int)sizeof(directory)) {
+        set_reason(reason, reason_len, "record_path_too_long");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    struct stat directory_stat;
+    if (stat(directory, &directory_stat) != 0) {
+        if (errno == ENOENT) {
+            return ESP_OK;
+        }
+        set_reason(reason, reason_len, "cannot_stat_record_directory");
+        return ESP_FAIL;
+    }
+    if (!S_ISDIR(directory_stat.st_mode)) {
+        set_reason(reason, reason_len, "record_not_directory");
+        return ESP_FAIL;
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        char path[160];
+        if (snprintf(path, sizeof(path), "%s/%s", directory, s_record_files[i]) >= (int)sizeof(path)) {
+            set_reason(reason, reason_len, "record_path_too_long");
+            return ESP_ERR_INVALID_SIZE;
+        }
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            if (errno == ENOENT) {
+                continue;
+            }
+            set_reason(reason, reason_len, "cannot_stat_manifest_file");
+            return ESP_FAIL;
+        }
+        if (!S_ISREG(st.st_mode) || (uint64_t)st.st_size != record->file_sizes[i]) {
+            set_reason(reason, reason_len, "manifest_file_changed_during_commit");
+            return ESP_FAIL;
+        }
+        if (unlink(path) != 0) {
+            set_reason(reason, reason_len, "cannot_delete_manifest_file");
+            return ESP_FAIL;
+        }
+    }
+    if (rmdir(directory) != 0 && errno != ENOENT) {
+        set_reason(reason, reason_len, "cannot_delete_record_directory");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 esp_err_t day_export_list_record_dates(const day_usb_pagination_args_t *args,
@@ -735,6 +1115,10 @@ esp_err_t day_export_get_status(const day_usb_get_export_status_args_t *args,
     if (!args || !response || response_len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!day_storage_get_status().mounted) {
+        set_reason(reason, reason_len, "storage_not_mounted");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (args->has_export_id) {
         transaction_info_t info;
         esp_err_t result = load_transaction(args->export_id, &info);
@@ -839,4 +1223,152 @@ size_t day_export_active_count(void)
     }
     closedir(dir);
     return count;
+}
+
+esp_err_t day_export_commit_delete(const day_usb_commit_export_args_t *args,
+                                   char *response, size_t response_len,
+                                   char *reason, size_t reason_len)
+{
+    if (!args || !response || response_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    day_storage_status_t storage = day_storage_get_status();
+    if (!storage.mounted) {
+        set_reason(reason, reason_len, "storage_not_mounted");
+        return ESP_ERR_INVALID_STATE;
+    }
+    char manifest_path[128];
+    char state_path[128];
+    if (!transaction_paths(args->export_id, manifest_path, state_path)) {
+        set_reason(reason, reason_len, "invalid_export_id");
+        return ESP_ERR_INVALID_ARG;
+    }
+    transaction_info_t info;
+    esp_err_t result = load_transaction(args->export_id, &info);
+    if (result != ESP_OK) {
+        set_reason(reason, reason_len,
+                   result == ESP_ERR_NOT_FOUND ? "export_not_found" : "invalid_export_metadata");
+        return result;
+    }
+    if (strcmp(info.manifest_sha256, args->manifest_sha256) != 0) {
+        set_reason(reason, reason_len, "manifest_sha256_mismatch");
+        return ESP_ERR_INVALID_CRC;
+    }
+    if (info.record_count != args->confirm_record_count) {
+        set_reason(reason, reason_len, "record_count_mismatch");
+        return ESP_ERR_INVALID_ARG;
+    }
+    record_info_t *records = NULL;
+    size_t record_count = 0;
+    result = parse_verified_manifest(args->export_id, args->manifest_sha256,
+                                     args->confirm_record_count, &records, &record_count,
+                                     reason, reason_len);
+    if (result != ESP_OK) {
+        return result;
+    }
+    if (strcmp(info.state, "committed") == 0) {
+        free(records);
+        return transaction_response(&info, response, response_len);
+    }
+    bool resuming = strcmp(info.state, "committing") == 0;
+    if (!resuming && strcmp(info.state, "prepared") != 0) {
+        free(records);
+        set_reason(reason, reason_len,
+                   strcmp(info.state, "aborted") == 0 ? "export_aborted" : "invalid_export_state");
+        return ESP_ERR_INVALID_STATE;
+    }
+    result = preflight_records(records, record_count, info.deleted_count, resuming,
+                               reason, reason_len);
+    if (result != ESP_OK) {
+        if (resuming) {
+            strlcpy(info.last_error, reason && reason[0] ? reason : "commit_preflight_failed",
+                    sizeof(info.last_error));
+            (void)write_transaction_state(&info, state_path);
+        }
+        free(records);
+        return result;
+    }
+    if (!resuming) {
+        strlcpy(info.state, "committing", sizeof(info.state));
+        info.deleted_count = 0;
+        info.last_error[0] = '\0';
+        result = write_transaction_state(&info, state_path);
+        if (result != ESP_OK) {
+            free(records);
+            set_reason(reason, reason_len, "cannot_persist_committing_state");
+            return result;
+        }
+    }
+    for (size_t i = info.deleted_count; i < record_count; ++i) {
+        result = delete_one_record(&records[i], reason, reason_len);
+        if (result != ESP_OK) {
+            strlcpy(info.last_error, reason && reason[0] ? reason : "record_delete_failed",
+                    sizeof(info.last_error));
+            (void)write_transaction_state(&info, state_path);
+            free(records);
+            return result;
+        }
+        info.deleted_count = (uint32_t)(i + 1);
+        info.last_error[0] = '\0';
+        result = write_transaction_state(&info, state_path);
+        if (result != ESP_OK) {
+            free(records);
+            set_reason(reason, reason_len, "cannot_persist_delete_progress");
+            return result;
+        }
+    }
+    free(records);
+    strlcpy(info.state, "committed", sizeof(info.state));
+    info.last_error[0] = '\0';
+    result = write_transaction_state(&info, state_path);
+    if (result != ESP_OK) {
+        set_reason(reason, reason_len, "cannot_persist_committed_state");
+        return result;
+    }
+    ESP_LOGI(TAG, "committed export %s records=%lu", info.export_id,
+             (unsigned long)info.record_count);
+    return transaction_response(&info, response, response_len);
+}
+
+esp_err_t day_export_abort(const day_usb_export_id_args_t *args,
+                           char *response, size_t response_len,
+                           char *reason, size_t reason_len)
+{
+    if (!args || !response || response_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!day_storage_get_status().mounted) {
+        set_reason(reason, reason_len, "storage_not_mounted");
+        return ESP_ERR_INVALID_STATE;
+    }
+    char manifest_path[128];
+    char state_path[128];
+    if (!transaction_paths(args->export_id, manifest_path, state_path)) {
+        set_reason(reason, reason_len, "invalid_export_id");
+        return ESP_ERR_INVALID_ARG;
+    }
+    transaction_info_t info;
+    esp_err_t result = load_transaction(args->export_id, &info);
+    if (result != ESP_OK) {
+        set_reason(reason, reason_len,
+                   result == ESP_ERR_NOT_FOUND ? "export_not_found" : "invalid_export_metadata");
+        return result;
+    }
+    if (strcmp(info.state, "committing") == 0) {
+        set_reason(reason, reason_len, "commit_recovery_required");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (strcmp(info.state, "prepared") == 0) {
+        strlcpy(info.state, "aborted", sizeof(info.state));
+        info.last_error[0] = '\0';
+        result = write_transaction_state(&info, state_path);
+        if (result != ESP_OK) {
+            set_reason(reason, reason_len, "cannot_persist_aborted_state");
+            return result;
+        }
+    } else if (strcmp(info.state, "aborted") != 0 && strcmp(info.state, "committed") != 0) {
+        set_reason(reason, reason_len, "invalid_export_state");
+        return ESP_ERR_INVALID_STATE;
+    }
+    return transaction_response(&info, response, response_len);
 }

@@ -17,6 +17,12 @@ esp_err_t day_export_begin(const day_usb_begin_export_args_t *args,
 esp_err_t day_export_get_status(const day_usb_get_export_status_args_t *args,
                                 char *response, size_t response_len,
                                 char *reason, size_t reason_len);
+esp_err_t day_export_commit_delete(const day_usb_commit_export_args_t *args,
+                                   char *response, size_t response_len,
+                                   char *reason, size_t reason_len);
+esp_err_t day_export_abort(const day_usb_export_id_args_t *args,
+                           char *response, size_t response_len,
+                           char *reason, size_t reason_len);
 esp_err_t day_export_validate_prepared(const char export_ids[][DAY_USB_EXPORT_ID_MAX], size_t count,
                                        char *reason, size_t reason_len);
 size_t day_export_active_count(void);
