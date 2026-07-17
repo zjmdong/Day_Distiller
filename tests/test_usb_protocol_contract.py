@@ -91,6 +91,18 @@ class UsbProtocolContractTests(unittest.TestCase):
         self.assertIn("2 * TUD_CDC_DESC_LEN", source)
         self.assertIn("TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN", source)
 
+    def test_primary_cdc_is_the_protocol_port_for_windows_usbser(self):
+        source = (ROOT / "main/src/usb/usb_link.c").read_text(encoding="utf-8")
+        self.assertIn("static tinyusb_cdcacm_itf_t s_protocol_port = TINYUSB_CDC_ACM_0", source)
+        self.assertIn("init_cdc_port(TINYUSB_CDC_ACM_0, true)", source)
+        self.assertIn("init_cdc_port(TINYUSB_CDC_ACM_1, false)", source)
+
+    def test_protocol_buffers_do_not_exhaust_the_protocol_task_stack(self):
+        source = (ROOT / "main/src/usb/usb_link.c").read_text(encoding="utf-8")
+        self.assertIn("uint8_t *frame = malloc(frame_len)", source)
+        self.assertIn("day_usb_rx_msg_t *msg = malloc(sizeof(*msg))", source)
+        self.assertIn('xTaskCreate(protocol_task, "day_usb_proto", 8192', source)
+
     def test_arguments_use_structured_json_not_substring_matching(self):
         link = (ROOT / "main/src/usb/usb_link.c").read_text(encoding="utf-8")
         parser = (ROOT / "main/src/usb/usb_protocol.c").read_text(encoding="utf-8")

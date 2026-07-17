@@ -6,8 +6,11 @@ USB Link is an optional maintenance interface layered beside the existing
 application behavior. The normal boot mode exposes two TinyUSB CDC ACM
 interfaces:
 
-- CDC0: device logs and debugging output.
-- CDC1: USB Link command protocol.
+- CDC0: USB Link command protocol (firmware 2.0.1 and later).
+- CDC1: device logs and debugging output (firmware 2.0.1 and later).
+
+Firmware 2.0.0 used the opposite assignment. Desktop clients must probe both
+CDC functions with `HELLO` so that 2.0.0 and 2.0.1 devices remain compatible.
 
 After a successful `ENTER_MSC` request the device reboots into maintenance
 storage mode and exposes:

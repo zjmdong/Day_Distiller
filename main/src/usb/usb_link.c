@@ -56,7 +56,11 @@ static TaskHandle_t s_protocol_task;
 static day_usb_slip_decoder_t s_decoder;
 static uint8_t s_cdc_rx_buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
 static day_usb_mode_t s_mode = DAY_USB_MODE_SERIAL;
-static tinyusb_cdcacm_itf_t s_protocol_port = TINYUSB_CDC_ACM_1;
+// Keep the command protocol on CDC0. Windows usbser.sys can enumerate the
+// second CDC function on affected hosts while aborting every read submitted
+// to its data endpoint. CDC0 is also the protocol port in MSC mode, so using
+// it in both modes removes that driver-dependent role switch.
+static tinyusb_cdcacm_itf_t s_protocol_port = TINYUSB_CDC_ACM_0;
 static bool s_tinyusb_started;
 static bool s_maintenance_active;
 static int64_t s_last_protocol_us;
@@ -106,7 +110,7 @@ static tusb_desc_device_t s_serial_device_desc = {
     .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor = 0x303A,
     .idProduct = 0x4020,
-    .bcdDevice = 0x0100,
+    .bcdDevice = 0x0201,
     .iManufacturer = 0x01,
     .iProduct = 0x02,
     .iSerialNumber = 0x03,
@@ -123,7 +127,7 @@ static tusb_desc_device_t s_msc_device_desc = {
     .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor = 0x303A,
     .idProduct = 0x4021,
-    .bcdDevice = 0x0100,
+    .bcdDevice = 0x0201,
     .iManufacturer = 0x01,
     .iProduct = 0x02,
     .iSerialNumber = 0x03,
@@ -133,8 +137,8 @@ static tusb_desc_device_t s_msc_device_desc = {
 static const uint8_t s_serial_fs_desc[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_SERIAL_TOTAL, 0, DAY_USB_SERIAL_DESC_LEN,
                           TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC0, 4, EP_CDC0_NOTIF, 8, EP_CDC0_OUT, EP_CDC0_IN, 64),
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC1, 5, EP_CDC1_NOTIF, 8, EP_CDC1_OUT, EP_CDC1_IN, 64),
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC0, 5, EP_CDC0_NOTIF, 8, EP_CDC0_OUT, EP_CDC0_IN, 64),
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC1, 4, EP_CDC1_NOTIF, 8, EP_CDC1_OUT, EP_CDC1_IN, 64),
 };
 
 static const uint8_t s_msc_fs_desc[] = {
@@ -184,7 +188,7 @@ const char *day_usb_link_mode_name(void)
 
 static int usb_log_vprintf(const char *fmt, va_list args)
 {
-    if (!s_tinyusb_started || s_mode != DAY_USB_MODE_SERIAL || !tinyusb_cdcacm_initialized(TINYUSB_CDC_ACM_0)) {
+    if (!s_tinyusb_started || s_mode != DAY_USB_MODE_SERIAL || !tinyusb_cdcacm_initialized(TINYUSB_CDC_ACM_1)) {
         return 0;
     }
     char buffer[256];
@@ -196,8 +200,8 @@ static int usb_log_vprintf(const char *fmt, va_list args)
     if (out_len >= sizeof(buffer)) {
         out_len = sizeof(buffer) - 1;
     }
-    tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (const uint8_t *)buffer, out_len);
-    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+    tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_1, (const uint8_t *)buffer, out_len);
+    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_1, 0);
     return written;
 }
 
@@ -245,7 +249,15 @@ static esp_err_t send_slip_bytes(const uint8_t *data, size_t len)
 
 static esp_err_t send_response(uint32_t seq, day_usb_command_t cmd, day_usb_status_t status, const char *json)
 {
-    uint8_t frame[sizeof(day_usb_frame_header_t) + DAY_USB_PAYLOAD_MAX + 4];
+    size_t payload_len = json ? strlen(json) : 0;
+    if (payload_len > DAY_USB_PAYLOAD_MAX) {
+        return ESP_ERR_NO_MEM;
+    }
+    size_t frame_len = sizeof(day_usb_frame_header_t) + payload_len + 4;
+    uint8_t *frame = malloc(frame_len);
+    if (!frame) {
+        return ESP_ERR_NO_MEM;
+    }
     day_usb_frame_header_t hdr = {
         .magic = {DAY_USB_PROTO_MAGIC0, DAY_USB_PROTO_MAGIC1},
         .version = DAY_USB_PROTO_VERSION,
@@ -254,18 +266,17 @@ static esp_err_t send_response(uint32_t seq, day_usb_command_t cmd, day_usb_stat
         .seq = seq,
         .cmd = (uint16_t)cmd,
         .status = (uint16_t)status,
-        .payload_len = json ? (uint32_t)strlen(json) : 0,
+        .payload_len = (uint32_t)payload_len,
     };
-    if (hdr.payload_len > DAY_USB_PAYLOAD_MAX) {
-        return ESP_ERR_NO_MEM;
-    }
     memcpy(frame, &hdr, sizeof(hdr));
     if (hdr.payload_len) {
         memcpy(frame + sizeof(hdr), json, hdr.payload_len);
     }
     uint32_t crc = day_usb_crc32(0, frame, sizeof(hdr) + hdr.payload_len);
     put_u32_le(frame + sizeof(hdr) + hdr.payload_len, crc);
-    return send_slip_bytes(frame, sizeof(hdr) + hdr.payload_len + 4);
+    esp_err_t result = send_slip_bytes(frame, frame_len);
+    free(frame);
+    return result;
 }
 
 static int storage_status_json(char *buffer, size_t len)
@@ -708,11 +719,17 @@ static void slip_decode_byte(uint8_t byte)
 static void protocol_task(void *arg)
 {
     (void)arg;
-    day_usb_rx_msg_t msg;
+    day_usb_rx_msg_t *msg = malloc(sizeof(*msg));
+    if (!msg) {
+        ESP_LOGE(TAG, "cannot allocate protocol receive buffer");
+        s_protocol_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
     while (true) {
-        if (xQueueReceive(s_rx_queue, &msg, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            for (size_t i = 0; i < msg.len; ++i) {
-                slip_decode_byte(msg.data[i]);
+        if (xQueueReceive(s_rx_queue, msg, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            for (size_t i = 0; i < msg->len; ++i) {
+                slip_decode_byte(msg->data[i]);
             }
         }
         int64_t now = esp_timer_get_time();
@@ -773,7 +790,7 @@ static esp_err_t start_protocol(day_usb_mode_t mode)
         s_maintenance_active = true;
         s_last_protocol_us = esp_timer_get_time();
     }
-    s_protocol_port = mode == DAY_USB_MODE_MSC ? TINYUSB_CDC_ACM_0 : TINYUSB_CDC_ACM_1;
+    s_protocol_port = TINYUSB_CDC_ACM_0;
     s_rx_queue = xQueueCreate(8, sizeof(day_usb_rx_msg_t));
     if (!s_rx_queue) {
         return ESP_ERR_NO_MEM;
@@ -783,11 +800,11 @@ static esp_err_t start_protocol(day_usb_mode_t mode)
         return ret;
     }
     if (mode == DAY_USB_MODE_SERIAL) {
-        ret = init_cdc_port(TINYUSB_CDC_ACM_0, false);
+        ret = init_cdc_port(TINYUSB_CDC_ACM_0, true);
         if (ret != ESP_OK) {
             return ret;
         }
-        ret = init_cdc_port(TINYUSB_CDC_ACM_1, true);
+        ret = init_cdc_port(TINYUSB_CDC_ACM_1, false);
         if (ret != ESP_OK) {
             return ret;
         }
@@ -798,7 +815,7 @@ static esp_err_t start_protocol(day_usb_mode_t mode)
             return ret;
         }
     }
-    if (xTaskCreate(protocol_task, "day_usb_proto", 4096, NULL, 8, &s_protocol_task) != pdPASS) {
+    if (xTaskCreate(protocol_task, "day_usb_proto", 8192, NULL, 8, &s_protocol_task) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
