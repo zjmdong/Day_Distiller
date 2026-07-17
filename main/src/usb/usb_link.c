@@ -317,7 +317,7 @@ static char *make_status_payload(void)
                            "\"device\":\"Day Distiller\",\"device_id\":\"%s\",\"mode\":\"%s\","
                            "\"runtime_state\":\"%s\",\"session_id\":\"%016" PRIx64 "\","
                            "\"maintenance\":%s,\"recording\":%s,"
-                           "\"usb_full_speed\":true,\"metadata_schemas\":[1],\"active_exports\":%u,"
+                           "\"usb_full_speed\":true,\"metadata_schemas\":[1,2],\"active_exports\":%u,"
                            "\"storage\":%s,"
                            "\"capabilities\":[\"enter_msc\",\"exit_msc\",\"msc_rw\","
                            "\"msc_ro\",\"slip_crc32_json\",\"transactional_export_v2\","

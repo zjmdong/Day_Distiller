@@ -1,21 +1,33 @@
 #include "storage_service.h"
 
 #include <dirent.h>
+#include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "day_pins.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_vfs_fat.h"
+#include "nvs.h"
 #include "sdmmc_cmd.h"
+
+#define DAY_RECORDING_DIR DAY_SD_MOUNT_POINT "/.recording"
+#define DAY_RECORD_COUNTER_NS "day_record"
+#define DAY_RECORD_COUNTER_KEY "next_id"
+#define DAY_RECORD_SEQUENCE_MODULUS 10000U
+#define DAY_RECORD_COUNTER_MAX 9007199254740000ULL
 
 static const char *TAG = "day_storage";
 
 static sdmmc_card_t *s_card;
 static bool s_bus_initialized;
 static sdmmc_host_t s_host;
+static bool s_partial_records_scanned;
 static day_storage_status_t s_status = {
     .last_error = ESP_ERR_INVALID_STATE,
 };
@@ -63,6 +75,22 @@ esp_err_t day_storage_init(void)
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "TF card mounted");
         day_storage_refresh_status(&s_status);
+        struct stat recording_dir;
+        if (stat(DAY_RECORDING_DIR, &recording_dir) == 0 && S_ISDIR(recording_dir.st_mode) &&
+            !s_partial_records_scanned) {
+            DIR *dir = opendir(DAY_RECORDING_DIR);
+            if (dir) {
+                struct dirent *entry;
+                while ((entry = readdir(dir)) != NULL) {
+                    if (entry->d_name[0] != '.') {
+                        ESP_LOGW(TAG, "preserving incomplete recording for diagnostics: %s",
+                                 entry->d_name);
+                    }
+                }
+                closedir(dir);
+            }
+            s_partial_records_scanned = true;
+        }
     } else {
         ESP_LOGW(TAG, "TF card mount failed: %s", esp_err_to_name(ret));
     }
@@ -92,22 +120,92 @@ day_storage_status_t day_storage_get_status(void)
     return status;
 }
 
-static uint32_t next_sequence(void)
+esp_err_t day_storage_require_free_bytes(uint64_t required_bytes)
 {
-    DIR *dir = opendir(DAY_SD_MOUNT_POINT);
-    if (!dir) {
-        return 0;
+    day_storage_status_t status;
+    esp_err_t result = day_storage_refresh_status(&status);
+    if (result != ESP_OK) {
+        return result;
     }
-    uint32_t max_seq = 0;
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL) {
-        unsigned seq = 0;
-        if (sscanf(ent->d_name, "REC_%04u_", &seq) == 1 && seq >= max_seq) {
-            max_seq = seq + 1;
+    if (status.free_bytes < required_bytes) {
+        ESP_LOGE(TAG, "insufficient TF space: free=%" PRIu64 " required=%" PRIu64,
+                 status.free_bytes, required_bytes);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t allocate_record_counter(uint64_t *counter)
+{
+    nvs_handle_t nvs;
+    esp_err_t result = nvs_open(DAY_RECORD_COUNTER_NS, NVS_READWRITE, &nvs);
+    if (result != ESP_OK) {
+        return result;
+    }
+    uint64_t current = 0;
+    result = nvs_get_u64(nvs, DAY_RECORD_COUNTER_KEY, &current);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        current = ((uint64_t)esp_random() << 20) | (esp_random() & 0x000fffffU);
+        if (current == 0 || current >= DAY_RECORD_COUNTER_MAX) {
+            current = 1;
         }
+        result = ESP_OK;
     }
-    closedir(dir);
-    return max_seq % 10000;
+    if (result == ESP_OK && current >= DAY_RECORD_COUNTER_MAX) {
+        result = ESP_ERR_INVALID_STATE;
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_u64(nvs, DAY_RECORD_COUNTER_KEY, current + 1);
+    }
+    if (result == ESP_OK) {
+        result = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    if (result == ESP_OK) {
+        *counter = current;
+    }
+    return result;
+}
+
+static esp_err_t ensure_recording_directory(void)
+{
+    struct stat st;
+    if (stat(DAY_RECORDING_DIR, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? ESP_OK : ESP_FAIL;
+    }
+    if (errno != ENOENT || mkdir(DAY_RECORDING_DIR, 0775) != 0) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t path_exists(const char *path, bool *exists)
+{
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        *exists = true;
+        return ESP_OK;
+    }
+    if (errno == ENOENT) {
+        *exists = false;
+        return ESP_OK;
+    }
+    return ESP_FAIL;
+}
+
+static esp_err_t set_record_file_paths(day_record_paths_t *paths, const char *directory)
+{
+    int video = snprintf(paths->video_path, sizeof(paths->video_path), "%s/video.avi", directory);
+    int audio = snprintf(paths->audio_path, sizeof(paths->audio_path), "%s/audio.wav", directory);
+    int imu = snprintf(paths->imu_path, sizeof(paths->imu_path), "%s/imu.json", directory);
+    int meta = snprintf(paths->meta_path, sizeof(paths->meta_path), "%s/meta.json", directory);
+    if (video < 0 || video >= (int)sizeof(paths->video_path) ||
+        audio < 0 || audio >= (int)sizeof(paths->audio_path) ||
+        imu < 0 || imu >= (int)sizeof(paths->imu_path) ||
+        meta < 0 || meta >= (int)sizeof(paths->meta_path)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
 }
 
 esp_err_t day_storage_make_record_paths(day_record_paths_t *paths, time_t record_time)
@@ -119,30 +217,105 @@ esp_err_t day_storage_make_record_paths(day_record_paths_t *paths, time_t record
         return ESP_ERR_INVALID_STATE;
     }
     memset(paths, 0, sizeof(*paths));
-    paths->sequence = next_sequence();
+    esp_err_t result = ensure_recording_directory();
+    if (result != ESP_OK) {
+        return result;
+    }
+    result = allocate_record_counter(&paths->record_counter);
+    if (result != ESP_OK) {
+        return result;
+    }
 
     struct tm tm;
     localtime_r(&record_time, &tm);
-    if (tm.tm_year < 100) {
-        time_t fallback = time(NULL);
+    if (tm.tm_year < 120 || tm.tm_year > 199) {
+        time_t fallback = 1625097600 + (time_t)(paths->record_counter % 31536000ULL);
         localtime_r(&fallback, &tm);
+        paths->record_time = fallback;
+    } else {
+        paths->record_time = record_time;
     }
 
-    snprintf(paths->dir_path, sizeof(paths->dir_path),
-             DAY_SD_MOUNT_POINT "/REC_%04lu_%02d%02d%02d_%02d%02d%02d",
-             (unsigned long)paths->sequence,
-             (tm.tm_year + 1900) % 100, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec);
-
+    bool found = false;
+    uint32_t initial_sequence = (uint32_t)(paths->record_counter % DAY_RECORD_SEQUENCE_MODULUS);
+    for (uint32_t attempt = 0; attempt < DAY_RECORD_SEQUENCE_MODULUS; ++attempt) {
+        paths->sequence = (initial_sequence + attempt) % DAY_RECORD_SEQUENCE_MODULUS;
+        int name_len = snprintf(paths->record_name, sizeof(paths->record_name),
+                                "REC_%04lu_%02d%02d%02d_%02d%02d%02d",
+                                (unsigned long)paths->sequence,
+                                (tm.tm_year + 1900) % 100, tm.tm_mon + 1, tm.tm_mday,
+                                tm.tm_hour, tm.tm_min, tm.tm_sec);
+        int final_len = snprintf(paths->final_dir_path, sizeof(paths->final_dir_path),
+                                 DAY_SD_MOUNT_POINT "/%s", paths->record_name);
+        int partial_len = snprintf(paths->dir_path, sizeof(paths->dir_path),
+                                   DAY_RECORDING_DIR "/%s.partial", paths->record_name);
+        if (name_len != 22 || final_len < 0 || final_len >= (int)sizeof(paths->final_dir_path) ||
+            partial_len < 0 || partial_len >= (int)sizeof(paths->dir_path)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        bool final_exists = false;
+        bool partial_exists = false;
+        result = path_exists(paths->final_dir_path, &final_exists);
+        if (result == ESP_OK) {
+            result = path_exists(paths->dir_path, &partial_exists);
+        }
+        if (result != ESP_OK) {
+            return result;
+        }
+        if (!final_exists && !partial_exists) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        ESP_LOGE(TAG, "all four-digit record sequences collide for selected timestamp");
+        return ESP_ERR_NOT_FOUND;
+    }
     if (mkdir(paths->dir_path, 0775) != 0) {
-        ESP_LOGW(TAG, "mkdir failed for %s", paths->dir_path);
+        ESP_LOGW(TAG, "partial record mkdir failed for %s: errno=%d", paths->dir_path, errno);
         return ESP_FAIL;
     }
-    snprintf(paths->video_path, sizeof(paths->video_path), "%s/video.avi", paths->dir_path);
-    snprintf(paths->audio_path, sizeof(paths->audio_path), "%s/audio.wav", paths->dir_path);
-    snprintf(paths->imu_path, sizeof(paths->imu_path), "%s/imu.json", paths->dir_path);
-    snprintf(paths->meta_path, sizeof(paths->meta_path), "%s/meta.json", paths->dir_path);
-    return ESP_OK;
+    result = set_record_file_paths(paths, paths->dir_path);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "record file path construction failed; preserving %s", paths->dir_path);
+    }
+    return result;
+}
+
+esp_err_t day_storage_finalize_record(day_record_paths_t *paths)
+{
+    if (!paths || !s_status.mounted || paths->dir_path[0] == '\0' ||
+        paths->final_dir_path[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const char *files[] = {paths->meta_path, paths->video_path, paths->audio_path, paths->imu_path};
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
+        struct stat st;
+        if (stat(files[i], &st) != 0 || !S_ISREG(st.st_mode)) {
+            ESP_LOGE(TAG, "cannot finalize record with missing file: %s", files[i]);
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+    bool final_exists = false;
+    esp_err_t result = path_exists(paths->final_dir_path, &final_exists);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "cannot verify final record path absence: errno=%d", errno);
+        return result;
+    }
+    if (final_exists) {
+        ESP_LOGE(TAG, "refusing to overwrite existing record: %s", paths->final_dir_path);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (rename(paths->dir_path, paths->final_dir_path) != 0) {
+        ESP_LOGE(TAG, "record directory rename failed: errno=%d", errno);
+        return ESP_FAIL;
+    }
+    strlcpy(paths->dir_path, paths->final_dir_path, sizeof(paths->dir_path));
+    result = set_record_file_paths(paths, paths->dir_path);
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG, "record atomically completed: %s", paths->record_name);
+    }
+    return result;
 }
 
 esp_err_t day_storage_files_json(char *buffer, size_t len)
@@ -187,6 +360,7 @@ void day_storage_deinit(void)
         esp_vfs_fat_sdcard_unmount(DAY_SD_MOUNT_POINT, s_card);
         s_status.mounted = false;
         s_card = NULL;
+        s_partial_records_scanned = false;
     }
     if (s_bus_initialized) {
         spi_bus_free(s_host.slot);

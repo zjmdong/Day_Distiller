@@ -238,10 +238,12 @@ esp_err_t day_audio_patch_wav_header(FILE *file, uint32_t sample_rate_hz, uint32
     if (!file) {
         return ESP_ERR_INVALID_ARG;
     }
-    fflush(file);
-    fseek(file, 0, SEEK_SET);
+    if (fflush(file) != 0 || fseek(file, 0, SEEK_SET) != 0) {
+        return ESP_FAIL;
+    }
     esp_err_t ret = day_audio_write_wav_header(file, sample_rate_hz, data_bytes);
-    fflush(file);
-    fseek(file, 0, SEEK_END);
+    if (fflush(file) != 0 || fseek(file, 0, SEEK_END) != 0) {
+        ret = ESP_FAIL;
+    }
     return ret;
 }

@@ -1,5 +1,6 @@
 #include "avi_writer.h"
 
+#include <stdbool.h>
 #include <string.h>
 
 static void w4(FILE *f, const char *s)
@@ -21,12 +22,14 @@ static void le32(FILE *f, uint32_t v)
     fputc((v >> 24) & 0xff, f);
 }
 
-static void patch32(FILE *f, long pos, uint32_t v)
+static bool patch32(FILE *f, long pos, uint32_t v)
 {
     long cur = ftell(f);
-    fseek(f, pos, SEEK_SET);
+    if (cur < 0 || fseek(f, pos, SEEK_SET) != 0) {
+        return false;
+    }
     le32(f, v);
-    fseek(f, cur, SEEK_SET);
+    return !ferror(f) && fseek(f, cur, SEEK_SET) == 0;
 }
 
 esp_err_t day_avi_begin(day_avi_writer_t *writer, FILE *file, uint32_t width, uint32_t height, uint32_t fps)
@@ -113,7 +116,13 @@ esp_err_t day_avi_begin(day_avi_writer_t *writer, FILE *file, uint32_t width, ui
     le32(file, 0);
     writer->movi_list_pos = ftell(file) - 4;
     w4(file, "movi");
-    return ferror(file) ? ESP_FAIL : ESP_OK;
+    if (writer->riff_size_pos < 0 || writer->avih_us_per_frame_pos < 0 ||
+        writer->avih_frames_pos < 0 || writer->strh_scale_pos < 0 ||
+        writer->strh_rate_pos < 0 || writer->strh_frames_pos < 0 ||
+        writer->movi_size_pos < 0 || writer->movi_list_pos < 0 || ferror(file)) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 esp_err_t day_avi_write_frame(day_avi_writer_t *writer, const uint8_t *data, uint32_t len)
@@ -123,7 +132,9 @@ esp_err_t day_avi_write_frame(day_avi_writer_t *writer, const uint8_t *data, uin
     }
     w4(writer->file, "00dc");
     le32(writer->file, len);
-    fwrite(data, 1, len, writer->file);
+    if (fwrite(data, 1, len, writer->file) != len) {
+        return ESP_FAIL;
+    }
     if (len & 1) {
         fputc(0, writer->file);
     }
@@ -136,18 +147,26 @@ esp_err_t day_avi_finish(day_avi_writer_t *writer, uint32_t actual_frame_us)
     if (!writer || !writer->file) {
         return ESP_ERR_INVALID_ARG;
     }
-    fflush(writer->file);
+    if (fflush(writer->file) != 0) {
+        return ESP_FAIL;
+    }
     long end = ftell(writer->file);
+    if (end < 0) {
+        return ESP_FAIL;
+    }
     if (actual_frame_us == 0) {
         actual_frame_us = writer->fps ? (1000000 / writer->fps) : 1000000;
     }
-    patch32(writer->file, writer->riff_size_pos, (uint32_t)(end - 8));
-    patch32(writer->file, writer->avih_us_per_frame_pos, actual_frame_us);
-    patch32(writer->file, writer->avih_frames_pos, writer->frames);
-    patch32(writer->file, writer->strh_scale_pos, actual_frame_us);
-    patch32(writer->file, writer->strh_rate_pos, 1000000);
-    patch32(writer->file, writer->strh_frames_pos, writer->frames);
-    patch32(writer->file, writer->movi_size_pos, (uint32_t)(end - writer->movi_list_pos - 4));
-    fflush(writer->file);
-    return ferror(writer->file) ? ESP_FAIL : ESP_OK;
+    if (!patch32(writer->file, writer->riff_size_pos, (uint32_t)(end - 8)) ||
+        !patch32(writer->file, writer->avih_us_per_frame_pos, actual_frame_us) ||
+        !patch32(writer->file, writer->avih_frames_pos, writer->frames) ||
+        !patch32(writer->file, writer->strh_scale_pos, actual_frame_us) ||
+        !patch32(writer->file, writer->strh_rate_pos, 1000000) ||
+        !patch32(writer->file, writer->strh_frames_pos, writer->frames) ||
+        !patch32(writer->file, writer->movi_size_pos,
+                 (uint32_t)(end - writer->movi_list_pos - 4)) ||
+        fflush(writer->file) != 0 || ferror(writer->file)) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }

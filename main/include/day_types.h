@@ -128,9 +128,13 @@ typedef struct {
 
 typedef struct {
     char dir_path[96];
+    char final_dir_path[96];
+    char record_name[24];
     char video_path[128];
     char audio_path[128];
     char imu_path[128];
     char meta_path[128];
     uint32_t sequence;
+    uint64_t record_counter;
+    time_t record_time;
 } day_record_paths_t;

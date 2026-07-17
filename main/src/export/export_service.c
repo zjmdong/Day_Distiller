@@ -27,6 +27,7 @@ static const char *const s_record_files[] = {"meta.json", "video.avi", "audio.wa
 
 typedef struct {
     char name[DAY_RECORD_NAME_LEN + 1];
+    char record_id[64];
     uint64_t file_sizes[4];
     uint64_t total_bytes;
 } record_info_t;
@@ -101,6 +102,61 @@ static bool record_name_parse(const char *name, char date[11])
     return true;
 }
 
+static bool load_record_identity(const char *meta_path, const char *record_name,
+                                 uint64_t meta_size, char record_id[64])
+{
+    int fallback = snprintf(record_id, 64, "%s-%s", day_device_id(), record_name);
+    if (fallback < 0 || fallback >= 64 || meta_size == 0 || meta_size > 64U * 1024U) {
+        return fallback > 0 && fallback < 64;
+    }
+    FILE *file = fopen(meta_path, "rb");
+    if (!file) {
+        return true;
+    }
+    char *text = malloc((size_t)meta_size + 1);
+    if (!text) {
+        fclose(file);
+        return true;
+    }
+    bool read_ok = fread(text, 1, (size_t)meta_size, file) == (size_t)meta_size;
+    if (fclose(file) != 0) {
+        read_ok = false;
+    }
+    if (!read_ok) {
+        free(text);
+        return true;
+    }
+    text[meta_size] = '\0';
+    const char *end = NULL;
+    cJSON *meta = cJSON_ParseWithLengthOpts(text, (size_t)meta_size, &end, false);
+    bool parsed_exactly = meta && end == text + meta_size && cJSON_IsObject(meta);
+    free(text);
+    if (!parsed_exactly) {
+        cJSON_Delete(meta);
+        return true;
+    }
+    const cJSON *schema = cJSON_GetObjectItemCaseSensitive(meta, "schema_version");
+    if (!cJSON_IsNumber(schema) || schema->valuedouble != 2) {
+        cJSON_Delete(meta);
+        return true;
+    }
+    const cJSON *state = cJSON_GetObjectItemCaseSensitive(meta, "record_state");
+    const cJSON *device = cJSON_GetObjectItemCaseSensitive(meta, "device_id");
+    const cJSON *identity = cJSON_GetObjectItemCaseSensitive(meta, "record_id");
+    size_t device_len = strlen(day_device_id());
+    bool valid = cJSON_IsString(state) && strcmp(state->valuestring, "complete") == 0 &&
+                 cJSON_IsString(device) && strcmp(device->valuestring, day_device_id()) == 0 &&
+                 cJSON_IsString(identity) && identity->valuestring &&
+                 strlen(identity->valuestring) < 64 &&
+                 strncmp(identity->valuestring, day_device_id(), device_len) == 0 &&
+                 identity->valuestring[device_len] == '-';
+    if (valid) {
+        strlcpy(record_id, identity->valuestring, 64);
+    }
+    cJSON_Delete(meta);
+    return valid;
+}
+
 static bool load_complete_record(const char *name, record_info_t *record, char date[11])
 {
     if (!record_name_parse(name, date)) {
@@ -126,7 +182,10 @@ static bool load_complete_record(const char *name, record_info_t *record, char d
         }
         record->total_bytes += record->file_sizes[i];
     }
-    return true;
+    char meta_path[160];
+    written = snprintf(meta_path, sizeof(meta_path), "%s/meta.json", dir_path);
+    return written > 0 && written < (int)sizeof(meta_path) &&
+           load_record_identity(meta_path, name, record->file_sizes[0], record->record_id);
 }
 
 static int compare_dates_desc(const void *left, const void *right)
@@ -970,9 +1029,7 @@ static esp_err_t create_manifest_json(const day_usb_begin_export_args_t *args,
     for (size_t i = 0; i < record_count; ++i) {
         cJSON *record = cJSON_CreateObject();
         cJSON_AddStringToObject(record, "name", records[i].name);
-        char record_id[64];
-        snprintf(record_id, sizeof(record_id), "%s-%s", day_device_id(), records[i].name);
-        cJSON_AddStringToObject(record, "record_id", record_id);
+        cJSON_AddStringToObject(record, "record_id", records[i].record_id);
         cJSON *files = cJSON_AddArrayToObject(record, "files");
         for (size_t file_index = 0; file_index < 4; ++file_index) {
             cJSON *file = cJSON_CreateObject();
