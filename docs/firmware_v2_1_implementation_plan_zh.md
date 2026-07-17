@@ -1,10 +1,14 @@
 # Day Distiller 固件 2.1.0 完整更新计划书
 
-文档状态：可执行实施基线  
-编写日期：2026-07-17  
-固件基线：`codex/firmware-v2` / `0dbce23` / firmware `2.0.1`  
-桌面端基线：`codex/desktop-sync-production-fix-v2` / `29c059a`  
-目标版本：firmware `2.1.0`  
+文档状态：可执行实施基线
+
+编写日期：2026-07-17
+
+固件基线：`codex/firmware-v2` / `0dbce23` / firmware `2.0.1`
+
+桌面端基线：`codex/desktop-sync-production-fix-v2` / `29c059a`
+
+目标版本：firmware `2.1.0`
 
 ## 1. 版本目标
 
