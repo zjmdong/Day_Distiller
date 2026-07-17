@@ -8,7 +8,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from day_distiller_client.app import MainWindow
 from day_distiller_client.device import PortCandidate
@@ -102,12 +102,13 @@ def test_landing_intro_uses_ordered_title_subtitle_button_footer_timeline() -> N
         subtitle_and_button = sequence.animationAt(1)
         assert subtitle_and_button.animationCount() == 2
         assert subtitle_and_button.animationAt(0).duration() == 800
-        delayed_button = subtitle_and_button.animationAt(1)
-        assert delayed_button.animationAt(0).duration() == 400
-        assert delayed_button.animationAt(1).duration() == 800
+        button = subtitle_and_button.animationAt(1)
+        assert button.duration() == 800
 
         assert sequence.animationAt(2).duration() == 800
-        assert sequence.duration() == 3250
+        assert sequence.duration() == 2850
+        all_copy = "\n".join(label.text() for label in window.window.findChildren(QLabel))
+        assert "隐私与费用" not in all_copy
     finally:
         _close(window, temporary)
 

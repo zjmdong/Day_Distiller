@@ -19,7 +19,7 @@
 
 ## FFmpeg
 
-发布目录已经内置 `ffmpeg.exe`、`ffprobe.exe`、许可证和构建说明，用户无需安装或配置。必须保留整个 `DayDistillerClient` 目录；只复制主 EXE 会导致媒体处理组件缺失。
+Windows 发布目录内置 `ffmpeg.exe` / `ffprobe.exe`，macOS 发布目录内置原生 arm64 `ffmpeg` / `ffprobe`；用户无需安装或配置。必须分发完整 Nuitka 应用目录或官方 ZIP，不能只复制主可执行文件。
 
 `ffprobe failed` 通常表示 AVI/WAV 损坏、尚未写完或编码不受支持；任务会失败且不会清理设备。先复制原文件留证，再检查设备录制日志。
 

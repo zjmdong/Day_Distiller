@@ -16,20 +16,22 @@ def main() -> int:
     args = parser.parse_args()
 
     args.destination.parent.mkdir(parents=True, exist_ok=True)
-    renderer = QSvgRenderer(str(args.source))
-    if not renderer.isValid():
-        raise RuntimeError(f"Invalid SVG icon: {args.source}")
-
-    image = QImage(1024, 1024, QImage.Format.Format_ARGB32)
-    image.fill(0)
-    painter = QPainter(image)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    renderer.render(painter, QRectF(0, 0, 1024, 1024))
-    painter.end()
-
     png_path = args.destination.with_suffix(".png")
-    if not image.save(str(png_path), "PNG"):
-        raise RuntimeError(f"Could not render application icon: {png_path}")
+    if args.source.suffix.lower() == ".svg":
+        renderer = QSvgRenderer(str(args.source))
+        if not renderer.isValid():
+            raise RuntimeError(f"Invalid SVG icon: {args.source}")
+        image = QImage(1024, 1024, QImage.Format.Format_ARGB32)
+        image.fill(0)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        renderer.render(painter, QRectF(0, 0, 1024, 1024))
+        painter.end()
+        if not image.save(str(png_path), "PNG"):
+            raise RuntimeError(f"Could not render application icon: {png_path}")
+    else:
+        with Image.open(args.source) as source:
+            source.convert("RGBA").resize((1024, 1024), Image.Resampling.LANCZOS).save(png_path)
     with Image.open(png_path) as icon:
         icon.save(
             args.destination,

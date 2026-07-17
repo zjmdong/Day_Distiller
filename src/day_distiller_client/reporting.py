@@ -96,11 +96,11 @@ h1 {{ margin:0; font-size:32px; line-height:1.35; font-weight:750; letter-spacin
         try:
             if font_name not in pdfmetrics.getRegisteredFontNames():
                 pdfmetrics.registerFont(
-                    TTFont(font_name, str(_windows_font("msyh.ttc")), subfontIndex=0)
+                    TTFont(font_name, str(_cjk_font(False)), subfontIndex=0)
                 )
             if bold_font_name not in pdfmetrics.getRegisteredFontNames():
                 pdfmetrics.registerFont(
-                    TTFont(bold_font_name, str(_windows_font("msyhbd.ttc")), subfontIndex=0)
+                    TTFont(bold_font_name, str(_cjk_font(True)), subfontIndex=0)
                 )
         except Exception:
             font_name = bold_font_name = "STSong-Light"
@@ -171,11 +171,24 @@ h1 {{ margin:0; font-size:32px; line-height:1.35; font-weight:750; letter-spacin
             raise RuntimeError("PDF rendering did not produce an output file")
 
 
-def _windows_font(filename: str) -> Path:
-    font = Path("C:/Windows/Fonts") / filename
-    if not font.is_file():
-        raise FileNotFoundError(font)
-    return font
+def _cjk_font(bold: bool) -> Path:
+    names = (
+        (
+            Path("C:/Windows/Fonts/msyhbd.ttc"),
+            Path("/System/Library/Fonts/PingFang.ttc"),
+            Path("/System/Library/Fonts/STHeiti Medium.ttc"),
+        )
+        if bold
+        else (
+            Path("C:/Windows/Fonts/msyh.ttc"),
+            Path("/System/Library/Fonts/PingFang.ttc"),
+            Path("/System/Library/Fonts/STHeiti Light.ttc"),
+        )
+    )
+    for font in names:
+        if font.is_file():
+            return font
+    raise FileNotFoundError("No supported system CJK font was found")
 
 
 def day_report_from_json(value: dict[str, object]) -> DayReport:

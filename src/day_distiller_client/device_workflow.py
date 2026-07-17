@@ -147,13 +147,13 @@ class LegacyDeviceWorkflow:
         before = drive_letters()
         self._emit("以只读模式挂载 TF 卡")
         self._enter_msc_when_ready(port.device, "ro", export_ids=export_ids)
-        self._emit("等待 Windows 完成设备卷挂载")
+        self._emit("等待系统完成设备卷挂载")
         drive = wait_for_ready_new_drive(before, timeout=30)
         if drive is None:
             try:
                 self._exit_msc(next_mode="maintenance" if profile.is_firmware_v2 else None)
             finally:
-                raise RuntimeError("设备已进入 MSC，但 Windows 未分配可读取的稳定盘符")
+                raise RuntimeError("设备已进入 MSC，但系统未发现可读取的稳定挂载卷")
         source_root = Path(drive.root)
         try:
             close_explorer_windows_for_drive(drive.letter)

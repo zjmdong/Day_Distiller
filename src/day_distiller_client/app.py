@@ -30,6 +30,17 @@ from .device import (
     find_device,
     list_serial_ports,
 )
+from .device_settings import (
+    FPS_VALUES,
+    FRAME_SIZES,
+    JPEG_QUALITIES,
+    LOW_BATTERY_VALUES,
+    TIMEZONES,
+    WAKE_INTERVALS,
+    DeviceSettingsSnapshot,
+    build_patch,
+    normalize_color,
+)
 from .device_workflow import LegacyDeviceWorkflow, SyncInventory, SyncedDay
 from .domain import JobStage
 from .legacy_import import available_record_dates, normalize_source_root, scan_record_directories
@@ -295,7 +306,7 @@ class MainWindow:
 
         self.window = QMainWindow()
         self.window.setWindowTitle("Day Distiller")
-        icon_path = resource_path("assets", "day-distiller.svg")
+        icon_path = resource_path("assets", "day-distiller-icon.png")
         if icon_path.is_file():
             self.window.setWindowIcon(QIcon(str(icon_path)))
         self.window.resize(1280, 820)
@@ -308,6 +319,8 @@ class MainWindow:
         self.worker = Worker(self.events.put)
         self.device: UsbLinkDevice | None = None
         self.connected_device_profile: DeviceProfile | None = None
+        self.device_settings_snapshot: DeviceSettingsSnapshot | None = None
+        self.device_settings_status: dict[str, Any] = {}
         self.ports: list[PortCandidate] = []
         self.last_drive_letter: str | None = None
         self.active_job_id: str | None = None
@@ -343,7 +356,7 @@ class MainWindow:
         self._load_avatar_profile()
         self.refresh_ports()
         self.refresh_history()
-        # Let the native Windows window-opening animation finish before the
+        # Let the native window-opening animation finish before the
         # landing content begins its own reveal.
         QTimer.singleShot(500, self._play_landing_intro)
 
@@ -593,16 +606,11 @@ class MainWindow:
         first_use_row.addStretch(1)
         first_use_row.addWidget(first_use)
         first_use_row.addStretch(1)
-        privacy = QLabel("隐私与费用：IMU 与地点记忆在本地处理；仅必要的关键帧、音频与证据会发送至已配置服务。")
-        privacy.setObjectName("privacyFootnote")
-        privacy.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        privacy.setWordWrap(True)
         footer_holder = QWidget()
         footer_layout = QVBoxLayout(footer_holder)
         footer_layout.setContentsMargins(0, 0, 0, 0)
         footer_layout.setSpacing(6)
         footer_layout.addLayout(first_use_row)
-        footer_layout.addWidget(privacy)
         landing_layout.addWidget(reveal_container(footer_holder))
         self.home_stack.addWidget(landing)
 
@@ -892,6 +900,7 @@ class MainWindow:
         self.settings_stack.addWidget(self._developer_settings_page())
         self.settings_stack.addWidget(self._developer_history_page())
         self.settings_stack.addWidget(self._manual_debug_page())
+        self.settings_stack.addWidget(self._device_settings_page())
         layout.addWidget(self.settings_stack)
         return page
 
@@ -957,12 +966,223 @@ class MainWindow:
         edit_row.addWidget(self.save_recipient_button)
         mail_layout.addLayout(edit_row)
         layout.addWidget(mail_group)
+
+        device_group = QGroupBox("设备设置")
+        device_layout = QHBoxLayout(device_group)
+        device_copy = QVBoxLayout()
+        device_title = QLabel("录制、网络、时间与状态灯")
+        device_title.setObjectName("modelName")
+        self.device_settings_summary_label = QLabel("连接设备后可读取状态并同步设置")
+        self.device_settings_summary_label.setProperty("muted", True)
+        device_copy.addWidget(device_title)
+        device_copy.addWidget(self.device_settings_summary_label)
+        open_device_settings = self._mark_button(QPushButton("打开设备设置"))
+        open_device_settings.clicked.connect(self.open_device_settings)
+        device_layout.addLayout(device_copy, 1)
+        device_layout.addWidget(open_device_settings)
+        layout.addWidget(device_group)
         layout.addStretch(1)
 
         developer_link = QPushButton("进入开发者设置")
         developer_link.setProperty("role", "link")
         developer_link.clicked.connect(lambda: self.settings_stack.setCurrentIndex(1))
         layout.addWidget(developer_link, alignment=Qt.AlignmentFlag.AlignHCenter)
+        return page
+
+    def _device_settings_page(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import (
+            QCheckBox,
+            QComboBox,
+            QFormLayout,
+            QFrame,
+            QGridLayout,
+            QGroupBox,
+            QHBoxLayout,
+            QLabel,
+            QLineEdit,
+            QPushButton,
+            QScrollArea,
+            QSlider,
+            QSpinBox,
+            QVBoxLayout,
+            QWidget,
+        )
+
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(30, 22, 30, 26)
+        page_layout.setSpacing(14)
+
+        top = QHBoxLayout()
+        back = QPushButton("←  返回设置")
+        back.setProperty("role", "link")
+        back.clicked.connect(lambda: self.settings_stack.setCurrentIndex(0))
+        top.addWidget(back)
+        top.addStretch(1)
+        page_layout.addLayout(top)
+        page_layout.addWidget(
+            self._page_header(
+                "设备设置",
+                "读取设备当前状态，并同步录制、Wi-Fi、时间、自动化和 RGB 状态灯设置。",
+            )
+        )
+
+        toolbar = QFrame()
+        toolbar.setObjectName("workflowStatusCard")
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(18, 14, 18, 14)
+        self.device_settings_connection_label = QLabel("尚未连接设备")
+        self.device_settings_connection_label.setObjectName("workflowStatusText")
+        self.device_settings_refresh_button = self._mark_button(QPushButton("连接并同步"))
+        self.device_settings_refresh_button.clicked.connect(self.refresh_device_settings)
+        toolbar_layout.addWidget(self.device_settings_connection_label, 1)
+        toolbar_layout.addWidget(self.device_settings_refresh_button)
+        page_layout.addWidget(toolbar)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 6, 0)
+        content_layout.setSpacing(14)
+
+        status_group = QGroupBox("设备状态")
+        status_grid = QGridLayout(status_group)
+        self.device_status_values: dict[str, QLabel] = {}
+        status_items = (
+            ("identity", "设备"),
+            ("battery", "电量"),
+            ("rtc", "RTC"),
+            ("clock", "系统时钟"),
+            ("wifi", "Wi-Fi"),
+            ("storage", "存储"),
+            ("power", "唤醒与电源"),
+            ("led", "状态灯"),
+        )
+        for index, (key, title) in enumerate(status_items):
+            card = QFrame()
+            card.setObjectName("modelCard")
+            card_layout = QVBoxLayout(card)
+            caption = QLabel(title)
+            caption.setProperty("muted", True)
+            value = QLabel("—")
+            value.setObjectName("deviceStatusValue")
+            value.setWordWrap(True)
+            card_layout.addWidget(caption)
+            card_layout.addWidget(value)
+            self.device_status_values[key] = value
+            status_grid.addWidget(card, index // 4, index % 4)
+        content_layout.addWidget(status_group)
+
+        columns = QGridLayout()
+        columns.setHorizontalSpacing(14)
+        columns.setVerticalSpacing(14)
+
+        video_group = QGroupBox("录制画质")
+        video_form = QFormLayout(video_group)
+        self.device_framesize_combo = QComboBox()
+        for label, value in FRAME_SIZES:
+            self.device_framesize_combo.addItem(label, value)
+        self.device_quality_combo = QComboBox()
+        for label, value in JPEG_QUALITIES:
+            self.device_quality_combo.addItem(label, value)
+        self.device_fps_combo = QComboBox()
+        for value in FPS_VALUES:
+            self.device_fps_combo.addItem(f"{value} fps", value)
+        video_form.addRow("录像分辨率", self.device_framesize_combo)
+        video_form.addRow("录像质量", self.device_quality_combo)
+        video_form.addRow("录像帧率", self.device_fps_combo)
+        columns.addWidget(video_group, 0, 0)
+
+        wifi_group = QGroupBox("Wi-Fi 配网")
+        wifi_form = QFormLayout(wifi_group)
+        self.device_wifi_ssid_edit = QLineEdit()
+        self.device_wifi_password_edit = QLineEdit()
+        self.device_wifi_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.device_wifi_password_edit.setPlaceholderText("留空则保留设备中已保存的密码")
+        reveal_password = QCheckBox("显示密码")
+        reveal_password.toggled.connect(
+            lambda checked: self.device_wifi_password_edit.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        wifi_form.addRow("Wi-Fi 名称", self.device_wifi_ssid_edit)
+        wifi_form.addRow("Wi-Fi 密码", self.device_wifi_password_edit)
+        wifi_form.addRow("", reveal_password)
+        columns.addWidget(wifi_group, 0, 1)
+
+        time_group = QGroupBox("时间")
+        time_form = QFormLayout(time_group)
+        self.device_timezone_combo = QComboBox()
+        self.device_timezone_combo.setEditable(True)
+        for label, value in TIMEZONES:
+            self.device_timezone_combo.addItem(label, value)
+        self.device_ntp_edit = QLineEdit()
+        self.device_ntp_edit.setPlaceholderText("ntp1.aliyun.com")
+        time_form.addRow("时区", self.device_timezone_combo)
+        time_form.addRow("NTP 服务器", self.device_ntp_edit)
+        columns.addWidget(time_group, 1, 0)
+
+        system_group = QGroupBox("自动记录")
+        system_form = QFormLayout(system_group)
+        self.device_wake_combo = QComboBox()
+        self.device_wake_combo.setEditable(True)
+        for label, value in WAKE_INTERVALS:
+            self.device_wake_combo.addItem(label, value)
+        self.device_auto_record_check = QCheckBox("启用定时唤醒后的自动记录")
+        self.device_low_battery_combo = QComboBox()
+        for value in LOW_BATTERY_VALUES:
+            self.device_low_battery_combo.addItem(f"{value}%", value)
+        system_form.addRow("自动唤醒间隔", self.device_wake_combo)
+        system_form.addRow("自动记录", self.device_auto_record_check)
+        system_form.addRow("低电量关机阈值", self.device_low_battery_combo)
+        columns.addWidget(system_group, 1, 1)
+
+        led_group = QGroupBox("RGB 状态灯")
+        led_form = QFormLayout(led_group)
+        led_brightness_row = QHBoxLayout()
+        self.device_led_slider = QSlider(Qt.Orientation.Horizontal)
+        self.device_led_slider.setRange(5, 100)
+        self.device_led_slider.setValue(100)
+        self.device_led_brightness_spin = QSpinBox()
+        self.device_led_brightness_spin.setRange(5, 100)
+        self.device_led_brightness_spin.setSuffix("%")
+        self.device_led_brightness_spin.setValue(100)
+        self.device_led_slider.valueChanged.connect(self.device_led_brightness_spin.setValue)
+        self.device_led_brightness_spin.valueChanged.connect(self.device_led_slider.setValue)
+        led_brightness_row.addWidget(self.device_led_slider, 1)
+        led_brightness_row.addWidget(self.device_led_brightness_spin)
+        color_row = QHBoxLayout()
+        self.device_led_color_edit = QLineEdit("#FF3000")
+        self.device_led_color_edit.setMaxLength(7)
+        self.device_led_color_button = QPushButton("选择颜色")
+        self.device_led_color_button.clicked.connect(self.choose_device_led_color)
+        self.device_led_preview_button = QPushButton("预览状态灯")
+        self.device_led_preview_button.clicked.connect(self.preview_device_led)
+        color_row.addWidget(self.device_led_color_edit, 1)
+        color_row.addWidget(self.device_led_color_button)
+        color_row.addWidget(self.device_led_preview_button)
+        led_form.addRow("全局亮度", led_brightness_row)
+        led_form.addRow("正在录制颜色", color_row)
+        columns.addWidget(led_group, 2, 0, 1, 2)
+
+        content_layout.addLayout(columns)
+        self.device_settings_notice = QLabel("连接后将根据 capabilities 自动启用固件支持的功能；旧固件仍可正常同步记录。")
+        self.device_settings_notice.setWordWrap(True)
+        self.device_settings_notice.setProperty("muted", True)
+        content_layout.addWidget(self.device_settings_notice)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        self.device_settings_save_button = self._mark_button(QPushButton("保存到设备"))
+        self.device_settings_save_button.clicked.connect(self.save_device_settings)
+        actions.addWidget(self.device_settings_save_button)
+        content_layout.addLayout(actions)
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        page_layout.addWidget(scroll, 1)
+        self._set_device_settings_controls_enabled(False)
         return page
 
     def _developer_settings_page(self):
@@ -987,7 +1207,7 @@ class MainWindow:
         layout.addWidget(
             self._page_header(
                 "开发者设置",
-                "只需首次填写。密钥保存在 Windows 凭据管理器，并按你的要求在此页明文显示。",
+                "只需首次填写。密钥保存在系统安全凭据库，并按你的要求在此页明文显示。",
             )
         )
         notice = QLabel(
@@ -1089,6 +1309,249 @@ class MainWindow:
         layout.addLayout(developer_routes)
         self.refresh_data_usage()
         return page
+
+    def open_device_settings(self) -> None:
+        self.settings_stack.setCurrentIndex(4)
+        self.refresh_device_settings()
+
+    def _set_device_settings_controls_enabled(self, enabled: bool) -> None:
+        for name in (
+            "device_framesize_combo",
+            "device_quality_combo",
+            "device_fps_combo",
+            "device_wifi_ssid_edit",
+            "device_wifi_password_edit",
+            "device_timezone_combo",
+            "device_ntp_edit",
+            "device_wake_combo",
+            "device_auto_record_check",
+            "device_low_battery_combo",
+            "device_led_slider",
+            "device_led_brightness_spin",
+            "device_led_color_edit",
+            "device_led_color_button",
+            "device_led_preview_button",
+            "device_settings_save_button",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def refresh_device_settings(self) -> None:
+        if self.guided_operation_active:
+            self.device_settings_notice.setText("一键同步或蒸馏进行中，请完成当前任务后再修改设备设置。")
+            return
+        self._close_device()
+        self._set_device_settings_controls_enabled(False)
+        self.device_settings_refresh_button.setEnabled(False)
+        self.device_settings_connection_label.setText("正在连接并读取设备…")
+        self.device_settings_notice.setText("正在读取固件能力、状态和设备配置。")
+
+        def work() -> dict[str, Any]:
+            found = find_device(timeout_per_port=1.0)
+            if not found:
+                raise RuntimeError("没有找到 Day Distiller 协议串口，请重启设备并检查 USB 连接")
+            port, hello = found
+            profile = device_profile(hello, port)
+            with UsbLinkDevice(port.device) as device:
+                status = device.get_status()
+                config = device.get_config(include_secrets=True) if profile.supports_device_settings else None
+            return {"port": port, "hello": hello, "status": status, "config": config}
+
+        self.worker.run("device_settings_load", work)
+
+    def _device_settings_from_form(self) -> DeviceSettingsSnapshot:
+        previous = self.device_settings_snapshot
+        timezone = self.device_timezone_combo.currentData()
+        if timezone is None:
+            timezone = self.device_timezone_combo.currentText().strip()
+        wake_value = self.device_wake_combo.currentData()
+        if wake_value is None:
+            raw = self.device_wake_combo.currentText().strip()
+            if not raw.isdigit():
+                raise ValueError("自动唤醒间隔请选择列表项，或输入秒数")
+            wake_value = int(raw)
+        password = self.device_wifi_password_edit.text()
+        if not password and previous and previous.wifi_password_set:
+            password_value: str | None = None
+        else:
+            password_value = password
+        return DeviceSettingsSnapshot(
+            schema_version=previous.schema_version if previous else 1,
+            revision=previous.revision if previous else 0,
+            record_framesize=int(self.device_framesize_combo.currentData()),
+            jpeg_quality=int(self.device_quality_combo.currentData()),
+            record_fps=int(self.device_fps_combo.currentData()),
+            wifi_ssid=self.device_wifi_ssid_edit.text().strip(),
+            wifi_password=password_value,
+            wifi_password_set=bool(password_value) or bool(previous and previous.wifi_password_set),
+            timezone=str(timezone),
+            ntp_server=self.device_ntp_edit.text().strip(),
+            wake_interval_sec=int(wake_value),
+            auto_record_enabled=self.device_auto_record_check.isChecked(),
+            low_battery_percent=int(self.device_low_battery_combo.currentData()),
+            led_brightness_percent=self.device_led_brightness_spin.value(),
+            recording_color=normalize_color(self.device_led_color_edit.text()),
+        )
+
+    def save_device_settings(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        profile = self.connected_device_profile
+        if not profile or not profile.supports_device_settings or not profile.supports("device_config_write"):
+            QMessageBox.information(self.window, "固件不支持", "当前设备固件不支持通过桌面端修改设置。")
+            return
+        try:
+            snapshot = self._device_settings_from_form()
+            patch = build_patch(snapshot, include_password=snapshot.wifi_password is not None)
+        except ValueError as exc:
+            QMessageBox.warning(self.window, "设备设置无效", str(exc))
+            return
+        selected = self._selected_port_candidate()
+        if selected is None:
+            QMessageBox.warning(self.window, "设备未连接", "请先重新连接设备并同步设置。")
+            return
+        self._close_device()
+        self._set_device_settings_controls_enabled(False)
+        self.device_settings_refresh_button.setEnabled(False)
+        self.device_settings_connection_label.setText("正在保存到设备…")
+
+        def work() -> dict[str, Any]:
+            with UsbLinkDevice(selected.device) as device:
+                result = device.set_config(patch, expected_revision=snapshot.revision)
+                config = device.get_config(include_secrets=True)
+                status = device.get_status()
+            return {"port": selected, "result": result, "config": config, "status": status}
+
+        self.worker.run("device_settings_save", work)
+
+    def choose_device_led_color(self) -> None:
+        from PySide6.QtGui import QColor
+        from PySide6.QtWidgets import QColorDialog, QMessageBox
+
+        initial = QColor(self.device_led_color_edit.text())
+        selected = QColorDialog.getColor(initial, self.window, "选择正在录制提示灯颜色")
+        if not selected.isValid():
+            return
+        color = selected.name().upper()
+        try:
+            self.device_led_color_edit.setText(normalize_color(color))
+        except ValueError as exc:
+            QMessageBox.warning(self.window, "颜色无效", str(exc))
+
+    def preview_device_led(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        profile = self.connected_device_profile
+        if not profile or not profile.supports("led_preview"):
+            QMessageBox.information(self.window, "固件不支持", "当前设备固件不支持状态灯预览。")
+            return
+        selected = self._selected_port_candidate()
+        if selected is None:
+            QMessageBox.warning(self.window, "设备未连接", "请先重新连接设备并同步设置。")
+            return
+        try:
+            color = normalize_color(self.device_led_color_edit.text())
+        except ValueError as exc:
+            QMessageBox.warning(self.window, "颜色无效", str(exc))
+            return
+        brightness = self.device_led_brightness_spin.value()
+        self._close_device()
+        self.device_led_preview_button.setEnabled(False)
+        self.device_settings_notice.setText("正在让设备临时预览当前颜色；2 秒后会恢复原有灯效。")
+
+        def work() -> dict[str, Any]:
+            with UsbLinkDevice(selected.device) as device:
+                return device.preview_led(color, brightness, duration_ms=2000)
+
+        self.worker.run("device_led_preview", work)
+
+    @staticmethod
+    def _combo_select_data(combo, value: Any) -> None:
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        elif combo.isEditable():
+            combo.setEditText(str(value))
+
+    def _populate_device_settings(self, snapshot: DeviceSettingsSnapshot) -> None:
+        self.device_settings_snapshot = snapshot
+        self._combo_select_data(self.device_framesize_combo, snapshot.record_framesize)
+        self._combo_select_data(self.device_quality_combo, snapshot.jpeg_quality)
+        self._combo_select_data(self.device_fps_combo, snapshot.record_fps)
+        self.device_wifi_ssid_edit.setText(snapshot.wifi_ssid)
+        self.device_wifi_password_edit.setText(snapshot.wifi_password or "")
+        self._combo_select_data(self.device_timezone_combo, snapshot.timezone)
+        self.device_ntp_edit.setText(snapshot.ntp_server)
+        self._combo_select_data(self.device_wake_combo, snapshot.wake_interval_sec)
+        self.device_auto_record_check.setChecked(snapshot.auto_record_enabled)
+        self._combo_select_data(self.device_low_battery_combo, snapshot.low_battery_percent)
+        self.device_led_brightness_spin.setValue(snapshot.led_brightness_percent)
+        self.device_led_color_edit.setText(snapshot.recording_color)
+
+    @staticmethod
+    def _available(value: Any) -> bool:
+        return isinstance(value, dict) and value.get("available", True) is not False
+
+    def _populate_device_status_cards(self, status: dict[str, Any], profile: DeviceProfile) -> None:
+        def section(name: str) -> dict[str, Any]:
+            value = status.get(name)
+            return value if isinstance(value, dict) else {}
+
+        battery, rtc, clock = section("battery"), section("rtc"), section("clock")
+        wifi, storage, power, led = (
+            section("wifi"), section("storage"), section("power"), section("led")
+        )
+        self.device_status_values["identity"].setText(
+            f"{profile.display_firmware}\n{profile.serial_number}"
+        )
+        self.device_status_values["battery"].setText(
+            (
+                f"{battery.get('soc_percent', '—')}% · {battery.get('voltage_v', '—')} V\n"
+                f"{battery.get('charge_state', 'unknown')}"
+            )
+            if self._available(battery)
+            else "当前不可用"
+        )
+        self.device_status_values["rtc"].setText(
+            (
+                f"{'有效' if rtc.get('valid') else '无效'} · {rtc.get('iso8601') or '未校时'}"
+            )
+            if self._available(rtc)
+            else "当前不可用"
+        )
+        self.device_status_values["clock"].setText(
+            (
+                f"{'可信' if clock.get('system_valid') else '未校准'} · {clock.get('timezone', '—')}\n"
+                f"来源 {clock.get('source', '—')} · 上次 {clock.get('last_sync_source', '—')}"
+            )
+            if clock
+            else "当前固件未提供"
+        )
+        wifi_state = "已连接" if wifi.get("sta_connected") else "已配置" if wifi.get("configured") else "未配置"
+        self.device_status_values["wifi"].setText(
+            f"{wifi_state} · {wifi.get('ssid') or '—'}\n{wifi.get('ip') or '无 IP'}"
+            if self._available(wifi)
+            else "当前不可用"
+        )
+        self.device_status_values["storage"].setText(
+            f"{'已就绪' if storage.get('ready') else '未就绪'} · "
+            f"{'USB 已挂载' if storage.get('usb_exposed') else '设备端'}"
+            if storage
+            else "当前固件未提供"
+        )
+        self.device_status_values["power"].setText(
+            f"{power.get('wake_reason', '—')} · 下次 {power.get('next_wake_sec', '—')} 秒\n"
+            f"{'低电量锁定' if power.get('low_battery_latched') else '正常'}"
+            if power
+            else "当前固件未提供"
+        )
+        self.device_status_values["led"].setText(
+            f"{led.get('mode', '—')} · {led.get('brightness_percent', '—')}%\n"
+            f"录制 {led.get('recording_color', '—')}"
+            if led
+            else "当前固件未提供"
+        )
 
     def _developer_history_page(self):
         from PySide6.QtWidgets import QHBoxLayout, QListWidget, QPushButton, QVBoxLayout, QWidget
@@ -1221,7 +1684,7 @@ class MainWindow:
                 ("电量", self.battery_status_label),
                 ("RTC 时钟", self.rtc_status_label),
                 ("TF 卡", self.storage_label),
-                ("Windows 盘符", self.drive_label),
+                ("挂载卷", self.drive_label),
             )
         ):
             grid.addWidget(QLabel(label), index, 0)
@@ -1430,7 +1893,7 @@ class MainWindow:
         layout = QVBoxLayout(page)
         notice = QLabel(
             "云端模式会把本地抽取的关键帧、音频和结构化证据发送到所选 API。Responses 请求使用 store:false，"
-            "但这不等同于 Zero Data Retention。API Key 与 SMTP 密码只保存到 Windows Credential Manager。"
+            "但这不等同于 Zero Data Retention。API Key 与 SMTP 密码只保存到系统安全凭据库。"
         )
         notice.setWordWrap(True)
         layout.addWidget(notice)
@@ -1631,10 +2094,9 @@ class MainWindow:
         subtitle_and_button.addAnimation(
             reveal_group(*subtitle, 800, subtitle_and_button)
         )
-        delayed_button = QSequentialAnimationGroup(subtitle_and_button)
-        delayed_button.addPause(400)
-        delayed_button.addAnimation(reveal_group(*button, 800, delayed_button))
-        subtitle_and_button.addAnimation(delayed_button)
+        subtitle_and_button.addAnimation(
+            reveal_group(*button, 800, subtitle_and_button)
+        )
         sequence.addAnimation(subtitle_and_button)
 
         sequence.addAnimation(reveal_group(*footer, 800, sequence))
@@ -2887,6 +3349,24 @@ class MainWindow:
                     self.distill_log.appendPlainText(f"{name} 失败：{error}")
                     self._set_busy(False)
                     self.refresh_history()
+                elif name in {"device_settings_load", "device_settings_save", "device_led_preview"}:
+                    self.device_settings_refresh_button.setEnabled(True)
+                    self.device_led_preview_button.setEnabled(
+                        bool(self.connected_device_profile and self.connected_device_profile.supports("led_preview"))
+                    )
+                    self.device_settings_connection_label.setText("设备设置同步失败")
+                    self.device_settings_notice.setText(str(error))
+                    if name == "device_settings_load":
+                        self.device_settings_snapshot = None
+                        self._set_device_settings_controls_enabled(False)
+                    else:
+                        self._set_device_settings_controls_enabled(
+                            bool(
+                                self.connected_device_profile
+                                and self.connected_device_profile.supports("device_config_write")
+                                and self.device_settings_snapshot
+                            )
+                        )
                 elif name == "style_test":
                     self.style_preview_spinner.stop()
                     self.style_preview_spinner_layer.hide()
@@ -2898,7 +3378,62 @@ class MainWindow:
             self._handle_result(name, result)
 
     def _handle_result(self, name: str, result: Any) -> None:
-        if name == "guided_discover":
+        if name == "device_settings_load":
+            port = result["port"]
+            status = result["status"]
+            profile = device_profile(status, port)
+            self.refresh_ports()
+            self._select_port(port.device)
+            self._apply_status(status, port)
+            self.device_settings_status = status
+            self._populate_device_status_cards(status, profile)
+            self.device_settings_connection_label.setText(
+                f"已连接 · {profile.display_firmware} · {profile.serial_number}"
+            )
+            self.device_settings_refresh_button.setEnabled(True)
+            config = result.get("config")
+            if isinstance(config, dict):
+                snapshot = DeviceSettingsSnapshot.from_payload(config)
+                self._populate_device_settings(snapshot)
+                can_write = profile.supports("device_config_write")
+                self._set_device_settings_controls_enabled(can_write)
+                self.device_settings_notice.setText(
+                    f"设备设置已同步 · 配置版本 {snapshot.schema_version} · revision {snapshot.revision}"
+                    + ("" if can_write else "；当前固件仅允许读取")
+                )
+                self.device_settings_summary_label.setText(
+                    f"{profile.display_firmware} · 电量、时间、网络和录制设置已同步"
+                )
+            else:
+                self.device_settings_snapshot = None
+                self._set_device_settings_controls_enabled(False)
+                self.device_settings_notice.setText(
+                    "当前固件未声明 device_config_v1；可查看基础状态，设备同步仍按兼容协议运行。"
+                )
+                self.device_settings_summary_label.setText(
+                    f"{profile.display_firmware} · 当前固件不支持桌面端配置"
+                )
+        elif name == "device_settings_save":
+            port = result["port"]
+            status = result["status"]
+            profile = device_profile(status, port)
+            self._apply_status(status, port)
+            self.device_settings_status = status
+            self._populate_device_status_cards(status, profile)
+            snapshot = DeviceSettingsSnapshot.from_payload(result["config"])
+            self._populate_device_settings(snapshot)
+            self._set_device_settings_controls_enabled(profile.supports("device_config_write"))
+            self.device_settings_refresh_button.setEnabled(True)
+            self.device_settings_connection_label.setText(
+                f"已保存 · {profile.display_firmware} · revision {snapshot.revision}"
+            )
+            self.device_settings_notice.setText(
+                "设置已安全写入设备。录制参数会在设备空闲时生效，网络参数会在下次冷启动使用。"
+            )
+        elif name == "device_led_preview":
+            self.device_led_preview_button.setEnabled(True)
+            self.device_settings_notice.setText("状态灯预览已发送；预览结束后设备会自动恢复原有灯效。")
+        elif name == "guided_discover":
             from PySide6.QtCore import QTimer
 
             self.guided_discovery_inflight = False
@@ -3119,6 +3654,8 @@ class MainWindow:
                 f"{battery.get('soc_percent', battery.get('soc', '-'))}% · "
                 f"{battery.get('voltage_v', battery.get('voltage', '-'))} V"
             )
+            if battery and battery.get("available", True) is not False
+            else "当前不可用"
             if battery
             else "当前固件未通过 USB 提供"
         )
@@ -3127,6 +3664,8 @@ class MainWindow:
                 f"{'有效' if rtc.get('valid') else '无效'} · "
                 f"{rtc.get('iso8601', rtc.get('iso', '-'))}"
             )
+            if rtc and rtc.get("available", True) is not False
+            else "当前不可用"
             if rtc
             else "当前固件未通过 USB 提供"
         )
@@ -3138,6 +3677,8 @@ class MainWindow:
             or "-"
         )
         self._set_device_feature_availability(profile)
+        if hasattr(self, "device_status_values"):
+            self._populate_device_status_cards(status, profile)
         info = (
             f"固件 {profile.display_firmware}  ·  序列号 {profile.serial_number}  ·  "
             f"{profile.adapter_name}"

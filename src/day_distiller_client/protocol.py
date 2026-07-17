@@ -40,6 +40,9 @@ class Command(IntEnum):
     END_SESSION = 9
     GET_EXPORT_STATUS = 10
     LIST_RECORD_DATES = 11
+    GET_CONFIG = 12
+    SET_CONFIG = 13
+    PREVIEW_LED = 14
 
 
 class Status(IntEnum):

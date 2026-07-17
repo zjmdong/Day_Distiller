@@ -7,7 +7,7 @@
 3. 在应用设置页填写 Resend SMTP 参数：主机 `smtp.resend.com`、SSL/TLS端口 `465`（或STARTTLS端口 `587`）、API Key、发件地址和日报收件地址。SMTP用户名固定为 `resend`，API Key作为SMTP密码。发件地址的域名必须与 Resend 已验证域名完全一致。
 4. 在“形象与风格”页上传一张清晰的单人正面或半身照片，填写简短形象描述，再从5个内置艺术风格中选择一个；也可输入不超过200字的自定义风格。最多只发送3张图片，当天选出两个Moment时可把参考形象作为第三张输入。
 
-API Key只保存在Windows Credential Manager，并会在本机设置页明文回显。不要通过聊天、截图或Git提交密钥；查看设置页时注意旁人和录屏软件。
+API Key 只保存在系统安全凭据库（Windows Credential Manager / macOS Keychain），并会在本机设置页明文回显。不要通过聊天、截图或 Git 提交密钥；查看设置页时注意旁人和录屏软件。
 
 ## 每天使用
 

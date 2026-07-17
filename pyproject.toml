@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "day-distiller-client"
-version = "0.2.0"
-description = "Windows USB Link client for Day Distiller"
+version = "0.3.0"
+description = "Day Distiller desktop client for Windows and Apple Silicon macOS"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -24,7 +24,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
-    "pyinstaller>=6",
+    "nuitka>=2.7,<3",
+    "ordered-set>=4.1",
+    "zstandard>=0.23",
 ]
 
 [project.scripts]

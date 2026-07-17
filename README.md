@@ -1,11 +1,12 @@
-# Day Distiller Windows Client v2
+# Day Distiller Desktop App
 
-Day Distiller 的 Windows 上位机与“AI 每日蒸馏”工作流。当前版本直接兼容协议 v1 固件，不要求先升级设备。
+Day Distiller 的 Windows / Apple Silicon macOS 桌面端与“AI 每日蒸馏”工作流。应用通过 capabilities 自动兼容 1.x、2.0.x 和 2.1.x 固件；旧设备无需升级即可继续同步，新设备会按能力开放状态与设置。
 
 ## 已实现
 
-- 七页 PySide6 消费者界面：开始、设备、记录、生成、回忆、形象与风格、设置。
+- 四入口 PySide6 消费者界面：开始、回忆、形象与风格、设置；设备、记录和生成调试页收纳在开发者设置中。
 - 现有固件 `HELLO`、`GET_STATUS`、只读/读写 MSC、`PING` 和安全弹出。
+- 固件 2.1 `GET_CONFIG` / `SET_CONFIG` / `PREVIEW_LED`，以及电量、RTC、校时来源、Wi-Fi、电源、存储和 LED 状态；所有新功能均按 capability 启用。
 - 按日期导入 `REC_XXXX_YYMMDD_HHMMSS`，复制后进行大小与 SHA-256 双重校验。
 - SQLite 可恢复任务状态机；失败记录错误与恢复阶段。
 - FFprobe/FFmpeg 媒体验证、0.5/2.5/4.5 秒关键帧与场景变化补帧。
@@ -55,6 +56,8 @@ python -m pip install -e .[dev]
 .\scripts\build.ps1
 ```
 
-生成的目录版程序位于 `dist\DayDistillerClient`。必须分发整个目录，不能只复制 EXE；FFmpeg、FFprobe和许可证已经内置。
+生产包使用 Nuitka 原生编译，不再使用 PyInstaller。Windows 构建输出为 `dist\DayDistiller-Windows-x64.zip`。macOS 必须在 Apple Silicon 主机上执行 `./scripts/build_macos.sh`，输出 `dist/DayDistiller-macOS-AppleSilicon.zip`；仓库的 GitHub Actions 会在 M1 arm64 runner 上同时测试并构建该版本。两个平台均内置 FFmpeg/FFprobe。
 
-应用数据默认位于 `%LOCALAPPDATA%\DayDistillerV2`，可通过 `DAY_DISTILLER_DATA_DIR` 改到测试目录。原始导入素材与成品长期保留，由用户手动清理。
+设备设置与兼容矩阵见 [固件 2.1 桌面端适配说明](docs/firmware-2.1-desktop-adaptation.md)，构建细节见 [Nuitka 构建与发布](docs/nuitka-build.md)。
+
+应用数据在 Windows 默认位于 `%LOCALAPPDATA%\DayDistillerV2`，在 macOS 位于 `~/Library/Application Support/Day Distiller`；可通过 `DAY_DISTILLER_DATA_DIR` 改到测试目录。原始导入素材与成品长期保留，由用户手动清理。

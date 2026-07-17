@@ -1,4 +1,4 @@
-"""Day Distiller Windows USB Link client."""
+"""Day Distiller cross-platform USB Link desktop client."""
 
 __all__ = ["__version__"]
 

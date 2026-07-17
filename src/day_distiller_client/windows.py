@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 import time
+import platform
+import plistlib
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -19,7 +21,9 @@ class DriveInfo:
 
     @property
     def root(self) -> str:
-        return f"{self.letter}:\\"
+        if platform.system() == "Windows":
+            return f"{self.letter}:\\"
+        return self.letter
 
 
 def _wmi_service():
@@ -29,6 +33,10 @@ def _wmi_service():
 
 
 def list_removable_drives() -> list[DriveInfo]:
+    if platform.system() == "Darwin":
+        return _list_macos_removable_drives()
+    if platform.system() != "Windows":
+        return []
     try:
         svc = _wmi_service()
         drives = []
@@ -46,6 +54,38 @@ def list_removable_drives() -> list[DriveInfo]:
         return sorted(drives, key=lambda drive: drive.letter)
     except Exception:
         return []
+
+
+def _list_macos_removable_drives() -> list[DriveInfo]:
+    drives: list[DriveInfo] = []
+    volumes = Path("/Volumes")
+    if not volumes.is_dir():
+        return drives
+    for mount in volumes.iterdir():
+        try:
+            result = subprocess.run(
+                ["diskutil", "info", "-plist", str(mount)],
+                capture_output=True,
+                check=False,
+                timeout=4,
+            )
+            if result.returncode != 0:
+                continue
+            info = plistlib.loads(result.stdout)
+            if not bool(info.get("RemovableMedia") or info.get("Ejectable") or info.get("Internal") is False):
+                continue
+            drives.append(
+                DriveInfo(
+                    letter=str(mount),
+                    label=str(info.get("VolumeName") or mount.name),
+                    filesystem=str(info.get("FilesystemName") or info.get("FilesystemType") or ""),
+                    size=int(info["TotalSize"]) if info.get("TotalSize") is not None else None,
+                    free=int(info["FreeSpace"]) if info.get("FreeSpace") is not None else None,
+                )
+            )
+        except (OSError, ValueError, plistlib.InvalidFileException, subprocess.SubprocessError):
+            continue
+    return sorted(drives, key=lambda drive: drive.letter)
 
 
 def drive_letters(drives: list[DriveInfo] | None = None) -> set[str]:
@@ -100,6 +140,9 @@ def wait_for_ready_new_drive(before: set[str], timeout: float = 30.0) -> DriveIn
 def close_explorer_windows_for_drive(letter: str) -> int:
     """Close AutoPlay Explorer windows that point at the device volume."""
 
+    if platform.system() != "Windows":
+        return 0
+
     normalized = letter.rstrip(":\\").upper()
     if len(normalized) != 1:
         return 0
@@ -134,6 +177,21 @@ def _wait_for_drive_removal(letter: str, timeout: float = 10.0) -> bool:
 
 
 def safe_eject(letter: str) -> None:
+    if platform.system() == "Darwin":
+        mount = str(Path(letter))
+        completed = subprocess.run(
+            ["diskutil", "eject", mount],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(f"failed to eject {mount}: {detail}")
+        return
+    if platform.system() != "Windows":
+        raise RuntimeError("safe eject is supported only on Windows and macOS")
     letter = letter.rstrip(":\\").upper()
     if not letter or len(letter) != 1:
         raise ValueError("drive letter must be a single letter")

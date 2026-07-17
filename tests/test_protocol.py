@@ -44,6 +44,13 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame.command, Command.LIST_RECORD_DATES)
         self.assertEqual(frame.payload_json(), {"cursor": 0, "limit": 15})
 
+    def test_firmware_v2_1_commands_are_additive(self) -> None:
+        self.assertEqual(int(Command.GET_CONFIG), 12)
+        self.assertEqual(int(Command.SET_CONFIG), 13)
+        self.assertEqual(int(Command.PREVIEW_LED), 14)
+        frame = parse_frame(build_request(Command.GET_CONFIG, 12, {"include_secrets": True}))
+        self.assertEqual(frame.payload_json(), {"include_secrets": True})
+
     def test_crc_failure(self) -> None:
         raw = bytearray(build_request(Command.PING, 1, {}))
         raw[-1] ^= 0x55

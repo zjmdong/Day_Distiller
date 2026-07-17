@@ -57,6 +57,17 @@ class DeviceProfile:
     def display_firmware(self) -> str:
         return self.firmware_version or "1.x（旧版）"
 
+    def supports(self, capability: str) -> bool:
+        return capability in self.capabilities
+
+    @property
+    def supports_device_settings(self) -> bool:
+        return self.supports("device_config_v1")
+
+    @property
+    def supports_device_status(self) -> bool:
+        return self.supports("device_status_v2")
+
 
 class UsbLinkDevice:
     def __init__(self, port: str, baudrate: int = DEFAULT_BAUDRATE, timeout: float = DEFAULT_TIMEOUT) -> None:
@@ -228,6 +239,41 @@ class UsbLinkDevice:
 
     def end_session(self) -> dict[str, Any]:
         return self.request(Command.END_SESSION, {}, timeout=5.0).payload_json()
+
+    def get_config(self, include_secrets: bool = True) -> dict[str, Any]:
+        return self.request(
+            Command.GET_CONFIG,
+            {"include_secrets": bool(include_secrets)},
+            timeout=5.0,
+        ).payload_json()
+
+    def set_config(
+        self,
+        patch: dict[str, Any],
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        if not patch:
+            raise ValueError("device config patch cannot be empty")
+        payload: dict[str, Any] = {"patch": patch}
+        if expected_revision is not None:
+            payload["expected_revision"] = int(expected_revision)
+        return self.request(Command.SET_CONFIG, payload, timeout=8.0).payload_json()
+
+    def preview_led(
+        self,
+        color: str,
+        brightness_percent: int,
+        duration_ms: int = 2000,
+    ) -> dict[str, Any]:
+        return self.request(
+            Command.PREVIEW_LED,
+            {
+                "color": color,
+                "brightness_percent": int(brightness_percent),
+                "duration_ms": int(duration_ms),
+            },
+            timeout=5.0,
+        ).payload_json()
 
 
 def _interface_number(hwid: str, location: str | None = None) -> int | None:

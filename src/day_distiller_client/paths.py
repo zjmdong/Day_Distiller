@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,7 +22,12 @@ class AppPaths:
             root = Path(override).expanduser().resolve()
         else:
             local = os.environ.get("LOCALAPPDATA")
-            root = Path(local) / "DayDistillerV2" if local else Path.home() / ".day-distiller-v2"
+            if local:
+                root = Path(local) / "DayDistillerV2"
+            elif platform.system() == "Darwin":
+                root = Path.home() / "Library" / "Application Support" / "Day Distiller"
+            else:
+                root = Path.home() / ".day-distiller-v2"
         return cls.from_root(root)
 
     @classmethod
@@ -40,4 +46,3 @@ class AppPaths:
         for path in (self.root, self.imports, self.reports, self.cache, self.logs):
             path.mkdir(parents=True, exist_ok=True)
         return self
-
