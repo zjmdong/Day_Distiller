@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from day_distiller_client.app import MainWindow
+from day_distiller_client.device import PortCandidate
 from day_distiller_client.device_workflow import SyncInventory, SyncedDate
 
 
@@ -107,5 +108,50 @@ def test_landing_intro_uses_ordered_title_subtitle_button_footer_timeline() -> N
 
         assert sequence.animationAt(2).duration() == 800
         assert sequence.duration() == 3250
+    finally:
+        _close(window, temporary)
+
+
+def test_firmware_and_serial_are_shown_and_v2_features_are_gated() -> None:
+    window, temporary = _window()
+    try:
+        port = PortCandidate(
+            "COM9",
+            "USB 串行设备",
+            "USB VID:PID=303A:4020 MI_02",
+            0x303A,
+            0x4020,
+            True,
+            serial_number="DD-USB-TEST",
+            interface_number=2,
+            role="protocol",
+        )
+        window._apply_status(
+            {
+                "protocol": 1,
+                "firmware_version": "2.0.0",
+                "device": "Day Distiller",
+                "device_id": "DD-AABBCCDDEEFF",
+                "mode": "serial",
+                "capabilities": [
+                    "transactional_export_v2",
+                    "list_record_dates",
+                    "get_export_status",
+                    "end_session",
+                ],
+                "storage": {"ready": True},
+            },
+            port,
+        )
+
+        assert window.firmware_version_label.text() == "2.0.0"
+        assert window.device_serial_label.text() == "DD-USB-TEST"
+        assert "2.0.0" in window.guided_device_info.text()
+        assert "DD-USB-TEST" in window.guided_sync_device_info.text()
+        assert window.v2_dates_button.isEnabled()
+        assert window.v2_exports_button.isEnabled()
+        assert window.v2_end_session_button.isEnabled()
+        assert window.battery_status_label.text() == "当前固件未通过 USB 提供"
+        assert window.rtc_status_label.text() == "当前固件未通过 USB 提供"
     finally:
         _close(window, temporary)

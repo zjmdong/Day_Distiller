@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 from typing import Callable, Iterable
 
-from .device import PortCandidate, UsbLinkDevice, find_device
-from .export_adapter import MaintenanceKeepAlive
+from .device import DeviceProfile, PortCandidate, UsbLinkDevice, device_profile, find_device
+from .export_adapter import MaintenanceKeepAlive, select_export_adapter
 from .legacy_import import CachedRecord, delete_verified_source_records, sync_legacy_cache
 from .pipeline import DistillationPipeline, PipelineResult
+from .protocol import ProtocolError
 from .windows import (
     close_explorer_windows_for_drive,
     drive_letters,
@@ -39,11 +42,24 @@ class SyncedDate:
 
 
 @dataclass(frozen=True)
+class ExportTransaction:
+    export_id: str
+    target_date: date
+    manifest_sha256: str
+    record_count: int
+    manifest_path: str
+    state: str = "prepared"
+
+
+@dataclass(frozen=True)
 class SyncInventory:
     """Verified local cache contents discovered during one device mount."""
 
     cache_root: Path
     days: tuple[SyncedDate, ...]
+    adapter_name: str = "legacy_msc_v1"
+    device_profile: DeviceProfile | None = None
+    exports: tuple[ExportTransaction, ...] = ()
 
     @property
     def total_records(self) -> int:
@@ -69,6 +85,8 @@ class LegacyDeviceWorkflow:
         self.sync_progress = sync_progress
         self.discovery_timeout = discovery_timeout
         self._keepalive: MaintenanceKeepAlive | None = None
+        self.adapter_name = "legacy_msc_v1"
+        self.connected_profile: DeviceProfile | None = None
 
     def run_day(
         self,
@@ -105,19 +123,35 @@ class LegacyDeviceWorkflow:
 
         self._emit("正在发现设备并执行 HELLO / GET_STATUS")
         port, hello = self._wait_for_device()
-        capabilities = set(hello.get("capabilities", [])) if isinstance(hello.get("capabilities"), list) else set()
-        adapter = "transactional_export_v2" if "transactional_export_v2" in capabilities else "legacy_msc_v1"
-        if adapter != "legacy_msc_v1":
-            self._emit("检测到 v2 能力；当前版本仍使用兼容的 legacy_msc_v1 路径")
+        profile = device_profile(hello, port)
+        self.connected_profile = profile
+        self.adapter_name = select_export_adapter(profile).adapter_name
+        transactions: tuple[ExportTransaction, ...] = ()
+        export_ids: tuple[str, ...] = ()
+        if profile.is_firmware_v2:
+            self._emit(
+                f"检测到固件 {profile.display_firmware}，启用 transactional_export_v2"
+            )
+            with UsbLinkDevice(port.device, timeout=1.2) as device:
+                summaries = self._list_v2_record_dates(device)
+                if len(summaries) > 32:
+                    self._emit("设备记录超过 32 个日期，本次安全回退 legacy_msc_v1")
+                    self.adapter_name = "legacy_msc_v1"
+                else:
+                    transactions = tuple(
+                        self._prepare_v2_export(device, profile, item)
+                        for item in summaries
+                    )
+                    export_ids = tuple(item.export_id for item in transactions)
 
         before = drive_letters()
         self._emit("以只读模式挂载 TF 卡")
-        self._enter_msc_when_ready(port.device, "ro")
+        self._enter_msc_when_ready(port.device, "ro", export_ids=export_ids)
         self._emit("等待 Windows 完成设备卷挂载")
         drive = wait_for_ready_new_drive(before, timeout=30)
         if drive is None:
             try:
-                self._exit_msc()
+                self._exit_msc(next_mode="maintenance" if profile.is_firmware_v2 else None)
             finally:
                 raise RuntimeError("设备已进入 MSC，但 Windows 未分配可读取的稳定盘符")
         source_root = Path(drive.root)
@@ -146,14 +180,93 @@ class LegacyDeviceWorkflow:
                 )
                 for target_date, records in sorted(grouped.items(), reverse=True)
             )
-            inventory = SyncInventory(Path(cache_root).resolve(), days)
+            inventory = SyncInventory(
+                Path(cache_root).resolve(),
+                days,
+                adapter_name=self.adapter_name,
+                device_profile=profile,
+                exports=transactions,
+            )
             self._emit(
                 f"本地校验完成：共 {inventory.total_records} 条，"
                 f"其中新增或更新 {inventory.changed_records} 条"
             )
         finally:
-            self._eject_and_exit(drive.letter, drive.root)
+            self._eject_and_exit(
+                drive.letter,
+                drive.root,
+                next_mode="maintenance" if profile.is_firmware_v2 else None,
+            )
         return inventory
+
+    def _list_v2_record_dates(self, device: UsbLinkDevice) -> list[dict[str, object]]:
+        items: list[dict[str, object]] = []
+        cursor = 0
+        while True:
+            page = device.list_record_dates(cursor=cursor, limit=15)
+            raw_items = page.get("items")
+            if not isinstance(raw_items, list):
+                raise RuntimeError("固件 LIST_RECORD_DATES 返回格式无效")
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    raise RuntimeError("固件日期列表包含无效条目")
+                date.fromisoformat(str(item.get("date", "")))
+                items.append(item)
+            next_cursor = page.get("next_cursor")
+            if next_cursor is None:
+                return items
+            cursor = int(next_cursor)
+
+    def _active_v2_exports(self, device: UsbLinkDevice) -> dict[str, dict[str, object]]:
+        active: dict[str, dict[str, object]] = {}
+        cursor = 0
+        while True:
+            page = device.get_export_status(cursor=cursor, limit=8)
+            raw_items = page.get("items")
+            if not isinstance(raw_items, list):
+                return active
+            for item in raw_items:
+                if isinstance(item, dict) and item.get("date"):
+                    active[str(item["date"])] = item
+            next_cursor = page.get("next_cursor")
+            if next_cursor is None:
+                return active
+            cursor = int(next_cursor)
+
+    def _prepare_v2_export(
+        self,
+        device: UsbLinkDevice,
+        profile: DeviceProfile,
+        summary: dict[str, object],
+    ) -> ExportTransaction:
+        target_date = date.fromisoformat(str(summary["date"]))
+        fingerprint = (
+            f"{profile.device_id}|{target_date.isoformat()}|"
+            f"{int(summary.get('record_count', 0))}|{int(summary.get('total_bytes', 0))}"
+        )
+        request_id = "desktop-" + hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:40]
+        try:
+            response = device.begin_export(target_date.isoformat(), request_id)
+        except ProtocolError as exc:
+            if "DATE_ALREADY_PREPARED" not in str(exc).upper():
+                raise
+            active = self._active_v2_exports(device).get(target_date.isoformat())
+            if not active or not active.get("export_id"):
+                raise
+            response = device.get_export_status(str(active["export_id"]))
+        transaction = ExportTransaction(
+            export_id=str(response["export_id"]),
+            target_date=target_date,
+            manifest_sha256=str(response["manifest_sha256"]),
+            record_count=int(response["record_count"]),
+            manifest_path=str(response["manifest_path"]),
+            state=str(response.get("state", "prepared")),
+        )
+        if transaction.state != "prepared":
+            raise RuntimeError(
+                f"日期 {target_date.isoformat()} 的导出事务状态不是 prepared：{transaction.state}"
+            )
+        return transaction
 
     def prepare_days(
         self,
@@ -165,6 +278,7 @@ class LegacyDeviceWorkflow:
         """Create recoverable jobs from already verified local cache days."""
 
         available = {item.target_date: item for item in inventory.days}
+        exports = {item.target_date: item for item in inventory.exports}
         requested = list(dict.fromkeys(target_dates))
         if not requested:
             raise ValueError("请至少选择一个需要蒸馏的日期")
@@ -177,11 +291,37 @@ class LegacyDeviceWorkflow:
             job_id = self.pipeline.import_legacy(
                 source_root,
                 target_date,
-                device_id,
+                inventory.device_profile.device_id
+                if inventory.device_profile
+                else device_id,
                 provider_mode,
             )
+            transaction = exports.get(target_date)
+            if transaction:
+                self._attach_export_transaction(job_id, transaction)
             prepared.append(SyncedDay(job_id, day.record_names, target_date))
         return prepared
+
+    def _attach_export_transaction(
+        self,
+        job_id: str,
+        transaction: ExportTransaction,
+    ) -> None:
+        job = self.pipeline.database.get_job(job_id)
+        if not job.manifest_path:
+            raise RuntimeError("任务缺少本地导入清单")
+        manifest_path = Path(job.manifest_path)
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+        value["adapter"] = "transactional_export_v2"
+        transaction_value = asdict(transaction)
+        transaction_value["target_date"] = transaction.target_date.isoformat()
+        value["device_export"] = transaction_value
+        temporary = manifest_path.with_suffix(".json.part")
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(manifest_path)
 
     def process_synced(
         self,
@@ -207,30 +347,104 @@ class LegacyDeviceWorkflow:
         job = self.pipeline.database.get_job(job_id)
         if not job.manifest_path:
             raise RuntimeError("任务缺少导入清单")
+        manifest_path = Path(job.manifest_path)
+        transaction = self._load_export_transaction(manifest_path)
+        if transaction:
+            deleted = self._commit_export_transaction(transaction)
+            self.pipeline.database.set_cleanup_state(job_id, "completed")
+            return deleted
         deleted: list[str] = []
 
         def cleanup(_job_id: str, manifest: Path) -> None:
             nonlocal deleted
             deleted = self._mount_rw_delete_and_exit(manifest)
 
-        cleanup(job_id, Path(job.manifest_path))
+        cleanup(job_id, manifest_path)
         self.pipeline.database.set_cleanup_state(job_id, "completed")
         return deleted
 
     def _cleanup_after_delivery(self, _job_id: str, manifest_path: Path) -> None:
         if self._keepalive:
             self._keepalive.stop()
+        transaction = self._load_export_transaction(manifest_path)
+        if transaction:
+            self._commit_export_transaction(transaction)
+            return
         self._mount_rw_delete_and_exit(manifest_path)
 
+    def _load_export_transaction(self, manifest_path: Path) -> ExportTransaction | None:
+        try:
+            value = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if value.get("adapter") != "transactional_export_v2":
+            return None
+        item = value.get("device_export")
+        if not isinstance(item, dict):
+            raise RuntimeError("事务化导入清单缺少 device_export")
+        return ExportTransaction(
+            export_id=str(item["export_id"]),
+            target_date=date.fromisoformat(str(item["target_date"])),
+            manifest_sha256=str(item["manifest_sha256"]),
+            record_count=int(item["record_count"]),
+            manifest_path=str(item["manifest_path"]),
+            state=str(item.get("state", "prepared")),
+        )
+
+    def _commit_export_transaction(self, transaction: ExportTransaction) -> list[str]:
+        port, status = self._wait_for_device()
+        profile = device_profile(status, port)
+        if not profile.is_firmware_v2:
+            raise RuntimeError("当前连接设备不支持 transactional_export_v2，已保留原始记录")
+        self.adapter_name = profile.adapter_name
+        self.connected_profile = profile
+        self._emit(
+            f"邮件已被服务器接受；正在提交 {transaction.target_date.isoformat()} 的设备清理事务"
+        )
+        with UsbLinkDevice(port.device, timeout=1.2) as device:
+            result = device.commit_export_delete(
+                transaction.export_id,
+                transaction.manifest_sha256,
+                transaction.record_count,
+            )
+        deleted_count = int(result.get("deleted_count", transaction.record_count))
+        self._emit(f"设备已按固件清单删除 {deleted_count} 条记录")
+        return [transaction.export_id] * deleted_count
+
+    def release_unselected(
+        self,
+        inventory: SyncInventory,
+        selected_dates: Iterable[date],
+    ) -> None:
+        selected = set(selected_dates)
+        to_abort = [item for item in inventory.exports if item.target_date not in selected]
+        if not to_abort:
+            return
+        port, status = self._wait_for_device()
+        if not device_profile(status, port).is_firmware_v2:
+            return
+        with UsbLinkDevice(port.device, timeout=1.2) as device:
+            for transaction in to_abort:
+                device.abort_export(transaction.export_id)
+                self._emit(f"已保留未选择日期 {transaction.target_date.isoformat()} 的设备记录")
+
+    def end_session(self) -> None:
+        port, status = self._wait_for_device()
+        if not device_profile(status, port).is_firmware_v2:
+            return
+        with UsbLinkDevice(port.device, timeout=1.2) as device:
+            device.end_session()
+
     def _mount_rw_delete_and_exit(self, manifest_path: Path) -> list[str]:
-        port, _status = self._wait_for_device()
+        port, status = self._wait_for_device()
+        profile = device_profile(status, port)
         before = drive_letters()
         self._emit("邮件已被服务器接受；正在以读写模式重新挂载以执行精确清理")
         self._enter_msc_when_ready(port.device, "rw")
         drive = wait_for_ready_new_drive(before, timeout=30)
         if drive is None:
             try:
-                self._exit_msc()
+                self._exit_msc(next_mode="maintenance" if profile.is_firmware_v2 else None)
             finally:
                 raise RuntimeError("清理阶段未检测到可读取的稳定设备盘符")
         try:
@@ -239,9 +453,18 @@ class LegacyDeviceWorkflow:
             self._emit(f"已按清单删除 {len(deleted)} 个设备记录目录")
             return deleted
         finally:
-            self._eject_and_exit(drive.letter, drive.root)
+            self._eject_and_exit(
+                drive.letter,
+                drive.root,
+                next_mode="maintenance" if profile.is_firmware_v2 else None,
+            )
 
-    def _eject_and_exit(self, letter: str, root: str) -> None:
+    def _eject_and_exit(
+        self,
+        letter: str,
+        root: str,
+        next_mode: str | None = None,
+    ) -> None:
         errors: list[str] = []
         self._emit(f"数据读取已结束，正在安全弹出设备卷 {root}")
         try:
@@ -249,18 +472,24 @@ class LegacyDeviceWorkflow:
         except Exception as exc:
             errors.append(f"安全弹出失败：{exc}")
         try:
-            self._exit_msc()
+            self._exit_msc(next_mode=next_mode)
         except Exception as exc:
             errors.append(f"退出 MSC 失败：{exc}")
         if errors:
             raise RuntimeError("；".join(errors))
 
-    def _exit_msc(self) -> None:
+    def _exit_msc(self, next_mode: str | None = None) -> None:
         port, _status = self._wait_for_device()
         with UsbLinkDevice(port.device) as device:
-            device.exit_msc(force=False)
+            device.exit_msc(force=False, next_mode=next_mode)
 
-    def _enter_msc_when_ready(self, port_name: str, access: str, timeout: float = 20.0) -> None:
+    def _enter_msc_when_ready(
+        self,
+        port_name: str,
+        access: str,
+        timeout: float = 20.0,
+        export_ids: tuple[str, ...] = (),
+    ) -> None:
         """Retry the short firmware transition window reported as BUSY."""
 
         deadline = time.monotonic() + timeout
@@ -272,7 +501,7 @@ class LegacyDeviceWorkflow:
                     if bool(status.get("recording")):
                         last_error = RuntimeError("设备正在完成当前录制片段")
                     else:
-                        device.enter_msc(access)
+                        device.enter_msc(access, export_ids=export_ids)
                         return
             except Exception as exc:
                 last_error = exc

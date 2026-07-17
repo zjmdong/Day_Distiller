@@ -22,7 +22,14 @@ from .art_styles import (
 )
 from .credentials import CredentialName, CredentialStore
 from .database import JobDatabase
-from .device import PortCandidate, UsbLinkDevice, find_device, list_serial_ports
+from .device import (
+    DeviceProfile,
+    PortCandidate,
+    UsbLinkDevice,
+    device_profile,
+    find_device,
+    list_serial_ports,
+)
 from .device_workflow import LegacyDeviceWorkflow, SyncInventory, SyncedDay
 from .domain import JobStage
 from .legacy_import import available_record_dates, normalize_source_root, scan_record_directories
@@ -300,6 +307,7 @@ class MainWindow:
         self.events: queue.Queue[tuple[str, Any, Exception | None]] = queue.Queue()
         self.worker = Worker(self.events.put)
         self.device: UsbLinkDevice | None = None
+        self.connected_device_profile: DeviceProfile | None = None
         self.ports: list[PortCandidate] = []
         self.last_drive_letter: str | None = None
         self.active_job_id: str | None = None
@@ -636,6 +644,11 @@ class MainWindow:
             alignment=Qt.AlignmentFlag.AlignHCenter,
         )
         connect_layout.addStretch(1)
+        self.guided_device_info = QLabel("")
+        self.guided_device_info.setObjectName("deviceMetaLabel")
+        self.guided_device_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.guided_device_info.hide()
+        connect_layout.addWidget(self.guided_device_info)
         self.home_stack.addWidget(connect_page)
 
         sync_page, sync_layout = centered_page()
@@ -676,6 +689,11 @@ class MainWindow:
         sync_actions.addStretch(1)
         self.guided_sync_actions.hide()
         sync_layout.addWidget(self.guided_sync_actions)
+        self.guided_sync_device_info = QLabel("")
+        self.guided_sync_device_info.setObjectName("deviceMetaLabel")
+        self.guided_sync_device_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.guided_sync_device_info.hide()
+        sync_layout.addWidget(self.guided_sync_device_info)
         self.home_stack.addWidget(sync_page)
 
         distill_page, distill_layout = centered_page()
@@ -1188,8 +1206,23 @@ class MainWindow:
         self.mode_label = QLabel("-")
         self.storage_label = QLabel("-")
         self.drive_label = QLabel("-")
+        self.firmware_version_label = QLabel("-")
+        self.device_serial_label = QLabel("-")
+        self.protocol_adapter_label = QLabel("-")
+        self.battery_status_label = QLabel("-")
+        self.rtc_status_label = QLabel("-")
         for index, (label, value) in enumerate(
-            (("连接", self.connection_label), ("模式", self.mode_label), ("TF 卡", self.storage_label), ("Windows 盘符", self.drive_label))
+            (
+                ("连接", self.connection_label),
+                ("固件版本", self.firmware_version_label),
+                ("设备序列号", self.device_serial_label),
+                ("协议适配器", self.protocol_adapter_label),
+                ("模式", self.mode_label),
+                ("电量", self.battery_status_label),
+                ("RTC 时钟", self.rtc_status_label),
+                ("TF 卡", self.storage_label),
+                ("Windows 盘符", self.drive_label),
+            )
         ):
             grid.addWidget(QLabel(label), index, 0)
             grid.addWidget(value, index, 1)
@@ -1208,6 +1241,28 @@ class MainWindow:
         ):
             controls.addWidget(widget)
         layout.addLayout(controls)
+        v2_controls = QHBoxLayout()
+        self.v2_dates_button = QPushButton("读取设备日期")
+        self.v2_exports_button = QPushButton("查询导出事务")
+        self.v2_end_session_button = QPushButton("结束 2.0 维护会话")
+        self.v2_dates_button.setEnabled(False)
+        self.v2_exports_button.setEnabled(False)
+        self.v2_end_session_button.setEnabled(False)
+        self.v2_dates_button.clicked.connect(
+            lambda: self._start("v2_dates", lambda: self._require_device().list_record_dates())
+        )
+        self.v2_exports_button.clicked.connect(
+            lambda: self._start("v2_exports", lambda: self._require_device().get_export_status())
+        )
+        self.v2_end_session_button.clicked.connect(
+            lambda: self._start("v2_end_session", lambda: self._require_device().end_session())
+        )
+        v2_controls.addWidget(QLabel("固件 2.0 功能"))
+        v2_controls.addWidget(self.v2_dates_button)
+        v2_controls.addWidget(self.v2_exports_button)
+        v2_controls.addWidget(self.v2_end_session_button)
+        v2_controls.addStretch(1)
+        layout.addLayout(v2_controls)
         self.device_log = QPlainTextEdit()
         self.device_log.setReadOnly(True)
         layout.addWidget(self.device_log, 1)
@@ -1218,7 +1273,9 @@ class MainWindow:
         self.status_button.clicked.connect(lambda: self._start("status", lambda: self._require_device().get_status()))
         self.enter_button.clicked.connect(self.enter_msc)
         self.eject_button.clicked.connect(self.eject_and_exit)
-        self.force_exit_button.clicked.connect(lambda: self._start("exit_msc", lambda: self._require_device().exit_msc(force=True)))
+        self.force_exit_button.clicked.connect(
+            lambda: self._start("exit_msc", lambda: self._manual_exit_msc(force=True))
+        )
         return page
 
     def _records_page(self):
@@ -1449,15 +1506,30 @@ class MainWindow:
         self.ports = list_serial_ports()
         self.port_combo.clear()
         for port in self.ports:
+            role_text = {
+                "protocol": "协议端口",
+                "log": "日志端口（不可连接）",
+                "unknown": "待检测",
+            }[port.role]
             self.port_combo.addItem(
-                f"{port.device} · {port.description}{' · 推荐' if port.likely else ''}", port.device
+                f"{port.device} · {port.description} · {role_text}"
+                f"{' · 推荐' if port.role == 'protocol' else ''}",
+                port.device,
             )
+            if port.role == "log":
+                item = self.port_combo.model().item(self.port_combo.count() - 1)
+                if item is not None:
+                    item.setEnabled(False)
         self._device_log(f"发现 {len(self.ports)} 个串口。")
 
     def connect_selected(self) -> None:
         port = self.port_combo.currentData()
         if not port:
             self._device_log("没有选择串口。")
+            return
+        candidate = self._selected_port_candidate()
+        if candidate and candidate.role == "log":
+            self._device_log(f"{candidate.device} 是日志 CDC，请选择标有“协议端口”的串口。")
             return
 
         def work():
@@ -1594,6 +1666,8 @@ class MainWindow:
         self.guided_discovery_deadline = time.monotonic() + 120.0
         self.connect_success_icon.hide()
         self.connect_spinner.start()
+        self.guided_device_info.hide()
+        self.guided_sync_device_info.hide()
         self.guided_retry_connection_button.hide()
         self.guided_connect_copy.setText("请重启 Day Distiller 设备，并使用 USB 连接至电脑。")
         self.guided_connection_status.setText("正在寻找设备")
@@ -1715,6 +1789,8 @@ class MainWindow:
         self.guided_phase = "distilling"
         self.guided_operation_active = True
         self.guided_backgrounded = False
+        self.guided_device_info.hide()
+        self.guided_sync_device_info.hide()
         self._set_busy(True)
         self.home_stack.setCurrentIndex(3)
         self.guided_distill_progress.setValue(1)
@@ -1735,6 +1811,7 @@ class MainWindow:
                 ),
             )
             preparation_workflow = LegacyDeviceWorkflow(preparation_pipeline)
+            preparation_workflow.release_unselected(inventory, selected_dates)
             synced_days = preparation_workflow.prepare_days(
                 inventory,
                 selected_dates,
@@ -1775,6 +1852,13 @@ class MainWindow:
                 self.events.put(
                     ("guided_day_complete", (index + 1, len(synced_days), day_label), None)
                 )
+            if inventory.adapter_name == "transactional_export_v2" and self.guided_sync_workflow:
+                try:
+                    self.guided_sync_workflow.end_session()
+                except Exception as exc:
+                    self.events.put(
+                        ("guided_message", f"设备维护会话将在超时后自动结束：{exc}", None)
+                    )
             return results
 
         self.worker.run("guided_distill", work)
@@ -2836,7 +2920,7 @@ class MainWindow:
             self.discovery_timer.stop()
             self.refresh_ports()
             self._select_port(port.device)
-            self._apply_status(status)
+            self._apply_status(status, port)
             self.connect_spinner.stop()
             self.connect_success_icon.show()
             self.guided_connection_status.setText("设备已连接")
@@ -2937,22 +3021,28 @@ class MainWindow:
             self._select_port(port.device)
             self._close_device()
             self.device = UsbLinkDevice(port.device)
-            self._apply_status(status)
+            self._apply_status(status, port)
             self._device_log(f"已连接 {port.device}。")
         elif name in {"connect", "status", "exit_msc"}:
-            self._apply_status(result)
+            self._apply_status(result, self._selected_port_candidate())
             self._device_log(f"{name} 成功。")
             if name == "exit_msc":
                 self._close_device()
+        elif name in {"v2_dates", "v2_exports", "v2_end_session"}:
+            self._device_log(
+                f"{name} 成功：{json.dumps(result, ensure_ascii=False, separators=(',', ':'))}"
+            )
+            if name == "v2_end_session":
+                self._close_device()
         elif name == "enter_msc":
-            self._apply_status(result.get("status", {}))
+            port = result.get("port")
+            self._apply_status(result.get("status", {}), port)
             drive = result.get("drive")
             if drive:
                 self.last_drive_letter = drive.letter
                 self.drive_label.setText(f"{drive.root} {drive.label}".strip())
                 self.source_edit.setText(drive.root)
                 self._device_log(f"检测到 MSC 卷 {drive.root}")
-            port = result.get("port")
             if port:
                 self.refresh_ports()
                 self._select_port(port.device)
@@ -2960,7 +3050,7 @@ class MainWindow:
             self._device_log(f"已弹出 {result}:，正在退出 MSC。")
             self.last_drive_letter = None
             self.drive_label.setText("-")
-            self._start("exit_msc", lambda: self._require_device().exit_msc(force=False))
+            self._start("exit_msc", lambda: self._manual_exit_msc(force=False))
         elif name == "distill":
             self.stage_label.setText(f"完成 · 清理状态 {result.cleanup_state}")
             self.progress_bar.setValue(1000)
@@ -2995,6 +3085,14 @@ class MainWindow:
             self.device.open()
         return self.device
 
+    def _manual_exit_msc(self, force: bool) -> dict[str, Any]:
+        next_mode = (
+            "maintenance"
+            if self.connected_device_profile and self.connected_device_profile.is_firmware_v2
+            else None
+        )
+        return self._require_device().exit_msc(force=force, next_mode=next_mode)
+
     def _close_device(self) -> None:
         if self.device:
             self.device.close()
@@ -3005,10 +3103,41 @@ class MainWindow:
         if index >= 0:
             self.port_combo.setCurrentIndex(index)
 
-    def _apply_status(self, status: dict[str, Any]) -> None:
+    def _selected_port_candidate(self) -> PortCandidate | None:
+        selected = str(self.port_combo.currentData() or "")
+        return next((port for port in self.ports if port.device == selected), None)
+
+    def _apply_status(
+        self,
+        status: dict[str, Any],
+        port: PortCandidate | None = None,
+    ) -> None:
         storage = status.get("storage") if isinstance(status.get("storage"), dict) else {}
+        profile = device_profile(status, port or self._selected_port_candidate())
+        self.connected_device_profile = profile
         self.connection_label.setText("已连接")
+        self.firmware_version_label.setText(profile.display_firmware)
+        self.device_serial_label.setText(profile.serial_number)
+        self.protocol_adapter_label.setText(profile.adapter_name)
         self.mode_label.setText(str(status.get("mode", "-")))
+        battery = status.get("battery") if isinstance(status.get("battery"), dict) else None
+        rtc = status.get("rtc") if isinstance(status.get("rtc"), dict) else None
+        self.battery_status_label.setText(
+            (
+                f"{battery.get('soc_percent', battery.get('soc', '-'))}% · "
+                f"{battery.get('voltage_v', battery.get('voltage', '-'))} V"
+            )
+            if battery
+            else "当前固件未通过 USB 提供"
+        )
+        self.rtc_status_label.setText(
+            (
+                f"{'有效' if rtc.get('valid') else '无效'} · "
+                f"{rtc.get('iso8601', rtc.get('iso', '-'))}"
+            )
+            if rtc
+            else "当前固件未通过 USB 提供"
+        )
         self.storage_label.setText(
             ", ".join(
                 f"{key}={storage.get(key)}" for key in ("ready", "mounted", "usb_exposed", "read_only", "ejected")
@@ -3016,6 +3145,30 @@ class MainWindow:
             )
             or "-"
         )
+        self._set_device_feature_availability(profile)
+        info = (
+            f"固件 {profile.display_firmware}  ·  序列号 {profile.serial_number}  ·  "
+            f"{profile.adapter_name}"
+        )
+        self.guided_device_info.setText(info)
+        self.guided_sync_device_info.setText(info)
+        self.guided_device_info.show()
+        self.guided_sync_device_info.show()
+
+    def _set_device_feature_availability(self, profile: DeviceProfile) -> None:
+        enabled = profile.is_firmware_v2
+        self.v2_dates_button.setEnabled(enabled and "list_record_dates" in profile.capabilities)
+        self.v2_exports_button.setEnabled(enabled and "get_export_status" in profile.capabilities)
+        self.v2_end_session_button.setEnabled(enabled and "end_session" in profile.capabilities)
+        rw_index = self.access_combo.findData("rw")
+        rw_item = self.access_combo.model().item(rw_index) if rw_index >= 0 else None
+        if rw_item is not None:
+            rw_item.setEnabled(not enabled)
+        if enabled:
+            self.access_combo.setCurrentIndex(self.access_combo.findData("ro"))
+            self.access_combo.setToolTip("固件 2.0 事务化工作流强制使用只读 MSC。")
+        else:
+            self.access_combo.setToolTip("旧固件清理阶段需要兼容的读写 MSC。")
 
     def _set_busy(self, busy: bool) -> None:
         self.start_folder_button.setDisabled(busy)

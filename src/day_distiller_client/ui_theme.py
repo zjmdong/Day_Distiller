@@ -63,6 +63,11 @@ QLabel#homeStatus {
     font-size: 12px;
     min-height: 20px;
 }
+QLabel#deviceMetaLabel {
+    color: #666666;
+    font-size: 11px;
+    padding: 8px 4px 2px 4px;
+}
 QLabel[stepBadge="true"] {
     background: #0b1820;
     color: #4db7ff;

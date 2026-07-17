@@ -37,6 +37,13 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame.command, Command.HELLO)
         self.assertEqual(frame.payload_json()["protocol"], 1)
 
+    def test_firmware_v2_command_ids_keep_protocol_v1_framing(self) -> None:
+        raw = build_request(Command.LIST_RECORD_DATES, 11, {"cursor": 0, "limit": 15})
+        frame = parse_frame(raw)
+
+        self.assertEqual(frame.command, Command.LIST_RECORD_DATES)
+        self.assertEqual(frame.payload_json(), {"cursor": 0, "limit": 15})
+
     def test_crc_failure(self) -> None:
         raw = bytearray(build_request(Command.PING, 1, {}))
         raw[-1] ^= 0x55

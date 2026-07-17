@@ -34,6 +34,12 @@ class Command(IntEnum):
     GET_STATUS = 3
     ENTER_MSC = 4
     EXIT_MSC = 5
+    BEGIN_EXPORT = 6
+    COMMIT_EXPORT_DELETE = 7
+    ABORT_EXPORT = 8
+    END_SESSION = 9
+    GET_EXPORT_STATUS = 10
+    LIST_RECORD_DATES = 11
 
 
 class Status(IntEnum):

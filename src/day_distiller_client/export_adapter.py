@@ -4,7 +4,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Protocol
 
-from .device import UsbLinkDevice
+from .device import DeviceProfile, UsbLinkDevice
 from .legacy_import import delete_verified_source_records, import_legacy_day
 from .protocol import Command
 
@@ -26,6 +26,24 @@ class LegacyMscV1Adapter:
 
     def cleanup(self, source_root: Path, manifest_path: Path) -> list[str]:
         return delete_verified_source_records(source_root, manifest_path)
+
+
+class TransactionalExportV2Adapter:
+    adapter_name = "transactional_export_v2"
+
+    def capabilities(self) -> set[str]:
+        return {
+            "read_only_msc",
+            "firmware_manifest",
+            "multi_day_export",
+            "recoverable_device_cleanup",
+        }
+
+
+def select_export_adapter(profile: DeviceProfile) -> DeviceExportAdapter:
+    if profile.is_firmware_v2:
+        return TransactionalExportV2Adapter()
+    return LegacyMscV1Adapter()
 
 
 class MaintenanceKeepAlive:
