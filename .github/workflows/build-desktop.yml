@@ -2,8 +2,6 @@ name: Build desktop apps
 
 on:
   workflow_dispatch:
-  push:
-    branches: [desktop-app]
 
 jobs:
   windows:
