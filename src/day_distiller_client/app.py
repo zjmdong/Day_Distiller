@@ -551,10 +551,6 @@ class MainWindow:
         hero.setObjectName("heroTitle")
         hero.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hero.setWordWrap(True)
-        hero_holder = QWidget()
-        hero_holder_layout = QVBoxLayout(hero_holder)
-        hero_holder_layout.setContentsMargins(0, 0, 0, 0)
-        hero_holder_layout.addWidget(hero)
 
         hero_copy = QLabel("连接设备后，Day Distiller 会自动同步、理解、创作并发送。")
         hero_copy.setObjectName("heroSubtitle")
@@ -567,20 +563,20 @@ class MainWindow:
         start_row.addStretch(1)
         start_row.addWidget(self.hero_start_button)
         start_row.addStretch(1)
-        action_holder = QWidget()
-        action_layout = QVBoxLayout(action_holder)
-        action_layout.setContentsMargins(0, 0, 0, 0)
-        action_layout.setSpacing(14)
-        action_layout.addWidget(hero_copy)
-        action_layout.addSpacing(8)
-        action_layout.addLayout(start_row)
+        button_holder = QWidget()
+        button_layout = QVBoxLayout(button_holder)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.addLayout(start_row)
         self.guided_home_status = QLabel("")
         self.guided_home_status.setObjectName("homeStatus")
         self.guided_home_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        action_layout.addWidget(self.guided_home_status)
+        button_layout.addWidget(self.guided_home_status)
 
-        landing_layout.addWidget(reveal_container(hero_holder))
-        landing_layout.addWidget(reveal_container(action_holder))
+        # Keep each visual level independent so the intro can follow a clear,
+        # deliberate title -> subtitle/button -> footer timeline.
+        landing_layout.addWidget(reveal_container(hero))
+        landing_layout.addWidget(reveal_container(hero_copy))
+        landing_layout.addWidget(reveal_container(button_holder))
         landing_layout.addStretch(3)
         first_use = QPushButton("首次使用？先完成配置")
         first_use.setProperty("role", "link")
@@ -1531,32 +1527,55 @@ class MainWindow:
             self.records_hint.setText(f"扫描失败：{exc}")
 
     def _play_landing_intro(self) -> None:
-        """Reveal the landing content in three lightweight 60 Hz Qt animations."""
+        """Reveal the landing content through a deliberate four-part timeline."""
 
-        from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QTimer
+        from PySide6.QtCore import (
+            QEasingCurve,
+            QParallelAnimationGroup,
+            QPropertyAnimation,
+            QSequentialAnimationGroup,
+        )
 
         self._landing_animation_groups.clear()
-        for index, (content, effect) in enumerate(self._landing_reveal_targets):
+        if len(self._landing_reveal_targets) != 4:
+            return
+
+        for content, effect in self._landing_reveal_targets:
             effect.setBlurRadius(16.0)
             effect.setProperty("revealOpacity", 0.0)
 
-            def start_reveal(content=content, effect=effect, index=index) -> None:
-                group = QParallelAnimationGroup(self.window)
-                blur_animation = QPropertyAnimation(effect, b"blurRadius", group)
-                blur_animation.setStartValue(16.0)
-                blur_animation.setEndValue(0.0)
-                blur_animation.setDuration(960)
-                blur_animation.setEasingCurve(QEasingCurve.Type.OutQuart)
-                opacity_animation = QPropertyAnimation(effect, b"revealOpacity", group)
-                opacity_animation.setStartValue(0.0)
-                opacity_animation.setEndValue(1.0)
-                opacity_animation.setDuration(900)
-                opacity_animation.setEasingCurve(QEasingCurve.Type.OutQuart)
-                group.finished.connect(lambda content=content: content.setGraphicsEffect(None))
-                self._landing_animation_groups.append(group)
-                group.start()
+        def reveal_group(content, effect, duration: int, parent) -> QParallelAnimationGroup:
+            group = QParallelAnimationGroup(parent)
+            blur_animation = QPropertyAnimation(effect, b"blurRadius", group)
+            blur_animation.setStartValue(16.0)
+            blur_animation.setEndValue(0.0)
+            blur_animation.setDuration(duration)
+            blur_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            opacity_animation = QPropertyAnimation(effect, b"revealOpacity", group)
+            opacity_animation.setStartValue(0.0)
+            opacity_animation.setEndValue(1.0)
+            opacity_animation.setDuration(duration)
+            opacity_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            group.finished.connect(lambda content=content: content.setGraphicsEffect(None))
+            return group
 
-            QTimer.singleShot(index * 220, start_reveal)
+        title, subtitle, button, footer = self._landing_reveal_targets
+        sequence = QSequentialAnimationGroup(self.window)
+        sequence.addAnimation(reveal_group(*title, 1250, sequence))
+
+        subtitle_and_button = QParallelAnimationGroup(sequence)
+        subtitle_and_button.addAnimation(
+            reveal_group(*subtitle, 800, subtitle_and_button)
+        )
+        delayed_button = QSequentialAnimationGroup(subtitle_and_button)
+        delayed_button.addPause(400)
+        delayed_button.addAnimation(reveal_group(*button, 800, delayed_button))
+        subtitle_and_button.addAnimation(delayed_button)
+        sequence.addAnimation(subtitle_and_button)
+
+        sequence.addAnimation(reveal_group(*footer, 800, sequence))
+        self._landing_animation_groups.append(sequence)
+        sequence.start()
 
     def start_guided_workflow(self) -> None:
         """Enter the production one-click flow and begin 1 Hz device discovery."""

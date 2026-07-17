@@ -87,3 +87,25 @@ def test_device_search_timeout_exposes_retry_and_home_return() -> None:
         assert window.guided_phase == "idle"
     finally:
         _close(window, temporary)
+
+
+def test_landing_intro_uses_ordered_title_subtitle_button_footer_timeline() -> None:
+    window, temporary = _window()
+    try:
+        window._play_landing_intro()
+        sequence = window._landing_animation_groups[-1]
+
+        assert sequence.animationCount() == 3
+        assert sequence.animationAt(0).duration() == 1250
+
+        subtitle_and_button = sequence.animationAt(1)
+        assert subtitle_and_button.animationCount() == 2
+        assert subtitle_and_button.animationAt(0).duration() == 800
+        delayed_button = subtitle_and_button.animationAt(1)
+        assert delayed_button.animationAt(0).duration() == 400
+        assert delayed_button.animationAt(1).duration() == 800
+
+        assert sequence.animationAt(2).duration() == 800
+        assert sequence.duration() == 3250
+    finally:
+        _close(window, temporary)
