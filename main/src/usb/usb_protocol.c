@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 #include "cJSON.h"
 
 _Static_assert(sizeof(day_usb_frame_header_t) == DAY_USB_FRAME_HEADER_LEN,
@@ -106,6 +107,88 @@ static bool validate_fields(const cJSON *root, const char *const *allowed, size_
     return true;
 }
 
+static bool valid_calendar_date(const char *value)
+{
+    if (!value || strlen(value) != 10 || value[4] != '-' || value[7] != '-') {
+        return false;
+    }
+    for (size_t i = 0; i < 10; ++i) {
+        if (i != 4 && i != 7 && !isdigit((unsigned char)value[i])) {
+            return false;
+        }
+    }
+    int year = (value[0] - '0') * 1000 + (value[1] - '0') * 100 +
+               (value[2] - '0') * 10 + value[3] - '0';
+    int month = (value[5] - '0') * 10 + value[6] - '0';
+    int day = (value[8] - '0') * 10 + value[9] - '0';
+    static const uint8_t days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (year < 2020 || year > 2099 || month < 1 || month > 12 || day < 1) {
+        return false;
+    }
+    int max_day = days[month - 1];
+    if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) {
+        max_day = 29;
+    }
+    return day <= max_day;
+}
+
+bool day_usb_export_id_valid(const char *value)
+{
+    if (!value) {
+        return false;
+    }
+    size_t len = strnlen(value, DAY_USB_EXPORT_ID_MAX);
+    if (len < 8 || len >= DAY_USB_EXPORT_ID_MAX || strncmp(value, "exp-", 4) != 0) {
+        return false;
+    }
+    for (size_t i = 4; i < len; ++i) {
+        unsigned char c = (unsigned char)value[i];
+        if (!isalnum(c) && c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool client_request_id_valid(const char *value)
+{
+    if (!value) {
+        return false;
+    }
+    size_t len = strnlen(value, DAY_USB_CLIENT_REQUEST_ID_MAX + 1);
+    if (len == 0 || len > DAY_USB_CLIENT_REQUEST_ID_MAX) {
+        return false;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)value[i];
+        if (!isalnum(c) && c != '-' && c != '_' && c != '.' && c != ':') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool parse_u32_field(const cJSON *root, const char *name, uint32_t default_value,
+                            uint32_t *out, char *reason, size_t reason_len)
+{
+    const cJSON *field = cJSON_GetObjectItemCaseSensitive(root, name);
+    if (!field) {
+        *out = default_value;
+        return true;
+    }
+    if (!cJSON_IsNumber(field) || field->valuedouble < 0 || field->valuedouble > UINT32_MAX) {
+        set_reason(reason, reason_len, "pagination_must_be_unsigned_integer");
+        return false;
+    }
+    uint32_t value = (uint32_t)field->valuedouble;
+    if ((double)value != field->valuedouble) {
+        set_reason(reason, reason_len, "pagination_must_be_unsigned_integer");
+        return false;
+    }
+    *out = value;
+    return true;
+}
+
 const char *day_usb_status_name(day_usb_status_t status)
 {
     switch (status) {
@@ -153,12 +236,13 @@ esp_err_t day_usb_parse_enter_msc_args(const uint8_t *payload, size_t len,
         return ESP_ERR_INVALID_ARG;
     }
     args->access = DAY_USB_ACCESS_RW;
+    args->export_id_count = 0;
     cJSON *root = parse_object(payload, len, reason, reason_len);
     if (!root) {
         return ESP_ERR_INVALID_ARG;
     }
-    static const char *const allowed[] = {"access"};
-    if (!validate_fields(root, allowed, 1, reason, reason_len)) {
+    static const char *const allowed[] = {"access", "export_ids"};
+    if (!validate_fields(root, allowed, 2, reason, reason_len)) {
         cJSON_Delete(root);
         return ESP_ERR_INVALID_ARG;
     }
@@ -176,6 +260,127 @@ esp_err_t day_usb_parse_enter_msc_args(const uint8_t *payload, size_t len,
             cJSON_Delete(root);
             return ESP_ERR_INVALID_ARG;
         }
+    }
+    const cJSON *export_ids = cJSON_GetObjectItemCaseSensitive(root, "export_ids");
+    if (export_ids) {
+        if (!cJSON_IsArray(export_ids) || cJSON_GetArraySize(export_ids) > DAY_USB_EXPORT_IDS_MAX) {
+            set_reason(reason, reason_len, "invalid_export_ids");
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_ARG;
+        }
+        const cJSON *item = NULL;
+        cJSON_ArrayForEach(item, export_ids) {
+            if (!cJSON_IsString(item) || !day_usb_export_id_valid(item->valuestring)) {
+                set_reason(reason, reason_len, "invalid_export_id");
+                cJSON_Delete(root);
+                return ESP_ERR_INVALID_ARG;
+            }
+            for (size_t i = 0; i < args->export_id_count; ++i) {
+                if (strcmp(args->export_ids[i], item->valuestring) == 0) {
+                    set_reason(reason, reason_len, "duplicate_export_id");
+                    cJSON_Delete(root);
+                    return ESP_ERR_INVALID_ARG;
+                }
+            }
+            strlcpy(args->export_ids[args->export_id_count++], item->valuestring,
+                    sizeof(args->export_ids[0]));
+        }
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+esp_err_t day_usb_parse_begin_export_args(const uint8_t *payload, size_t len,
+                                          day_usb_begin_export_args_t *args, char *reason, size_t reason_len)
+{
+    if (!args) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(args, 0, sizeof(*args));
+    cJSON *root = parse_object(payload, len, reason, reason_len);
+    if (!root) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    static const char *const allowed[] = {"date", "client_request_id"};
+    if (!validate_fields(root, allowed, 2, reason, reason_len)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    const cJSON *date = cJSON_GetObjectItemCaseSensitive(root, "date");
+    const cJSON *request_id = cJSON_GetObjectItemCaseSensitive(root, "client_request_id");
+    if (!cJSON_IsString(date) || !valid_calendar_date(date->valuestring)) {
+        set_reason(reason, reason_len, "invalid_date");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!cJSON_IsString(request_id) || !client_request_id_valid(request_id->valuestring)) {
+        set_reason(reason, reason_len, "invalid_client_request_id");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    strlcpy(args->date, date->valuestring, sizeof(args->date));
+    strlcpy(args->client_request_id, request_id->valuestring, sizeof(args->client_request_id));
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+esp_err_t day_usb_parse_pagination_args(const uint8_t *payload, size_t len,
+                                        day_usb_pagination_args_t *args, char *reason, size_t reason_len)
+{
+    if (!args) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    cJSON *root = parse_object(payload, len, reason, reason_len);
+    if (!root) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    static const char *const allowed[] = {"cursor", "limit"};
+    bool valid = validate_fields(root, allowed, 2, reason, reason_len) &&
+                 parse_u32_field(root, "cursor", 0, &args->cursor, reason, reason_len) &&
+                 parse_u32_field(root, "limit", 20, &args->limit, reason, reason_len);
+    if (valid && (args->limit < 1 || args->limit > 20)) {
+        set_reason(reason, reason_len, "invalid_pagination_limit");
+        valid = false;
+    }
+    cJSON_Delete(root);
+    return valid ? ESP_OK : ESP_ERR_INVALID_ARG;
+}
+
+esp_err_t day_usb_parse_get_export_status_args(const uint8_t *payload, size_t len,
+                                               day_usb_get_export_status_args_t *args,
+                                               char *reason, size_t reason_len)
+{
+    if (!args) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(args, 0, sizeof(*args));
+    args->limit = 20;
+    cJSON *root = parse_object(payload, len, reason, reason_len);
+    if (!root) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    static const char *const allowed[] = {"export_id", "cursor", "limit"};
+    if (!validate_fields(root, allowed, 3, reason, reason_len)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    const cJSON *export_id = cJSON_GetObjectItemCaseSensitive(root, "export_id");
+    if (export_id) {
+        if (!cJSON_IsString(export_id) || !day_usb_export_id_valid(export_id->valuestring) ||
+            cJSON_GetObjectItemCaseSensitive(root, "cursor") ||
+            cJSON_GetObjectItemCaseSensitive(root, "limit")) {
+            set_reason(reason, reason_len, "invalid_export_status_query");
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_ARG;
+        }
+        args->has_export_id = true;
+        strlcpy(args->export_id, export_id->valuestring, sizeof(args->export_id));
+    } else if (!parse_u32_field(root, "cursor", 0, &args->cursor, reason, reason_len) ||
+               !parse_u32_field(root, "limit", 20, &args->limit, reason, reason_len) ||
+               args->limit < 1 || args->limit > 20) {
+        set_reason(reason, reason_len, "invalid_pagination_limit");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
     }
     cJSON_Delete(root);
     return ESP_OK;

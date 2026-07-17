@@ -1,0 +1,842 @@
+#include "export_service.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include "cJSON.h"
+#include "day_pins.h"
+#include "device_identity.h"
+#include "esp_log.h"
+#include "esp_random.h"
+#include "psa/crypto.h"
+#include "storage_service.h"
+
+#define DAY_EXPORT_DIR DAY_SD_MOUNT_POINT "/EXPORTS"
+#define DAY_EXPORT_MAX_ACTIVE 32
+#define DAY_EXPORT_JSON_MAX (512U * 1024U)
+#define DAY_RECORD_NAME_LEN 22
+
+static const char *TAG = "day_export";
+static const char *const s_record_files[] = {"meta.json", "video.avi", "audio.wav", "imu.json"};
+
+typedef struct {
+    char name[DAY_RECORD_NAME_LEN + 1];
+    uint64_t file_sizes[4];
+    uint64_t total_bytes;
+} record_info_t;
+
+typedef struct {
+    char date[11];
+    uint32_t record_count;
+    uint64_t total_bytes;
+} date_summary_t;
+
+typedef struct {
+    char export_id[DAY_USB_EXPORT_ID_MAX];
+    char client_request_id[DAY_USB_CLIENT_REQUEST_ID_MAX + 1];
+    char date[11];
+    char state[16];
+    char manifest_sha256[65];
+    char last_error[64];
+    uint32_t record_count;
+    uint32_t deleted_count;
+    uint64_t total_bytes;
+} transaction_info_t;
+
+static void set_reason(char *reason, size_t len, const char *value)
+{
+    if (reason && len > 0) {
+        snprintf(reason, len, "%s", value ? value : "storage_error");
+    }
+}
+
+static bool regular_file_size(const char *path, uint64_t *size)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    if (size) {
+        *size = (uint64_t)st.st_size;
+    }
+    return true;
+}
+
+static bool record_name_parse(const char *name, char date[11])
+{
+    if (!name || strlen(name) != DAY_RECORD_NAME_LEN || strncmp(name, "REC_", 4) != 0 ||
+        name[8] != '_' || name[15] != '_') {
+        return false;
+    }
+    for (size_t i = 4; i < DAY_RECORD_NAME_LEN; ++i) {
+        if (i != 8 && i != 15 && (name[i] < '0' || name[i] > '9')) {
+            return false;
+        }
+    }
+    int year = 2000 + (name[9] - '0') * 10 + name[10] - '0';
+    int month = (name[11] - '0') * 10 + name[12] - '0';
+    int day = (name[13] - '0') * 10 + name[14] - '0';
+    int hour = (name[16] - '0') * 10 + name[17] - '0';
+    int minute = (name[18] - '0') * 10 + name[19] - '0';
+    int second = (name[20] - '0') * 10 + name[21] - '0';
+    static const uint8_t days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59) {
+        return false;
+    }
+    int max_day = days[month - 1];
+    if (month == 2 && year % 4 == 0) {
+        max_day = 29;
+    }
+    if (day > max_day) {
+        return false;
+    }
+    snprintf(date, 11, "20%c%c-%c%c-%c%c",
+             name[9], name[10], name[11], name[12], name[13], name[14]);
+    return true;
+}
+
+static bool load_complete_record(const char *name, record_info_t *record, char date[11])
+{
+    if (!record_name_parse(name, date)) {
+        return false;
+    }
+    char dir_path[128];
+    int written = snprintf(dir_path, sizeof(dir_path), DAY_SD_MOUNT_POINT "/%s", name);
+    if (written < 0 || written >= (int)sizeof(dir_path)) {
+        return false;
+    }
+    struct stat dir_stat;
+    if (stat(dir_path, &dir_stat) != 0 || !S_ISDIR(dir_stat.st_mode)) {
+        return false;
+    }
+    memset(record, 0, sizeof(*record));
+    strlcpy(record->name, name, sizeof(record->name));
+    for (size_t i = 0; i < 4; ++i) {
+        char file_path[160];
+        written = snprintf(file_path, sizeof(file_path), "%s/%s", dir_path, s_record_files[i]);
+        if (written < 0 || written >= (int)sizeof(file_path) ||
+            !regular_file_size(file_path, &record->file_sizes[i])) {
+            return false;
+        }
+        record->total_bytes += record->file_sizes[i];
+    }
+    return true;
+}
+
+static int compare_dates_desc(const void *left, const void *right)
+{
+    return strcmp(((const date_summary_t *)right)->date, ((const date_summary_t *)left)->date);
+}
+
+static int compare_records(const void *left, const void *right)
+{
+    return strcmp(((const record_info_t *)left)->name, ((const record_info_t *)right)->name);
+}
+
+static int compare_transactions(const void *left, const void *right)
+{
+    return strcmp(((const transaction_info_t *)left)->export_id,
+                  ((const transaction_info_t *)right)->export_id);
+}
+
+static esp_err_t collect_dates(date_summary_t **out_items, size_t *out_count)
+{
+    *out_items = NULL;
+    *out_count = 0;
+    DIR *dir = opendir(DAY_SD_MOUNT_POINT);
+    if (!dir) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    date_summary_t *items = NULL;
+    size_t count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        record_info_t record;
+        char date[11];
+        if (!load_complete_record(entry->d_name, &record, date)) {
+            continue;
+        }
+        size_t index = 0;
+        while (index < count && strcmp(items[index].date, date) != 0) {
+            ++index;
+        }
+        if (index == count) {
+            date_summary_t *next = realloc(items, (count + 1) * sizeof(*items));
+            if (!next) {
+                free(items);
+                closedir(dir);
+                return ESP_ERR_NO_MEM;
+            }
+            items = next;
+            memset(&items[count], 0, sizeof(items[count]));
+            strlcpy(items[count].date, date, sizeof(items[count].date));
+            ++count;
+        }
+        items[index].record_count++;
+        items[index].total_bytes += record.total_bytes;
+    }
+    closedir(dir);
+    qsort(items, count, sizeof(*items), compare_dates_desc);
+    *out_items = items;
+    *out_count = count;
+    return ESP_OK;
+}
+
+static esp_err_t collect_records(const char *wanted_date, record_info_t **out_records, size_t *out_count,
+                                 uint64_t *out_total)
+{
+    *out_records = NULL;
+    *out_count = 0;
+    *out_total = 0;
+    DIR *dir = opendir(DAY_SD_MOUNT_POINT);
+    if (!dir) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    record_info_t *records = NULL;
+    size_t count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        record_info_t record;
+        char date[11];
+        if (!load_complete_record(entry->d_name, &record, date) || strcmp(date, wanted_date) != 0) {
+            continue;
+        }
+        record_info_t *next = realloc(records, (count + 1) * sizeof(*records));
+        if (!next) {
+            free(records);
+            closedir(dir);
+            return ESP_ERR_NO_MEM;
+        }
+        records = next;
+        records[count++] = record;
+        *out_total += record.total_bytes;
+    }
+    closedir(dir);
+    qsort(records, count, sizeof(*records), compare_records);
+    *out_records = records;
+    *out_count = count;
+    return ESP_OK;
+}
+
+static esp_err_t ensure_export_dir(void)
+{
+    struct stat st;
+    if (stat(DAY_EXPORT_DIR, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? ESP_OK : ESP_FAIL;
+    }
+    return mkdir(DAY_EXPORT_DIR, 0775) == 0 ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t atomic_write(const char *path, const char *data, size_t len)
+{
+    char tmp[160];
+    char backup[160];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp) ||
+        snprintf(backup, sizeof(backup), "%s.bak", path) >= (int)sizeof(backup)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    (void)unlink(tmp);
+    FILE *file = fopen(tmp, "wb");
+    if (!file) {
+        return ESP_FAIL;
+    }
+    esp_err_t result = ESP_OK;
+    if (fwrite(data, 1, len, file) != len || fflush(file) != 0 || fsync(fileno(file)) != 0) {
+        result = ESP_FAIL;
+    }
+    if (fclose(file) != 0) {
+        result = ESP_FAIL;
+    }
+    if (result != ESP_OK) {
+        (void)unlink(tmp);
+        return result;
+    }
+    bool had_original = access(path, F_OK) == 0;
+    if (had_original) {
+        (void)unlink(backup);
+        if (rename(path, backup) != 0) {
+            (void)unlink(tmp);
+            return ESP_FAIL;
+        }
+    }
+    if (rename(tmp, path) != 0) {
+        if (had_original) {
+            (void)rename(backup, path);
+        }
+        (void)unlink(tmp);
+        return ESP_FAIL;
+    }
+    if (had_original) {
+        (void)unlink(backup);
+    }
+    return ESP_OK;
+}
+
+static cJSON *read_json_file(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > DAY_EXPORT_JSON_MAX) {
+        return NULL;
+    }
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return NULL;
+    }
+    size_t len = (size_t)st.st_size;
+    char *data = malloc(len + 1);
+    if (!data) {
+        fclose(file);
+        return NULL;
+    }
+    bool ok = fread(data, 1, len, file) == len && fclose(file) == 0;
+    if (!ok) {
+        free(data);
+        return NULL;
+    }
+    data[len] = '\0';
+    const char *end = NULL;
+    cJSON *json = cJSON_ParseWithLengthOpts(data, len, &end, false);
+    if (!json || end != data + len || !cJSON_IsObject(json)) {
+        cJSON_Delete(json);
+        json = NULL;
+    }
+    free(data);
+    return json;
+}
+
+static cJSON *read_json_with_backup(const char *path)
+{
+    cJSON *json = read_json_file(path);
+    if (json) {
+        return json;
+    }
+    char backup[160];
+    if (snprintf(backup, sizeof(backup), "%s.bak", path) >= (int)sizeof(backup)) {
+        return NULL;
+    }
+    return read_json_file(backup);
+}
+
+static bool copy_json_string(const cJSON *root, const char *name, char *out, size_t out_len)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    if (!cJSON_IsString(item) || !item->valuestring || strlen(item->valuestring) >= out_len) {
+        return false;
+    }
+    strlcpy(out, item->valuestring, out_len);
+    return true;
+}
+
+static bool copy_json_u32(const cJSON *root, const char *name, uint32_t *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    if (!cJSON_IsNumber(item) || item->valuedouble < 0 || item->valuedouble > UINT32_MAX) {
+        return false;
+    }
+    *out = (uint32_t)item->valuedouble;
+    return (double)*out == item->valuedouble;
+}
+
+static bool copy_json_u64(const cJSON *root, const char *name, uint64_t *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    if (!cJSON_IsNumber(item) || item->valuedouble < 0 || item->valuedouble > 9007199254740991.0) {
+        return false;
+    }
+    *out = (uint64_t)item->valuedouble;
+    return (double)*out == item->valuedouble;
+}
+
+static bool transaction_paths(const char *export_id, char manifest[128], char state[128])
+{
+    if (!day_usb_export_id_valid(export_id)) {
+        return false;
+    }
+    return snprintf(manifest, 128, DAY_EXPORT_DIR "/%s.json", export_id) < 128 &&
+           snprintf(state, 128, DAY_EXPORT_DIR "/%s.state", export_id) < 128;
+}
+
+static esp_err_t load_transaction(const char *export_id, transaction_info_t *info)
+{
+    char manifest_path[128];
+    char state_path[128];
+    if (!info || !transaction_paths(export_id, manifest_path, state_path)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    cJSON *manifest = read_json_with_backup(manifest_path);
+    cJSON *state = read_json_with_backup(state_path);
+    if (!manifest || !state) {
+        cJSON_Delete(manifest);
+        cJSON_Delete(state);
+        return ESP_ERR_NOT_FOUND;
+    }
+    memset(info, 0, sizeof(*info));
+    uint32_t manifest_count = 0;
+    bool ok = copy_json_string(manifest, "export_id", info->export_id, sizeof(info->export_id)) &&
+              strcmp(info->export_id, export_id) == 0 &&
+              copy_json_string(manifest, "client_request_id", info->client_request_id,
+                               sizeof(info->client_request_id)) &&
+              copy_json_string(manifest, "date", info->date, sizeof(info->date)) &&
+              copy_json_u32(manifest, "record_count", &manifest_count) &&
+              copy_json_u64(manifest, "total_bytes", &info->total_bytes) &&
+              copy_json_string(state, "export_id", info->export_id, sizeof(info->export_id)) &&
+              strcmp(info->export_id, export_id) == 0 &&
+              copy_json_string(state, "state", info->state, sizeof(info->state)) &&
+              copy_json_string(state, "manifest_sha256", info->manifest_sha256,
+                               sizeof(info->manifest_sha256)) &&
+              copy_json_u32(state, "record_count", &info->record_count) &&
+              copy_json_u32(state, "deleted_count", &info->deleted_count) &&
+              info->record_count == manifest_count;
+    const cJSON *last_error = cJSON_GetObjectItemCaseSensitive(state, "last_error");
+    if (ok && cJSON_IsString(last_error) && last_error->valuestring) {
+        strlcpy(info->last_error, last_error->valuestring, sizeof(info->last_error));
+    }
+    cJSON_Delete(manifest);
+    cJSON_Delete(state);
+    return ok ? ESP_OK : ESP_ERR_INVALID_CRC;
+}
+
+static bool export_id_from_filename(const char *name, char export_id[DAY_USB_EXPORT_ID_MAX])
+{
+    size_t len = name ? strlen(name) : 0;
+    if (len <= 5 || strcmp(name + len - 5, ".json") != 0 || len - 5 >= DAY_USB_EXPORT_ID_MAX) {
+        return false;
+    }
+    memcpy(export_id, name, len - 5);
+    export_id[len - 5] = '\0';
+    return day_usb_export_id_valid(export_id);
+}
+
+static esp_err_t sha256_text(const char *data, size_t len, char hex[65])
+{
+    uint8_t digest[32];
+    size_t digest_len = 0;
+    psa_status_t status = psa_crypto_init();
+    if (status == PSA_SUCCESS) {
+        status = psa_hash_compute(PSA_ALG_SHA_256, (const uint8_t *)data, len,
+                                  digest, sizeof(digest), &digest_len);
+    }
+    if (status != PSA_SUCCESS || digest_len != sizeof(digest)) {
+        return ESP_FAIL;
+    }
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+        snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    }
+    hex[64] = '\0';
+    return ESP_OK;
+}
+
+static int64_t utc_now_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static esp_err_t json_to_response(cJSON *json, char *response, size_t response_len)
+{
+    char *text = cJSON_PrintUnformatted(json);
+    if (!text) {
+        return ESP_ERR_NO_MEM;
+    }
+    size_t len = strlen(text);
+    esp_err_t result = len < response_len && len <= DAY_USB_PAYLOAD_MAX ? ESP_OK : ESP_ERR_NO_MEM;
+    if (result == ESP_OK) {
+        memcpy(response, text, len + 1);
+    }
+    free(text);
+    return result;
+}
+
+static esp_err_t transaction_response(const transaction_info_t *info, char *response, size_t response_len)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(root, "export_id", info->export_id);
+    cJSON_AddStringToObject(root, "date", info->date);
+    cJSON_AddStringToObject(root, "state", info->state);
+    cJSON_AddNumberToObject(root, "record_count", info->record_count);
+    cJSON_AddNumberToObject(root, "deleted_count", info->deleted_count);
+    cJSON_AddNumberToObject(root, "total_bytes", (double)info->total_bytes);
+    char path[64];
+    snprintf(path, sizeof(path), "/EXPORTS/%s.json", info->export_id);
+    cJSON_AddStringToObject(root, "manifest_path", path);
+    cJSON_AddStringToObject(root, "manifest_sha256", info->manifest_sha256);
+    cJSON_AddStringToObject(root, "last_error", info->last_error);
+    esp_err_t result = json_to_response(root, response, response_len);
+    cJSON_Delete(root);
+    return result;
+}
+
+esp_err_t day_export_list_record_dates(const day_usb_pagination_args_t *args,
+                                       char *response, size_t response_len,
+                                       char *reason, size_t reason_len)
+{
+    if (!args || !response || response_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    date_summary_t *items = NULL;
+    size_t count = 0;
+    esp_err_t result = collect_dates(&items, &count);
+    if (result != ESP_OK) {
+        set_reason(reason, reason_len, "storage_not_mounted");
+        return result;
+    }
+    size_t cursor = args->cursor < count ? args->cursor : count;
+    size_t page_count = args->limit;
+    if (page_count > 15) {
+        page_count = 15;
+    }
+    if (page_count > count - cursor) {
+        page_count = count - cursor;
+    }
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        free(items);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON *array = cJSON_AddArrayToObject(root, "items");
+    if (!array) {
+        cJSON_Delete(root);
+        free(items);
+        return ESP_ERR_NO_MEM;
+    }
+    for (size_t i = 0; i < page_count; ++i) {
+        const date_summary_t *item = &items[cursor + i];
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddStringToObject(entry, "date", item->date);
+        cJSON_AddNumberToObject(entry, "record_count", item->record_count);
+        cJSON_AddNumberToObject(entry, "total_bytes", (double)item->total_bytes);
+        cJSON_AddItemToArray(array, entry);
+    }
+    if (cursor + page_count < count) {
+        cJSON_AddNumberToObject(root, "next_cursor", cursor + page_count);
+    } else {
+        cJSON_AddNullToObject(root, "next_cursor");
+    }
+    result = json_to_response(root, response, response_len);
+    cJSON_Delete(root);
+    free(items);
+    if (result != ESP_OK) {
+        set_reason(reason, reason_len, "response_too_large");
+    }
+    return result;
+}
+
+static esp_err_t scan_transactions(const day_usb_begin_export_args_t *args,
+                                   transaction_info_t *idempotent, size_t *active_count,
+                                   bool *date_prepared)
+{
+    *active_count = 0;
+    *date_prepared = false;
+    DIR *dir = opendir(DAY_EXPORT_DIR);
+    if (!dir) {
+        return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        char export_id[DAY_USB_EXPORT_ID_MAX];
+        if (!export_id_from_filename(entry->d_name, export_id)) {
+            continue;
+        }
+        transaction_info_t info;
+        if (load_transaction(export_id, &info) != ESP_OK) {
+            continue;
+        }
+        bool active = strcmp(info.state, "prepared") == 0 || strcmp(info.state, "committing") == 0;
+        if (active) {
+            (*active_count)++;
+        }
+        if (strcmp(info.client_request_id, args->client_request_id) == 0) {
+            *idempotent = info;
+            closedir(dir);
+            return ESP_OK;
+        }
+        if (active && strcmp(info.date, args->date) == 0) {
+            *date_prepared = true;
+        }
+    }
+    closedir(dir);
+    return ESP_OK;
+}
+
+static esp_err_t create_manifest_json(const day_usb_begin_export_args_t *args,
+                                      const char *export_id, const record_info_t *records,
+                                      size_t record_count, uint64_t total_bytes,
+                                      char **out_text)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddNumberToObject(root, "schema_version", 2);
+    cJSON_AddStringToObject(root, "export_id", export_id);
+    cJSON_AddStringToObject(root, "client_request_id", args->client_request_id);
+    cJSON_AddStringToObject(root, "device_id", day_device_id());
+    cJSON_AddStringToObject(root, "date", args->date);
+    cJSON_AddNumberToObject(root, "created_at_utc_ms", (double)utc_now_ms());
+    cJSON_AddStringToObject(root, "state", "prepared");
+    cJSON_AddNumberToObject(root, "record_count", record_count);
+    cJSON_AddNumberToObject(root, "total_bytes", (double)total_bytes);
+    cJSON *record_array = cJSON_AddArrayToObject(root, "records");
+    for (size_t i = 0; i < record_count; ++i) {
+        cJSON *record = cJSON_CreateObject();
+        cJSON_AddStringToObject(record, "name", records[i].name);
+        char record_id[64];
+        snprintf(record_id, sizeof(record_id), "%s-%s", day_device_id(), records[i].name);
+        cJSON_AddStringToObject(record, "record_id", record_id);
+        cJSON *files = cJSON_AddArrayToObject(record, "files");
+        for (size_t file_index = 0; file_index < 4; ++file_index) {
+            cJSON *file = cJSON_CreateObject();
+            cJSON_AddStringToObject(file, "name", s_record_files[file_index]);
+            cJSON_AddNumberToObject(file, "size", (double)records[i].file_sizes[file_index]);
+            cJSON_AddItemToArray(files, file);
+        }
+        cJSON_AddItemToArray(record_array, record);
+    }
+    *out_text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return *out_text ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+static esp_err_t write_initial_state(const transaction_info_t *info, const char *state_path)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddNumberToObject(root, "schema_version", 1);
+    cJSON_AddStringToObject(root, "export_id", info->export_id);
+    cJSON_AddStringToObject(root, "state", "prepared");
+    cJSON_AddNumberToObject(root, "record_count", info->record_count);
+    cJSON_AddNumberToObject(root, "deleted_count", 0);
+    cJSON_AddStringToObject(root, "manifest_sha256", info->manifest_sha256);
+    cJSON_AddStringToObject(root, "last_error", "");
+    cJSON_AddNumberToObject(root, "updated_at_utc_ms", (double)utc_now_ms());
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!text) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t result = atomic_write(state_path, text, strlen(text));
+    free(text);
+    return result;
+}
+
+esp_err_t day_export_begin(const day_usb_begin_export_args_t *args,
+                           char *response, size_t response_len,
+                           char *reason, size_t reason_len)
+{
+    if (!args || !response || response_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    day_storage_status_t storage = day_storage_get_status();
+    if (!storage.mounted) {
+        set_reason(reason, reason_len, "storage_not_mounted");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ensure_export_dir() != ESP_OK) {
+        set_reason(reason, reason_len, "cannot_create_export_directory");
+        return ESP_FAIL;
+    }
+    transaction_info_t idempotent = {0};
+    size_t active_count = 0;
+    bool date_prepared = false;
+    esp_err_t result = scan_transactions(args, &idempotent, &active_count, &date_prepared);
+    if (result != ESP_OK) {
+        set_reason(reason, reason_len, "cannot_scan_export_transactions");
+        return result;
+    }
+    if (idempotent.export_id[0]) {
+        if (strcmp(idempotent.date, args->date) != 0) {
+            set_reason(reason, reason_len, "client_request_id_date_mismatch");
+            return ESP_ERR_INVALID_ARG;
+        }
+        return transaction_response(&idempotent, response, response_len);
+    }
+    if (date_prepared) {
+        set_reason(reason, reason_len, "date_already_prepared");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (active_count >= DAY_EXPORT_MAX_ACTIVE) {
+        set_reason(reason, reason_len, "too_many_active_exports");
+        return ESP_ERR_NO_MEM;
+    }
+    record_info_t *records = NULL;
+    size_t record_count = 0;
+    uint64_t total_bytes = 0;
+    result = collect_records(args->date, &records, &record_count, &total_bytes);
+    if (result != ESP_OK) {
+        set_reason(reason, reason_len, "cannot_scan_records");
+        return result;
+    }
+    if (record_count == 0) {
+        free(records);
+        set_reason(reason, reason_len, "no_complete_records_for_date");
+        return ESP_ERR_INVALID_ARG;
+    }
+    char export_id[DAY_USB_EXPORT_ID_MAX];
+    char manifest_path[128];
+    char state_path[128];
+    do {
+        snprintf(export_id, sizeof(export_id), "exp-%s-%08" PRIx32 "%08" PRIx32,
+                 day_device_id(), esp_random(), esp_random());
+        if (!transaction_paths(export_id, manifest_path, state_path)) {
+            free(records);
+            return ESP_FAIL;
+        }
+    } while (access(manifest_path, F_OK) == 0 || access(state_path, F_OK) == 0);
+
+    char *manifest_text = NULL;
+    result = create_manifest_json(args, export_id, records, record_count, total_bytes, &manifest_text);
+    free(records);
+    if (result != ESP_OK) {
+        set_reason(reason, reason_len, "cannot_build_manifest");
+        return result;
+    }
+    transaction_info_t info = {0};
+    strlcpy(info.export_id, export_id, sizeof(info.export_id));
+    strlcpy(info.client_request_id, args->client_request_id, sizeof(info.client_request_id));
+    strlcpy(info.date, args->date, sizeof(info.date));
+    strlcpy(info.state, "prepared", sizeof(info.state));
+    info.record_count = (uint32_t)record_count;
+    info.total_bytes = total_bytes;
+    result = sha256_text(manifest_text, strlen(manifest_text), info.manifest_sha256);
+    if (result == ESP_OK) {
+        result = atomic_write(manifest_path, manifest_text, strlen(manifest_text));
+    }
+    free(manifest_text);
+    if (result == ESP_OK) {
+        result = write_initial_state(&info, state_path);
+    }
+    if (result != ESP_OK) {
+        (void)unlink(state_path);
+        (void)unlink(manifest_path);
+        set_reason(reason, reason_len, "cannot_persist_export_transaction");
+        return result;
+    }
+    ESP_LOGI(TAG, "prepared export %s date=%s records=%lu", export_id, args->date,
+             (unsigned long)record_count);
+    return transaction_response(&info, response, response_len);
+}
+
+esp_err_t day_export_get_status(const day_usb_get_export_status_args_t *args,
+                                char *response, size_t response_len,
+                                char *reason, size_t reason_len)
+{
+    if (!args || !response || response_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (args->has_export_id) {
+        transaction_info_t info;
+        esp_err_t result = load_transaction(args->export_id, &info);
+        if (result != ESP_OK) {
+            set_reason(reason, reason_len, result == ESP_ERR_NOT_FOUND ? "export_not_found" : "invalid_export_metadata");
+            return result;
+        }
+        return transaction_response(&info, response, response_len);
+    }
+    transaction_info_t *items = NULL;
+    size_t count = 0;
+    DIR *dir = opendir(DAY_EXPORT_DIR);
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            char export_id[DAY_USB_EXPORT_ID_MAX];
+            transaction_info_t info;
+            if (!export_id_from_filename(entry->d_name, export_id) ||
+                load_transaction(export_id, &info) != ESP_OK ||
+                (strcmp(info.state, "prepared") != 0 && strcmp(info.state, "committing") != 0)) {
+                continue;
+            }
+            transaction_info_t *next = realloc(items, (count + 1) * sizeof(*items));
+            if (!next) {
+                free(items);
+                closedir(dir);
+                return ESP_ERR_NO_MEM;
+            }
+            items = next;
+            items[count++] = info;
+        }
+        closedir(dir);
+    }
+    qsort(items, count, sizeof(*items), compare_transactions);
+    size_t cursor = args->cursor < count ? args->cursor : count;
+    size_t page_count = args->limit > 8 ? 8 : args->limit;
+    if (page_count > count - cursor) {
+        page_count = count - cursor;
+    }
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        free(items);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON *array = cJSON_AddArrayToObject(root, "items");
+    if (!array) {
+        cJSON_Delete(root);
+        free(items);
+        return ESP_ERR_NO_MEM;
+    }
+    for (size_t i = 0; i < page_count; ++i) {
+        transaction_info_t *info = &items[cursor + i];
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddStringToObject(entry, "export_id", info->export_id);
+        cJSON_AddStringToObject(entry, "date", info->date);
+        cJSON_AddStringToObject(entry, "state", info->state);
+        cJSON_AddNumberToObject(entry, "record_count", info->record_count);
+        cJSON_AddNumberToObject(entry, "deleted_count", info->deleted_count);
+        cJSON_AddItemToArray(array, entry);
+    }
+    if (cursor + page_count < count) {
+        cJSON_AddNumberToObject(root, "next_cursor", cursor + page_count);
+    } else {
+        cJSON_AddNullToObject(root, "next_cursor");
+    }
+    esp_err_t result = json_to_response(root, response, response_len);
+    cJSON_Delete(root);
+    free(items);
+    return result;
+}
+
+esp_err_t day_export_validate_prepared(const char export_ids[][DAY_USB_EXPORT_ID_MAX], size_t count,
+                                       char *reason, size_t reason_len)
+{
+    for (size_t i = 0; i < count; ++i) {
+        transaction_info_t info;
+        esp_err_t result = load_transaction(export_ids[i], &info);
+        if (result != ESP_OK || strcmp(info.state, "prepared") != 0) {
+            set_reason(reason, reason_len, result == ESP_ERR_NOT_FOUND ? "export_not_found" : "export_not_prepared");
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    return ESP_OK;
+}
+
+size_t day_export_active_count(void)
+{
+    size_t count = 0;
+    DIR *dir = opendir(DAY_EXPORT_DIR);
+    if (!dir) {
+        return 0;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        char export_id[DAY_USB_EXPORT_ID_MAX];
+        transaction_info_t info;
+        if (export_id_from_filename(entry->d_name, export_id) &&
+            load_transaction(export_id, &info) == ESP_OK &&
+            (strcmp(info.state, "prepared") == 0 || strcmp(info.state, "committing") == 0)) {
+            ++count;
+        }
+    }
+    closedir(dir);
+    return count;
+}

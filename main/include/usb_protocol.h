@@ -16,6 +16,9 @@ extern "C" {
 #define DAY_USB_PAYLOAD_MAX 1600
 #define DAY_USB_FRAME_HEADER_LEN 20
 #define DAY_USB_FIRMWARE_VERSION "2.0.0"
+#define DAY_USB_EXPORT_ID_MAX 40
+#define DAY_USB_CLIENT_REQUEST_ID_MAX 64
+#define DAY_USB_EXPORT_IDS_MAX 32
 
 typedef enum {
     DAY_USB_FRAME_REQUEST = 1,
@@ -74,12 +77,31 @@ typedef enum {
 
 typedef struct {
     day_usb_access_t access;
+    size_t export_id_count;
+    char export_ids[DAY_USB_EXPORT_IDS_MAX][DAY_USB_EXPORT_ID_MAX];
 } day_usb_enter_msc_args_t;
 
 typedef struct {
     bool force;
     day_usb_next_mode_t next_mode;
 } day_usb_exit_msc_args_t;
+
+typedef struct {
+    char date[11];
+    char client_request_id[DAY_USB_CLIENT_REQUEST_ID_MAX + 1];
+} day_usb_begin_export_args_t;
+
+typedef struct {
+    uint32_t cursor;
+    uint32_t limit;
+} day_usb_pagination_args_t;
+
+typedef struct {
+    bool has_export_id;
+    char export_id[DAY_USB_EXPORT_ID_MAX];
+    uint32_t cursor;
+    uint32_t limit;
+} day_usb_get_export_status_args_t;
 
 const char *day_usb_status_name(day_usb_status_t status);
 uint32_t day_usb_crc32(uint32_t crc, const uint8_t *data, size_t len);
@@ -88,6 +110,14 @@ esp_err_t day_usb_parse_enter_msc_args(const uint8_t *payload, size_t len,
                                        day_usb_enter_msc_args_t *args, char *reason, size_t reason_len);
 esp_err_t day_usb_parse_exit_msc_args(const uint8_t *payload, size_t len,
                                       day_usb_exit_msc_args_t *args, char *reason, size_t reason_len);
+bool day_usb_export_id_valid(const char *value);
+esp_err_t day_usb_parse_begin_export_args(const uint8_t *payload, size_t len,
+                                          day_usb_begin_export_args_t *args, char *reason, size_t reason_len);
+esp_err_t day_usb_parse_pagination_args(const uint8_t *payload, size_t len,
+                                        day_usb_pagination_args_t *args, char *reason, size_t reason_len);
+esp_err_t day_usb_parse_get_export_status_args(const uint8_t *payload, size_t len,
+                                               day_usb_get_export_status_args_t *args,
+                                               char *reason, size_t reason_len);
 
 #ifdef __cplusplus
 }

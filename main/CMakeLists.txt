@@ -22,5 +22,6 @@ idf_component_register(
         esp_tinyusb
         cjson
         fatfs
+        mbedtls
         sdmmc
         lwip)

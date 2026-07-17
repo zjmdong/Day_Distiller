@@ -14,6 +14,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
+#include "export_service.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -316,10 +317,11 @@ static char *make_status_payload(void)
                            "\"device\":\"Day Distiller\",\"device_id\":\"%s\",\"mode\":\"%s\","
                            "\"runtime_state\":\"%s\",\"session_id\":\"%016" PRIx64 "\","
                            "\"maintenance\":%s,\"recording\":%s,"
-                           "\"usb_full_speed\":true,\"metadata_schemas\":[1],"
+                           "\"usb_full_speed\":true,\"metadata_schemas\":[1],\"active_exports\":%u,"
                            "\"storage\":%s,"
                            "\"capabilities\":[\"enter_msc\",\"exit_msc\",\"msc_rw\","
-                           "\"msc_ro\",\"slip_crc32_json\",\"exit_to_maintenance\","
+                           "\"msc_ro\",\"slip_crc32_json\",\"export_manifest_v2\","
+                           "\"list_record_dates\",\"get_export_status\",\"exit_to_maintenance\","
                            "\"end_session\"]}",
                            DAY_USB_PROTO_VERSION,
                            DAY_USB_FIRMWARE_VERSION,
@@ -330,6 +332,7 @@ static char *make_status_payload(void)
                            day_usb_session_id(),
                            s_maintenance_active ? "true" : "false",
                            recording ? "true" : "false",
+                           (unsigned)day_export_active_count(),
                            storage);
     if (written < 0 || written >= DAY_USB_PAYLOAD_MAX) {
         free(payload);
@@ -352,6 +355,21 @@ static void restart_after_response(void)
     tinyusb_cdcacm_write_flush(s_protocol_port, pdMS_TO_TICKS(200));
     vTaskDelay(pdMS_TO_TICKS(250));
     esp_restart();
+}
+
+static day_usb_status_t export_error_status(esp_err_t error, const char *reason)
+{
+    if (error == ESP_ERR_INVALID_ARG || error == ESP_ERR_NOT_FOUND) {
+        return DAY_USB_STATUS_INVALID_ARG;
+    }
+    if (reason && (strcmp(reason, "date_already_prepared") == 0 ||
+                   strcmp(reason, "too_many_active_exports") == 0)) {
+        return DAY_USB_STATUS_BUSY;
+    }
+    if (error == ESP_ERR_INVALID_STATE) {
+        return DAY_USB_STATUS_BAD_STATE;
+    }
+    return DAY_USB_STATUS_STORAGE_ERROR;
 }
 
 static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *payload)
@@ -390,7 +408,18 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
             status = DAY_USB_STATUS_INVALID_ARG;
             break;
         }
-        if (day_usb_session_prepare_msc(args.access, NULL) != ESP_OK) {
+        if (args.export_id_count > 0 && args.access != DAY_USB_ACCESS_RO) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            snprintf(reason, sizeof(reason), "transactional_msc_must_be_read_only");
+            break;
+        }
+        if (day_export_validate_prepared(args.export_ids, args.export_id_count,
+                                         reason, sizeof(reason)) != ESP_OK) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
+        const char *active_export = args.export_id_count > 0 ? args.export_ids[0] : NULL;
+        if (day_usb_session_prepare_msc(args.access, active_export) != ESP_OK) {
             status = DAY_USB_STATUS_STORAGE_ERROR;
             break;
         }
@@ -400,6 +429,85 @@ static void process_request(const day_usb_frame_header_t *hdr, const uint8_t *pa
         day_storage_deinit();
         restart_after_response();
         return;
+    }
+    case DAY_USB_CMD_BEGIN_EXPORT: {
+        if (s_mode != DAY_USB_MODE_SERIAL) {
+            status = DAY_USB_STATUS_BAD_STATE;
+            break;
+        }
+        if (day_recorder_is_active()) {
+            status = DAY_USB_STATUS_BUSY;
+            break;
+        }
+        day_usb_begin_export_args_t args;
+        if (day_usb_parse_begin_export_args(payload, hdr->payload_len, &args,
+                                            reason, sizeof(reason)) != ESP_OK) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
+        response = malloc(DAY_USB_PAYLOAD_MAX + 1);
+        if (!response) {
+            status = DAY_USB_STATUS_STORAGE_ERROR;
+            break;
+        }
+        esp_err_t result = day_export_begin(&args, response, DAY_USB_PAYLOAD_MAX + 1,
+                                            reason, sizeof(reason));
+        if (result != ESP_OK) {
+            status = export_error_status(result, reason);
+            free(response);
+            response = NULL;
+        }
+        break;
+    }
+    case DAY_USB_CMD_GET_EXPORT_STATUS: {
+        if (s_mode != DAY_USB_MODE_SERIAL) {
+            status = DAY_USB_STATUS_BAD_STATE;
+            break;
+        }
+        day_usb_get_export_status_args_t args;
+        if (day_usb_parse_get_export_status_args(payload, hdr->payload_len, &args,
+                                                 reason, sizeof(reason)) != ESP_OK) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
+        response = malloc(DAY_USB_PAYLOAD_MAX + 1);
+        if (!response) {
+            status = DAY_USB_STATUS_STORAGE_ERROR;
+            break;
+        }
+        esp_err_t result = day_export_get_status(&args, response, DAY_USB_PAYLOAD_MAX + 1,
+                                                 reason, sizeof(reason));
+        if (result != ESP_OK) {
+            status = export_error_status(result, reason);
+            free(response);
+            response = NULL;
+        }
+        break;
+    }
+    case DAY_USB_CMD_LIST_RECORD_DATES: {
+        if (s_mode != DAY_USB_MODE_SERIAL) {
+            status = DAY_USB_STATUS_BAD_STATE;
+            break;
+        }
+        day_usb_pagination_args_t args;
+        if (day_usb_parse_pagination_args(payload, hdr->payload_len, &args,
+                                          reason, sizeof(reason)) != ESP_OK) {
+            status = DAY_USB_STATUS_INVALID_ARG;
+            break;
+        }
+        response = malloc(DAY_USB_PAYLOAD_MAX + 1);
+        if (!response) {
+            status = DAY_USB_STATUS_STORAGE_ERROR;
+            break;
+        }
+        esp_err_t result = day_export_list_record_dates(&args, response, DAY_USB_PAYLOAD_MAX + 1,
+                                                        reason, sizeof(reason));
+        if (result != ESP_OK) {
+            status = export_error_status(result, reason);
+            free(response);
+            response = NULL;
+        }
+        break;
     }
     case DAY_USB_CMD_EXIT_MSC: {
         day_usb_exit_msc_args_t args;
