@@ -40,21 +40,6 @@ QLabel#headerDeviceStatus {
 QLabel#headerDeviceStatus[connected="true"] {
     color: #39cf7f;
 }
-QPushButton#headerRestartButton {
-    min-height: 32px;
-    max-height: 32px;
-    border-radius: 16px;
-    padding: 0 14px;
-    background: #0b0b0b;
-    border-color: #292929;
-    color: #cfcfcf;
-    font-size: 12px;
-}
-QPushButton#headerRestartButton:hover {
-    background: #111d25;
-    border-color: #27506b;
-    color: #ffffff;
-}
 QLabel#pageTitle {
     color: #ffffff;
     font-size: 31px;

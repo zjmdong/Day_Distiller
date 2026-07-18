@@ -157,8 +157,8 @@ def test_firmware_and_serial_are_shown_and_v2_features_are_gated() -> None:
         assert window.v2_dates_button.isEnabled()
         assert window.v2_exports_button.isEnabled()
         assert window.v2_end_session_button.isEnabled()
-        assert "已连接" in window.header_device_state_label.text()
-        assert window.header_restart_button.isEnabled()
+        assert window.header_device_state_label.text() == "已连接"
+        assert not hasattr(window, "header_restart_button")
         rw_index = window.access_combo.findData("rw")
         assert window.access_combo.model().item(rw_index).isEnabled()
         window.access_combo.setCurrentIndex(rw_index)
