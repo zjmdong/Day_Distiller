@@ -177,7 +177,12 @@ class UsbLinkDevice:
         payload: dict[str, Any] = {"access": access}
         if export_ids:
             payload["export_ids"] = list(export_ids)
-        return self.request(Command.ENTER_MSC, payload, timeout=5.0).payload_json()
+        try:
+            return self.request(Command.ENTER_MSC, payload, timeout=5.0).payload_json()
+        except Exception:
+            if self._wait_until_port_removed():
+                return {"accepted": True, "rebooting": True}
+            raise
 
     def exit_msc(self, force: bool = False, next_mode: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"force": force}
@@ -185,7 +190,25 @@ class UsbLinkDevice:
             if next_mode not in {"normal", "maintenance"}:
                 raise ValueError("next_mode must be 'normal' or 'maintenance'")
             payload["next_mode"] = next_mode
-        return self.request(Command.EXIT_MSC, payload, timeout=5.0).payload_json()
+        try:
+            return self.request(Command.EXIT_MSC, payload, timeout=5.0).payload_json()
+        except Exception:
+            if self._wait_until_port_removed():
+                return {"accepted": True, "rebooting": True}
+            raise
+
+    def _wait_until_port_removed(self, timeout: float = 1.2) -> bool:
+        """Accept a lost response only when Windows observed USB re-enumeration."""
+
+        from serial.tools import list_ports
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            names = {str(port.device) for port in list_ports.comports()}
+            if self.port_name not in names:
+                return True
+            time.sleep(0.08)
+        return False
 
     def list_record_dates(self, cursor: int = 0, limit: int = 15) -> dict[str, Any]:
         return self.request(

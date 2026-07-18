@@ -39,6 +39,7 @@ from .device_settings import (
     WAKE_INTERVALS,
     DeviceSettingsSnapshot,
     build_patch,
+    format_device_status_cards,
     normalize_color,
 )
 from .device_workflow import LegacyDeviceWorkflow, SyncInventory, SyncedDay
@@ -61,7 +62,13 @@ from .providers import (
 )
 from .reporting import ReportRenderer, day_report_from_json
 from .resources import bundled_ffmpeg_paths, resource_path
-from .windows import drive_letters, list_removable_drives, safe_eject, wait_for_new_drive
+from .windows import (
+    drive_letters,
+    list_removable_drives,
+    safe_eject,
+    wait_for_new_drive,
+    wait_for_ready_new_drive,
+)
 from .ui_theme import APP_STYLESHEET
 
 
@@ -343,6 +350,9 @@ class MainWindow:
         self.style_preview_path: Path | None = None
         self._landing_reveal_targets: list[tuple[object, object]] = []
         self._landing_animation_groups: list[object] = []
+        self._header_device_probe_inflight = False
+        self._header_device_port_name: str | None = None
+        self._device_operation_name: str | None = None
 
         self.discovery_timer = QTimer()
         self.discovery_timer.setInterval(1000)
@@ -350,12 +360,17 @@ class MainWindow:
         self.sync_countdown_timer = QTimer()
         self.sync_countdown_timer.setInterval(1000)
         self.sync_countdown_timer.timeout.connect(self._guided_countdown_tick)
+        self.header_device_timer = QTimer()
+        self.header_device_timer.setInterval(2000)
+        self.header_device_timer.timeout.connect(self._header_device_tick)
 
         self._build_ui()
         self._load_cloud_settings()
         self._load_avatar_profile()
         self.refresh_ports()
         self.refresh_history()
+        self.header_device_timer.start()
+        QTimer.singleShot(700, self._header_device_tick)
         # Let the native window-opening animation finish before the
         # landing content begins its own reveal.
         QTimer.singleShot(500, self._play_landing_intro)
@@ -370,7 +385,15 @@ class MainWindow:
 
     def _build_ui(self) -> None:
         from PySide6.QtCore import QTimer
-        from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+        from PySide6.QtWidgets import (
+            QApplication,
+            QFrame,
+            QHBoxLayout,
+            QLabel,
+            QPushButton,
+            QVBoxLayout,
+            QWidget,
+        )
 
         self.tabs = NavigationStack()
         self.tabs.addTab(self._guide_page(), "开始")
@@ -398,6 +421,17 @@ class MainWindow:
         brand_box.addWidget(brand_subtitle)
         header_layout.addLayout(brand_box)
         header_layout.addStretch(1)
+        self.header_device_state_label = QLabel("●  设备未连接")
+        self.header_device_state_label.setObjectName("headerDeviceStatus")
+        self.header_device_state_label.setProperty("connected", False)
+        self.header_restart_button = QPushButton("安全重启")
+        self.header_restart_button.setObjectName("headerRestartButton")
+        self.header_restart_button.setEnabled(False)
+        self.header_restart_button.setToolTip("连接支持维护模式的设备后可用")
+        self.header_restart_button.clicked.connect(self.safe_restart_device)
+        header_layout.addWidget(self.header_device_state_label)
+        header_layout.addSpacing(10)
+        header_layout.addWidget(self.header_restart_button)
         root_layout.addWidget(header)
         root_layout.addWidget(self.tabs.widget, 1)
         self.window.setCentralWidget(root)
@@ -1003,6 +1037,7 @@ class MainWindow:
             QLineEdit,
             QPushButton,
             QScrollArea,
+            QSizePolicy,
             QSlider,
             QSpinBox,
             QVBoxLayout,
@@ -1050,6 +1085,8 @@ class MainWindow:
 
         status_group = QGroupBox("设备状态")
         status_grid = QGridLayout(status_group)
+        for column in range(4):
+            status_grid.setColumnStretch(column, 1)
         self.device_status_values: dict[str, QLabel] = {}
         status_items = (
             ("identity", "设备"),
@@ -1064,12 +1101,15 @@ class MainWindow:
         for index, (key, title) in enumerate(status_items):
             card = QFrame()
             card.setObjectName("modelCard")
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             card_layout = QVBoxLayout(card)
             caption = QLabel(title)
             caption.setProperty("muted", True)
             value = QLabel("—")
             value.setObjectName("deviceStatusValue")
             value.setWordWrap(True)
+            value.setMinimumWidth(0)
+            value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             card_layout.addWidget(caption)
             card_layout.addWidget(value)
             self.device_status_values[key] = value
@@ -1346,6 +1386,7 @@ class MainWindow:
         self.device_settings_refresh_button.setEnabled(False)
         self.device_settings_connection_label.setText("正在连接并读取设备…")
         self.device_settings_notice.setText("正在读取固件能力、状态和设备配置。")
+        self._begin_device_operation("device_settings_load", "●  正在读取设备…")
 
         def work() -> dict[str, Any]:
             found = find_device(timeout_per_port=1.0)
@@ -1356,7 +1397,13 @@ class MainWindow:
             with UsbLinkDevice(port.device) as device:
                 status = device.get_status()
                 config = device.get_config(include_secrets=True) if profile.supports_device_settings else None
-            return {"port": port, "hello": hello, "status": status, "config": config}
+            return {
+                "port": port,
+                "hello": hello,
+                "profile": profile,
+                "status": status,
+                "config": config,
+            }
 
         self.worker.run("device_settings_load", work)
 
@@ -1414,14 +1461,25 @@ class MainWindow:
         self._close_device()
         self._set_device_settings_controls_enabled(False)
         self.device_settings_refresh_button.setEnabled(False)
-        self.device_settings_connection_label.setText("正在保存到设备…")
+        self.device_settings_connection_label.setText("正在保存并安全重启设备…")
+        self.device_settings_notice.setText("设置写入后会安全重启设备，请勿拔出 USB。")
+        self._begin_device_operation("device_settings_save", "●  正在保存并重启…")
 
         def work() -> dict[str, Any]:
             with UsbLinkDevice(selected.device) as device:
                 result = device.set_config(patch, expected_revision=snapshot.revision)
+            restarted = self._perform_safe_restart(selected, profile)
+            port = restarted["port"]
+            with UsbLinkDevice(port.device) as device:
                 config = device.get_config(include_secrets=True)
                 status = device.get_status()
-            return {"port": selected, "result": result, "config": config, "status": status}
+            return {
+                **restarted,
+                "port": port,
+                "result": result,
+                "config": config,
+                "status": status,
+            }
 
         self.worker.run("device_settings_save", work)
 
@@ -1459,6 +1517,7 @@ class MainWindow:
         self._close_device()
         self.device_led_preview_button.setEnabled(False)
         self.device_settings_notice.setText("正在让设备临时预览当前颜色；2 秒后会恢复原有灯效。")
+        self._begin_device_operation("device_led_preview", "●  正在预览状态灯…")
 
         def work() -> dict[str, Any]:
             with UsbLinkDevice(selected.device) as device:
@@ -1489,69 +1548,17 @@ class MainWindow:
         self.device_led_brightness_spin.setValue(snapshot.led_brightness_percent)
         self.device_led_color_edit.setText(snapshot.recording_color)
 
-    @staticmethod
-    def _available(value: Any) -> bool:
-        return isinstance(value, dict) and value.get("available", True) is not False
-
     def _populate_device_status_cards(self, status: dict[str, Any], profile: DeviceProfile) -> None:
-        def section(name: str) -> dict[str, Any]:
-            value = status.get(name)
-            return value if isinstance(value, dict) else {}
-
-        battery, rtc, clock = section("battery"), section("rtc"), section("clock")
-        wifi, storage, power, led = (
-            section("wifi"), section("storage"), section("power"), section("led")
+        values = format_device_status_cards(
+            status,
+            firmware_version=profile.display_firmware,
+            serial_number=profile.serial_number,
+            settings=self.device_settings_snapshot,
         )
-        self.device_status_values["identity"].setText(
-            f"{profile.display_firmware}\n{profile.serial_number}"
-        )
-        self.device_status_values["battery"].setText(
-            (
-                f"{battery.get('soc_percent', '—')}% · {battery.get('voltage_v', '—')} V\n"
-                f"{battery.get('charge_state', 'unknown')}"
-            )
-            if self._available(battery)
-            else "当前不可用"
-        )
-        self.device_status_values["rtc"].setText(
-            (
-                f"{'有效' if rtc.get('valid') else '无效'} · {rtc.get('iso8601') or '未校时'}"
-            )
-            if self._available(rtc)
-            else "当前不可用"
-        )
-        self.device_status_values["clock"].setText(
-            (
-                f"{'可信' if clock.get('system_valid') else '未校准'} · {clock.get('timezone', '—')}\n"
-                f"来源 {clock.get('source', '—')} · 上次 {clock.get('last_sync_source', '—')}"
-            )
-            if clock
-            else "当前固件未提供"
-        )
-        wifi_state = "已连接" if wifi.get("sta_connected") else "已配置" if wifi.get("configured") else "未配置"
-        self.device_status_values["wifi"].setText(
-            f"{wifi_state} · {wifi.get('ssid') or '—'}\n{wifi.get('ip') or '无 IP'}"
-            if self._available(wifi)
-            else "当前不可用"
-        )
-        self.device_status_values["storage"].setText(
-            f"{'已就绪' if storage.get('ready') else '未就绪'} · "
-            f"{'USB 已挂载' if storage.get('usb_exposed') else '设备端'}"
-            if storage
-            else "当前固件未提供"
-        )
-        self.device_status_values["power"].setText(
-            f"{power.get('wake_reason', '—')} · 下次 {power.get('next_wake_sec', '—')} 秒\n"
-            f"{'低电量锁定' if power.get('low_battery_latched') else '正常'}"
-            if power
-            else "当前固件未提供"
-        )
-        self.device_status_values["led"].setText(
-            f"{led.get('mode', '—')} · {led.get('brightness_percent', '—')}%\n"
-            f"录制 {led.get('recording_color', '—')}"
-            if led
-            else "当前固件未提供"
-        )
+        for key, value in values.items():
+            label = self.device_status_values.get(key)
+            if label is not None:
+                label.setText(value)
 
     def _developer_history_page(self):
         from PySide6.QtWidgets import QHBoxLayout, QListWidget, QPushButton, QVBoxLayout, QWidget
@@ -1982,6 +1989,208 @@ class MainWindow:
             )
         self._device_log(f"发现 {len(self.ports)} 个串口。")
 
+    def _device_operation_active(self) -> bool:
+        return bool(self._device_operation_name or self.guided_operation_active)
+
+    def _set_header_device_state(
+        self,
+        connected: bool,
+        text: str | None = None,
+    ) -> None:
+        if not hasattr(self, "header_device_state_label"):
+            return
+        if text is None:
+            if connected and self.connected_device_profile:
+                text = f"●  已连接 {self.connected_device_profile.serial_number}"
+            else:
+                text = "●  设备未连接"
+        self.header_device_state_label.setText(text)
+        self.header_device_state_label.setProperty("connected", connected)
+        self.header_device_state_label.style().unpolish(self.header_device_state_label)
+        self.header_device_state_label.style().polish(self.header_device_state_label)
+        can_restart = bool(
+            connected
+            and self.connected_device_profile
+            and self.connected_device_profile.is_firmware_v2
+            and not self._device_operation_active()
+        )
+        self.header_restart_button.setEnabled(can_restart)
+        if can_restart:
+            self.header_restart_button.setToolTip(
+                "如设备处于 U 盘模式，会先安全弹出并退出 MSC，再重启到维护模式"
+            )
+        elif connected and self.connected_device_profile and not self.connected_device_profile.is_firmware_v2:
+            self.header_restart_button.setToolTip("当前旧版固件不支持桌面端安全重启")
+        elif self._device_operation_active():
+            self.header_restart_button.setToolTip("设备操作进行中，请等待当前安全步骤结束")
+        else:
+            self.header_restart_button.setToolTip("连接支持维护模式的设备后可用")
+
+    def _begin_device_operation(self, name: str, message: str | None = None) -> None:
+        self._device_operation_name = name
+        self._set_header_device_state(
+            bool(self.connected_device_profile),
+            message,
+        )
+
+    def _finish_device_operation(self, name: str) -> None:
+        if self._device_operation_name == name:
+            self._device_operation_name = None
+        self._set_header_device_state(bool(self.connected_device_profile))
+
+    def _header_device_tick(self) -> None:
+        if self._header_device_probe_inflight or self._device_operation_active():
+            return
+        ports = list_serial_ports()
+        port_names = {port.device for port in ports}
+        if self.connected_device_profile and self._header_device_port_name in port_names:
+            self._set_header_device_state(True)
+            return
+        if self.connected_device_profile and self._header_device_port_name not in port_names:
+            self.connected_device_profile = None
+            self._header_device_port_name = None
+            self._set_header_device_state(False)
+        if not any(port.likely for port in ports):
+            return
+        self._header_device_probe_inflight = True
+        self.worker.run("header_device_probe", lambda: find_device(timeout_per_port=0.4))
+
+    @staticmethod
+    def _wait_for_device_found(timeout: float = 20.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            found = find_device(timeout_per_port=0.5)
+            if found:
+                return found
+            time.sleep(0.35)
+        return None
+
+    @staticmethod
+    def _wait_for_reboot_cycle(port_name: str, timeout: float = 3.0):
+        """Require an observed disconnect before accepting a reboot as complete."""
+
+        deadline = time.monotonic() + timeout
+        saw_disconnect = False
+        while time.monotonic() < deadline:
+            try:
+                with UsbLinkDevice(port_name, timeout=0.25) as device:
+                    device.hello()
+            except Exception:
+                saw_disconnect = True
+            if saw_disconnect:
+                found = find_device(timeout_per_port=0.4)
+                if found:
+                    return found
+            time.sleep(0.2)
+        return None
+
+    def _msc_drive_for_restart(self) -> str | None:
+        drives = list_removable_drives()
+        by_letter = {drive.letter: drive for drive in drives}
+        if self.last_drive_letter in by_letter:
+            return self.last_drive_letter
+        source = str(getattr(self, "source_edit", None).text() if hasattr(self, "source_edit") else "")
+        source_letter = source[:1].upper() if len(source) >= 3 and source[1:3] == ":\\" else None
+        if source_letter in by_letter:
+            return source_letter
+        named = [
+            drive
+            for drive in drives
+            if any(token in drive.label.upper() for token in ("AI_CAM", "DAY DISTILLER"))
+        ]
+        if len(named) == 1:
+            return named[0].letter
+        return drives[0].letter if len(drives) == 1 else None
+
+    def _perform_safe_restart(
+        self,
+        selected: PortCandidate,
+        profile: DeviceProfile,
+        msc_drive_hint: str | None = None,
+    ) -> dict[str, Any]:
+        """Restart safely, with an MSC round-trip fallback for firmware 2.1.0."""
+
+        with UsbLinkDevice(selected.device, timeout=1.0) as device:
+            status = device.get_status()
+        mode = str(status.get("mode") or "serial").lower()
+        compatibility_fallback = False
+
+        if mode == "msc":
+            letter = msc_drive_hint
+            if not letter:
+                raise RuntimeError("设备处于 U 盘模式，但无法唯一识别对应盘符；请关闭其他可移动磁盘后重试")
+            safe_eject(letter)
+            found = self._wait_for_device_found(8.0)
+            if not found:
+                raise RuntimeError("安全弹出后未找到设备协议串口")
+            with UsbLinkDevice(found[0].device, timeout=1.0) as device:
+                device.exit_msc(force=False, next_mode="maintenance" if profile.is_firmware_v2 else None)
+            restarted = self._wait_for_reboot_cycle(found[0].device, 8.0)
+        elif profile.is_firmware_v2:
+            # Firmware documentation defines EXIT_MSC(next_mode=maintenance)
+            # as a rebooting maintenance transition. Early 2.1.0 builds return
+            # success without restarting while already in serial mode, so the
+            # observed disconnect below decides whether a compatibility fallback
+            # is required.
+            with UsbLinkDevice(selected.device, timeout=1.0) as device:
+                device.exit_msc(force=False, next_mode="maintenance")
+            restarted = self._wait_for_reboot_cycle(selected.device, 3.0)
+            if restarted is None:
+                compatibility_fallback = True
+                before = drive_letters()
+                with UsbLinkDevice(selected.device, timeout=1.0) as device:
+                    device.enter_msc("ro")
+                drive = wait_for_ready_new_drive(before, timeout=30.0)
+                if drive is None:
+                    raise RuntimeError("兼容重启已进入 U 盘模式，但 Windows 未发现设备卷")
+                safe_eject(drive.letter)
+                found = self._wait_for_device_found(10.0)
+                if not found:
+                    raise RuntimeError("安全弹出后未找到设备协议串口")
+                with UsbLinkDevice(found[0].device, timeout=1.0) as device:
+                    device.exit_msc(force=False, next_mode="maintenance")
+                restarted = self._wait_for_reboot_cycle(found[0].device, 10.0)
+        else:
+            raise RuntimeError("当前旧版固件不支持桌面端安全重启")
+
+        if restarted is None:
+            restarted = self._wait_for_device_found(20.0)
+        if restarted is None:
+            raise RuntimeError("设备已收到重启请求，但在超时前没有重新连接")
+        port, hello = restarted
+        with UsbLinkDevice(port.device, timeout=1.0) as device:
+            fresh_status = device.get_status()
+        return {
+            "port": port,
+            "hello": hello,
+            "status": fresh_status,
+            "profile": device_profile(hello, port),
+            "compatibility_fallback": compatibility_fallback,
+        }
+
+    def safe_restart_device(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        if self._device_operation_active():
+            QMessageBox.information(
+                self.window,
+                "设备正在使用",
+                "当前设备操作仍在安全执行。请等待同步、弹出或写入完成后再重启。",
+            )
+            return
+        selected = self._selected_port_candidate()
+        profile = self.connected_device_profile
+        if selected is None or profile is None:
+            QMessageBox.information(self.window, "设备未连接", "请先连接 Day Distiller 设备。")
+            return
+        self._close_device()
+        msc_drive_hint = self._msc_drive_for_restart()
+        self._begin_device_operation("device_safe_restart", "●  正在安全重启设备…")
+        self.worker.run(
+            "device_safe_restart",
+            lambda: self._perform_safe_restart(selected, profile, msc_drive_hint),
+        )
+
     def connect_selected(self) -> None:
         port = self.port_combo.currentData()
         if not port:
@@ -2054,10 +2263,11 @@ class MainWindow:
             self.records_hint.setText(f"扫描失败：{exc}")
 
     def _play_landing_intro(self) -> None:
-        """Reveal the landing content through a deliberate four-part timeline."""
+        """Reveal the landing content with overlapping, lightweight motion."""
 
         from PySide6.QtCore import (
             QEasingCurve,
+            QPauseAnimation,
             QParallelAnimationGroup,
             QPropertyAnimation,
             QSequentialAnimationGroup,
@@ -2068,40 +2278,44 @@ class MainWindow:
             return
 
         for content, effect in self._landing_reveal_targets:
-            effect.setBlurRadius(16.0)
+            # Large blur radii are expensive on Windows raster surfaces. Eight
+            # pixels preserves the soft glass-like reveal without dropping
+            # frames while several elements overlap.
+            effect.setBlurRadius(8.0)
             effect.setProperty("revealOpacity", 0.0)
 
         def reveal_group(content, effect, duration: int, parent) -> QParallelAnimationGroup:
             group = QParallelAnimationGroup(parent)
             blur_animation = QPropertyAnimation(effect, b"blurRadius", group)
-            blur_animation.setStartValue(16.0)
+            blur_animation.setStartValue(8.0)
             blur_animation.setEndValue(0.0)
             blur_animation.setDuration(duration)
-            blur_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            blur_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
             opacity_animation = QPropertyAnimation(effect, b"revealOpacity", group)
             opacity_animation.setStartValue(0.0)
             opacity_animation.setEndValue(1.0)
             opacity_animation.setDuration(duration)
-            opacity_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            opacity_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
             group.finished.connect(lambda content=content: content.setGraphicsEffect(None))
             return group
 
+        def delayed_reveal(target, delay: int, duration: int, parent):
+            sequence = QSequentialAnimationGroup(parent)
+            sequence.addAnimation(QPauseAnimation(delay, sequence))
+            sequence.addAnimation(reveal_group(*target, duration, sequence))
+            return sequence
+
         title, subtitle, button, footer = self._landing_reveal_targets
-        sequence = QSequentialAnimationGroup(self.window)
-        sequence.addAnimation(reveal_group(*title, 1250, sequence))
-
-        subtitle_and_button = QParallelAnimationGroup(sequence)
-        subtitle_and_button.addAnimation(
-            reveal_group(*subtitle, 800, subtitle_and_button)
-        )
-        subtitle_and_button.addAnimation(
-            reveal_group(*button, 800, subtitle_and_button)
-        )
-        sequence.addAnimation(subtitle_and_button)
-
-        sequence.addAnimation(reveal_group(*footer, 800, sequence))
-        self._landing_animation_groups.append(sequence)
-        sequence.start()
+        timeline = QParallelAnimationGroup(self.window)
+        timeline.addAnimation(reveal_group(*title, 1100, timeline))
+        # Subtitle and primary action begin while the title is still settling.
+        timeline.addAnimation(delayed_reveal(subtitle, 520, 700, timeline))
+        timeline.addAnimation(delayed_reveal(button, 520, 700, timeline))
+        # The first-use link is intentionally quick and finishes before the
+        # primary action, keeping it from attracting attention.
+        timeline.addAnimation(delayed_reveal(footer, 880, 280, timeline))
+        self._landing_animation_groups.append(timeline)
+        timeline.start()
 
     def start_guided_workflow(self) -> None:
         """Enter the production one-click flow and begin 1 Hz device discovery."""
@@ -2176,6 +2390,7 @@ class MainWindow:
         self.sync_countdown_timer.stop()
         self.guided_phase = "syncing"
         self.guided_operation_active = True
+        self._set_header_device_state(bool(self.connected_device_profile))
         self.home_stack.setCurrentIndex(2)
         self.guided_sync_progress.setValue(2)
         self.guided_sync_subtitle.setText("正在挂载设备并比对本地缓存，请稍等。")
@@ -2242,6 +2457,7 @@ class MainWindow:
             return
         self.guided_phase = "distilling"
         self.guided_operation_active = True
+        self._set_header_device_state(bool(self.connected_device_profile))
         self.guided_backgrounded = False
         self.guided_device_info.hide()
         self.guided_sync_device_info.hide()
@@ -3246,6 +3462,20 @@ class MainWindow:
                 return
 
     def _start(self, name: str, operation: Callable[[], Any]) -> None:
+        if name in {
+            "auto_find",
+            "connect",
+            "status",
+            "enter_msc",
+            "eject",
+            "exit_msc",
+            "v2_dates",
+            "v2_exports",
+            "v2_end_session",
+            "distill",
+            "cleanup_retry",
+        }:
+            self._begin_device_operation(name, f"●  设备操作中 · {name}")
         if name in {"distill", "cleanup_retry", "manual_regenerate", "manual_resend"}:
             self.distill_log.appendPlainText(f"{name}...")
         elif name == "style_test":
@@ -3260,6 +3490,10 @@ class MainWindow:
                 name, result, error = self.events.get_nowait()
             except queue.Empty:
                 return
+            if name == "header_device_probe":
+                self._header_device_probe_inflight = False
+                if error:
+                    continue
             if name == "guided_sync_progress":
                 progress, message = result
                 self.guided_sync_progress.setValue(max(3, min(96, round(float(progress) * 96))))
@@ -3312,6 +3546,7 @@ class MainWindow:
                 self.distill_log.appendPlainText(str(result))
                 continue
             if error:
+                self._finish_device_operation(name)
                 if name == "guided_discover":
                     self.guided_discovery_inflight = False
                     if self.guided_phase == "discovering":
@@ -3367,6 +3602,12 @@ class MainWindow:
                                 and self.device_settings_snapshot
                             )
                         )
+                elif name == "device_safe_restart":
+                    self._set_header_device_state(
+                        bool(self.connected_device_profile),
+                        "●  安全重启失败",
+                    )
+                    self._device_log(f"安全重启失败：{error}")
                 elif name == "style_test":
                     self.style_preview_spinner.stop()
                     self.style_preview_spinner_layer.hide()
@@ -3376,17 +3617,41 @@ class MainWindow:
                     self._device_log(f"{name} 失败：{error}")
                 continue
             self._handle_result(name, result)
+            self._finish_device_operation(name)
 
     def _handle_result(self, name: str, result: Any) -> None:
-        if name == "device_settings_load":
-            port = result["port"]
-            status = result["status"]
-            profile = device_profile(status, port)
+        if name == "header_device_probe":
+            if not result:
+                self._set_header_device_state(False)
+                return
+            port, hello = result
+            profile = device_profile(hello, port)
             self.refresh_ports()
             self._select_port(port.device)
-            self._apply_status(status, port)
+            self._apply_status(hello, port, profile=profile)
+        elif name == "device_safe_restart":
+            port = result["port"]
+            profile = result["profile"]
+            self.refresh_ports()
+            self._select_port(port.device)
+            self._apply_status(result["status"], port, profile=profile)
+            detail = (
+                "已通过兼容维护流程安全弹出并重启设备。"
+                if result.get("compatibility_fallback")
+                else "设备已安全重启并重新连接。"
+            )
+            self._device_log(detail)
+        elif name == "device_settings_load":
+            port = result["port"]
+            status = result["status"]
+            # GET_STATUS intentionally omits the HELLO-only capabilities list.
+            # Keep the negotiated HELLO profile instead of rebuilding a legacy,
+            # read-only profile from the status payload.
+            profile = result.get("profile") or device_profile(result.get("hello", status), port)
+            self.refresh_ports()
+            self._select_port(port.device)
+            self._apply_status(status, port, profile=profile)
             self.device_settings_status = status
-            self._populate_device_status_cards(status, profile)
             self.device_settings_connection_label.setText(
                 f"已连接 · {profile.display_firmware} · {profile.serial_number}"
             )
@@ -3395,6 +3660,7 @@ class MainWindow:
             if isinstance(config, dict):
                 snapshot = DeviceSettingsSnapshot.from_payload(config)
                 self._populate_device_settings(snapshot)
+                self._populate_device_status_cards(status, profile)
                 can_write = profile.supports("device_config_write")
                 self._set_device_settings_controls_enabled(can_write)
                 self.device_settings_notice.setText(
@@ -3406,6 +3672,7 @@ class MainWindow:
                 )
             else:
                 self.device_settings_snapshot = None
+                self._populate_device_status_cards(status, profile)
                 self._set_device_settings_controls_enabled(False)
                 self.device_settings_notice.setText(
                     "当前固件未声明 device_config_v1；可查看基础状态，设备同步仍按兼容协议运行。"
@@ -3416,19 +3683,24 @@ class MainWindow:
         elif name == "device_settings_save":
             port = result["port"]
             status = result["status"]
-            profile = device_profile(status, port)
-            self._apply_status(status, port)
+            profile = result.get("profile") or device_profile(status, port)
+            self._apply_status(status, port, profile=profile)
             self.device_settings_status = status
-            self._populate_device_status_cards(status, profile)
             snapshot = DeviceSettingsSnapshot.from_payload(result["config"])
             self._populate_device_settings(snapshot)
+            self._populate_device_status_cards(status, profile)
             self._set_device_settings_controls_enabled(profile.supports("device_config_write"))
             self.device_settings_refresh_button.setEnabled(True)
             self.device_settings_connection_label.setText(
-                f"已保存 · {profile.display_firmware} · revision {snapshot.revision}"
+                f"已保存并重启 · {profile.display_firmware} · revision {snapshot.revision}"
             )
             self.device_settings_notice.setText(
-                "设置已安全写入设备。录制参数会在设备空闲时生效，网络参数会在下次冷启动使用。"
+                "设置已安全写入，设备已完成重启并重新连接。"
+                + (
+                    " 当前固件使用了兼容维护重启流程。"
+                    if result.get("compatibility_fallback")
+                    else ""
+                )
             )
         elif name == "device_led_preview":
             self.device_led_preview_button.setEnabled(True)
@@ -3638,10 +3910,14 @@ class MainWindow:
         self,
         status: dict[str, Any],
         port: PortCandidate | None = None,
+        *,
+        profile: DeviceProfile | None = None,
     ) -> None:
         storage = status.get("storage") if isinstance(status.get("storage"), dict) else {}
-        profile = device_profile(status, port or self._selected_port_candidate())
+        profile = profile or device_profile(status, port or self._selected_port_candidate())
         self.connected_device_profile = profile
+        selected_port = port or self._selected_port_candidate()
+        self._header_device_port_name = selected_port.device if selected_port else None
         self.connection_label.setText("已连接")
         self.firmware_version_label.setText(profile.display_firmware)
         self.device_serial_label.setText(profile.serial_number)
@@ -3687,6 +3963,7 @@ class MainWindow:
         self.guided_sync_device_info.setText(info)
         self.guided_device_info.show()
         self.guided_sync_device_info.show()
+        self._set_header_device_state(True)
 
     def _set_device_feature_availability(self, profile: DeviceProfile) -> None:
         enabled = profile.is_firmware_v2

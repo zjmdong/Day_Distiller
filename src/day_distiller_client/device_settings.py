@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from html import escape
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -183,3 +184,166 @@ def build_patch(snapshot: DeviceSettingsSnapshot, *, include_password: bool = Tr
             "recording_color": normalize_color(snapshot.recording_color),
         },
     }
+
+
+def _status_icon(ok: bool, success_text: str, failure_text: str) -> str:
+    color = "#22C875" if ok else "#FF5A67"
+    symbol = "✓" if ok else "✕"
+    text = success_text if ok else failure_text
+    return (
+        f'<span style="color:{color};font-size:17px;font-weight:700">{symbol}</span> '
+        f"{escape(text)}"
+    )
+
+
+def _number(value: Any, digits: int) -> str | None:
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def format_storage_size(value: Any) -> str:
+    try:
+        size = max(0, int(value))
+    except (TypeError, ValueError):
+        return "—"
+    units = ("B", "KB", "MB", "GB", "TB")
+    amount = float(size)
+    unit = units[0]
+    for unit in units:
+        if amount < 1000.0 or unit == units[-1]:
+            break
+        amount /= 1000.0
+    digits = 0 if unit in {"B", "KB"} else 1
+    return f"{amount:.{digits}f} {unit}"
+
+
+def format_interval(seconds: Any) -> str:
+    try:
+        value = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "—"
+    if value and value % 3600 == 0:
+        return f"{value // 3600} 小时"
+    if value and value % 60 == 0:
+        return f"{value // 60} 分钟"
+    return f"{value} 秒"
+
+
+def format_device_status_cards(
+    status: dict[str, Any],
+    *,
+    firmware_version: str,
+    serial_number: str,
+    settings: DeviceSettingsSnapshot | None = None,
+) -> dict[str, str]:
+    """Return user-facing rich text without leaking raw protocol values."""
+
+    def section(name: str) -> dict[str, Any]:
+        value = status.get(name)
+        return value if isinstance(value, dict) else {}
+
+    battery = section("battery")
+    rtc = section("rtc")
+    clock = section("clock")
+    wifi = section("wifi")
+    storage = section("storage")
+    power = section("power")
+    led = section("led")
+
+    values: dict[str, str] = {
+        "identity": (
+            f"固件版本　{escape(firmware_version or '1.x（旧版）')}<br>"
+            f"序列号　{escape(serial_number or '—')}"
+        )
+    }
+
+    if battery and battery.get("available", True) is not False:
+        percent = _number(battery.get("soc_percent", battery.get("soc")), 1)
+        voltage = _number(battery.get("voltage_v", battery.get("voltage")), 2)
+        values["battery"] = (
+            f"电量　{percent + '%' if percent is not None else '—'}<br>"
+            f"电压　{voltage + ' V' if voltage is not None else '—'}"
+        )
+    else:
+        values["battery"] = "当前不可用"
+
+    if rtc and rtc.get("available", True) is not False:
+        values["rtc"] = _status_icon(bool(rtc.get("valid")), "有效", "无效")
+    else:
+        values["rtc"] = "当前不可用"
+
+    rtc_time = rtc.get("iso8601") or rtc.get("iso") or "未校时"
+    timezone = str(clock.get("timezone") or (settings.timezone if settings else "—"))
+    timezone_label = {
+        "CST-8": "UTC+8（中国标准时间）",
+        "UTC0": "UTC",
+        "JST-9": "UTC+9（日本标准时间）",
+        "EST5": "UTC-5",
+        "PST8": "UTC-8",
+    }.get(timezone, timezone)
+    last_source = str(clock.get("last_sync_source") or "none").lower()
+    last_sync_ok = bool(clock.get("last_sync_unix")) and last_source not in {
+        "none",
+        "untrusted",
+        "unknown",
+    }
+    values["clock"] = (
+        f"RTC 时间　{escape(str(rtc_time))}<br>"
+        f"时区　{escape(timezone_label)}<br>"
+        f"上次对时　{_status_icon(last_sync_ok, '成功', '未成功')}"
+    )
+
+    configured = bool(wifi.get("configured"))
+    wifi_lines = [f"配置状态　{_status_icon(configured, '已配置', '未配置')}"]
+    if configured:
+        wifi_lines.append(f"Wi-Fi 名称　{escape(str(wifi.get('ssid') or '—'))}")
+    values["wifi"] = "<br>".join(wifi_lines) if wifi else "当前固件未提供"
+
+    if storage:
+        ready = bool(storage.get("ready"))
+        values["storage"] = (
+            f"就绪状态　{_status_icon(ready, '已就绪', '未就绪')}<br>"
+            f"总空间　{format_storage_size(storage.get('total_bytes'))}<br>"
+            f"剩余空间　{format_storage_size(storage.get('free_bytes'))}"
+        )
+    else:
+        values["storage"] = "当前固件未提供"
+
+    wake_enabled = bool(
+        settings.auto_record_enabled if settings is not None else power.get("timer_wake_enabled")
+    )
+    wake_interval = (
+        settings.wake_interval_sec
+        if settings is not None
+        else power.get("next_wake_sec")
+    )
+    values["power"] = (
+        f"自动唤醒　{_status_icon(wake_enabled, '已开启', '已关闭')}<br>"
+        f"唤醒间隔　{format_interval(wake_interval)}"
+        if power or settings is not None
+        else "当前固件未提供"
+    )
+
+    brightness = (
+        settings.led_brightness_percent
+        if settings is not None
+        else led.get("brightness_percent")
+    )
+    color = (
+        settings.recording_color
+        if settings is not None
+        else str(led.get("recording_color") or DEFAULT_RECORDING_COLOR)
+    )
+    try:
+        color = normalize_color(str(color))
+    except ValueError:
+        color = DEFAULT_RECORDING_COLOR
+    values["led"] = (
+        f"全局亮度　{escape(str(brightness))}%<br>"
+        f'录制灯颜色　<span style="color:{color};font-size:20px">●</span>'
+        if led or settings is not None
+        else "当前固件未提供"
+    )
+    return values

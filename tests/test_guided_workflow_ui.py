@@ -33,6 +33,7 @@ def _window() -> tuple[MainWindow, tempfile.TemporaryDirectory[str]]:
 def _close(window: MainWindow, temporary: tempfile.TemporaryDirectory[str]) -> None:
     window.discovery_timer.stop()
     window.sync_countdown_timer.stop()
+    window.header_device_timer.stop()
     window.timer.stop()
     window.window.close()
     environment, credentials = window._test_patches  # type: ignore[attr-defined]
@@ -94,19 +95,22 @@ def test_landing_intro_uses_ordered_title_subtitle_button_footer_timeline() -> N
     window, temporary = _window()
     try:
         window._play_landing_intro()
-        sequence = window._landing_animation_groups[-1]
+        timeline = window._landing_animation_groups[-1]
 
-        assert sequence.animationCount() == 3
-        assert sequence.animationAt(0).duration() == 1250
+        assert timeline.animationCount() == 4
+        assert timeline.animationAt(0).duration() == 1100
 
-        subtitle_and_button = sequence.animationAt(1)
-        assert subtitle_and_button.animationCount() == 2
-        assert subtitle_and_button.animationAt(0).duration() == 800
-        button = subtitle_and_button.animationAt(1)
-        assert button.duration() == 800
-
-        assert sequence.animationAt(2).duration() == 800
-        assert sequence.duration() == 2850
+        subtitle = timeline.animationAt(1)
+        button = timeline.animationAt(2)
+        footer = timeline.animationAt(3)
+        assert subtitle.animationAt(0).duration() == 520
+        assert button.animationAt(0).duration() == 520
+        assert subtitle.animationAt(1).duration() == 700
+        assert button.animationAt(1).duration() == 700
+        assert footer.animationAt(0).duration() == 880
+        assert footer.animationAt(1).duration() == 280
+        assert footer.duration() <= button.duration()
+        assert timeline.duration() == 1220
         all_copy = "\n".join(label.text() for label in window.window.findChildren(QLabel))
         assert "隐私与费用" not in all_copy
     finally:
@@ -153,6 +157,8 @@ def test_firmware_and_serial_are_shown_and_v2_features_are_gated() -> None:
         assert window.v2_dates_button.isEnabled()
         assert window.v2_exports_button.isEnabled()
         assert window.v2_end_session_button.isEnabled()
+        assert "已连接" in window.header_device_state_label.text()
+        assert window.header_restart_button.isEnabled()
         rw_index = window.access_combo.findData("rw")
         assert window.access_combo.model().item(rw_index).isEnabled()
         window.access_combo.setCurrentIndex(rw_index)
