@@ -226,12 +226,32 @@ class LegacyDeviceWorkflow:
             if not isinstance(raw_items, list):
                 return active
             for item in raw_items:
-                if isinstance(item, dict) and item.get("date"):
+                if (
+                    isinstance(item, dict)
+                    and item.get("date")
+                    and str(item.get("state", "prepared")) in {"prepared", "committing"}
+                ):
                     active[str(item["date"])] = item
             next_cursor = page.get("next_cursor")
             if next_cursor is None:
                 return active
             cursor = int(next_cursor)
+
+    def _begin_or_recover_v2_export(
+        self,
+        device: UsbLinkDevice,
+        target_date: date,
+        client_request_id: str,
+    ) -> dict[str, object]:
+        try:
+            return device.begin_export(target_date.isoformat(), client_request_id)
+        except ProtocolError as exc:
+            if "DATE_ALREADY_PREPARED" not in str(exc).upper():
+                raise
+            active = self._active_v2_exports(device).get(target_date.isoformat())
+            if not active or not active.get("export_id"):
+                raise
+            return device.get_export_status(str(active["export_id"]))
 
     def _prepare_v2_export(
         self,
@@ -245,15 +265,28 @@ class LegacyDeviceWorkflow:
             f"{int(summary.get('record_count', 0))}|{int(summary.get('total_bytes', 0))}"
         )
         request_id = "desktop-" + hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:40]
-        try:
-            response = device.begin_export(target_date.isoformat(), request_id)
-        except ProtocolError as exc:
-            if "DATE_ALREADY_PREPARED" not in str(exc).upper():
-                raise
-            active = self._active_v2_exports(device).get(target_date.isoformat())
-            if not active or not active.get("export_id"):
-                raise
-            response = device.get_export_status(str(active["export_id"]))
+        response = self._begin_or_recover_v2_export(
+            device,
+            target_date,
+            request_id,
+        )
+        state = str(response.get("state", "prepared"))
+        if state in {"aborted", "committed"}:
+            # Idempotency belongs to one request attempt, not to the date.
+            # A terminal transaction must never permanently lock that date.
+            retry_token = hashlib.sha256(
+                f"{request_id}|retry|{time.time_ns()}".encode("utf-8")
+            ).hexdigest()[:8]
+            retry_request_id = f"{request_id}-retry-{retry_token}"
+            self._emit(
+                f"日期 {target_date.isoformat()} 的旧导出事务已结束（{state}），"
+                "正在创建新的导出尝试"
+            )
+            response = self._begin_or_recover_v2_export(
+                device,
+                target_date,
+                retry_request_id,
+            )
         transaction = ExportTransaction(
             export_id=str(response["export_id"]),
             target_date=target_date,
