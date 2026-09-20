@@ -69,7 +69,7 @@ def main() -> int:
     parser.add_argument("--protocol-port", required=True)
     parser.add_argument("--log-port", required=True)
     parser.add_argument("--log-output", type=Path, required=True)
-    parser.add_argument("--expected-firmware", default="2.1.0")
+    parser.add_argument("--expected-firmware", default="2.1.1")
     args = parser.parse_args()
 
     sequence = 2001

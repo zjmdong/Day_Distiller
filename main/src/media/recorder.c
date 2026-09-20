@@ -534,11 +534,22 @@ esp_err_t day_recorder_record_once(const day_config_t *cfg, day_record_paths_t *
         return ESP_ERR_INVALID_STATE;
     }
     s_recording = true;
-    record_ctx_t ctx = {
-        .cfg = cfg,
-    };
-    ctx.events = xEventGroupCreate();
-    if (!ctx.events) {
+    /* record_ctx_t includes all transaction paths and schema-v2 metadata.
+     * Keeping it on app_main's 3584-byte stack leaves too little headroom for
+     * esp-camera and storage initialization and caused a panic at record
+     * startup. Large protocol buffers already follow the same heap rule.
+     */
+    record_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        s_last_error = ESP_ERR_NO_MEM;
+        s_recording = false;
+        return ESP_ERR_NO_MEM;
+    }
+    ctx->cfg = cfg;
+    ctx->events = xEventGroupCreate();
+    if (!ctx->events) {
+        free(ctx);
+        s_last_error = ESP_ERR_NO_MEM;
         s_recording = false;
         return ESP_ERR_NO_MEM;
     }
@@ -555,90 +566,95 @@ esp_err_t day_recorder_record_once(const day_config_t *cfg, day_record_paths_t *
         rtc.valid = false;
     }
     if (result == ESP_OK) {
-        result = day_storage_make_record_paths(&ctx.paths, record_time);
+        result = day_storage_make_record_paths(&ctx->paths, record_time);
     }
     if (result == ESP_OK) {
-        initialize_metadata(&ctx, &rtc);
-        ctx.metadata.video.error = day_camera_init_record(cfg);
-        ctx.metadata.audio.error = day_audio_stop();
-        if (ctx.metadata.audio.error == ESP_OK) {
-            ctx.metadata.audio.error = day_audio_init(cfg->audio_sample_rate_hz);
+        initialize_metadata(ctx, &rtc);
+        ctx->metadata.video.error = day_camera_init_record(cfg);
+        ctx->metadata.audio.error = day_audio_stop();
+        if (ctx->metadata.audio.error == ESP_OK) {
+            ctx->metadata.audio.error = day_audio_init(cfg->audio_sample_rate_hz);
         }
-        ctx.metadata.imu.error = day_imu_init(ctx.metadata.imu_sample_rate_hz);
+        ctx->metadata.imu.error = day_imu_init(ctx->metadata.imu_sample_rate_hz);
 
         bool task_started = false;
-        if (ctx.metadata.video.error == ESP_OK) {
-            task_started |= start_record_task(camera_task, "rec_camera", 6144, 5, &ctx,
+        if (ctx->metadata.video.error == ESP_OK) {
+            task_started |= start_record_task(camera_task, "rec_camera", 6144, 5, ctx,
                                               REC_BIT_CAMERA_READY, REC_BIT_CAMERA_DONE,
-                                              &ctx.metadata.video);
+                                              &ctx->metadata.video);
         } else {
-            ESP_LOGW(TAG, "camera unavailable: %s", esp_err_to_name(ctx.metadata.video.error));
-            xEventGroupSetBits(ctx.events, REC_BIT_CAMERA_READY | REC_BIT_CAMERA_DONE);
+            ESP_LOGW(TAG, "camera unavailable: %s", esp_err_to_name(ctx->metadata.video.error));
+            xEventGroupSetBits(ctx->events, REC_BIT_CAMERA_READY | REC_BIT_CAMERA_DONE);
         }
-        if (ctx.metadata.audio.error == ESP_OK) {
-            task_started |= start_record_task(audio_task, "rec_audio", 4096, 14, &ctx,
+        if (ctx->metadata.audio.error == ESP_OK) {
+            task_started |= start_record_task(audio_task, "rec_audio", 4096, 14, ctx,
                                               REC_BIT_AUDIO_READY, REC_BIT_AUDIO_DONE,
-                                              &ctx.metadata.audio);
+                                              &ctx->metadata.audio);
         } else {
-            ESP_LOGW(TAG, "audio unavailable: %s", esp_err_to_name(ctx.metadata.audio.error));
-            xEventGroupSetBits(ctx.events, REC_BIT_AUDIO_READY | REC_BIT_AUDIO_DONE);
+            ESP_LOGW(TAG, "audio unavailable: %s", esp_err_to_name(ctx->metadata.audio.error));
+            xEventGroupSetBits(ctx->events, REC_BIT_AUDIO_READY | REC_BIT_AUDIO_DONE);
         }
-        if (ctx.metadata.imu.error == ESP_OK) {
-            task_started |= start_record_task(imu_task, "rec_imu", 4096, 12, &ctx,
+        if (ctx->metadata.imu.error == ESP_OK) {
+            task_started |= start_record_task(imu_task, "rec_imu", 4096, 12, ctx,
                                               REC_BIT_IMU_READY, REC_BIT_IMU_DONE,
-                                              &ctx.metadata.imu);
+                                              &ctx->metadata.imu);
         } else {
-            ESP_LOGW(TAG, "IMU unavailable: %s", esp_err_to_name(ctx.metadata.imu.error));
-            xEventGroupSetBits(ctx.events, REC_BIT_IMU_READY | REC_BIT_IMU_DONE);
+            ESP_LOGW(TAG, "IMU unavailable: %s", esp_err_to_name(ctx->metadata.imu.error));
+            xEventGroupSetBits(ctx->events, REC_BIT_IMU_READY | REC_BIT_IMU_DONE);
         }
 
-        EventBits_t ready = xEventGroupWaitBits(ctx.events, REC_BITS_READY, false, true,
+        EventBits_t ready = xEventGroupWaitBits(ctx->events, REC_BITS_READY, false, true,
                                                 pdMS_TO_TICKS(REC_READY_TIMEOUT_MS));
         if ((ready & REC_BITS_READY) != REC_BITS_READY) {
-            mark_prepare_timeout(&ctx, ready);
+            mark_prepare_timeout(ctx, ready);
         }
-        ctx.metadata.capture_epoch_monotonic_us = esp_timer_get_time();
-        xEventGroupSetBits(ctx.events, REC_BIT_START);
-        EventBits_t before_capture = xEventGroupGetBits(ctx.events);
+        ctx->metadata.capture_epoch_monotonic_us = esp_timer_get_time();
+        xEventGroupSetBits(ctx->events, REC_BIT_START);
+        EventBits_t before_capture = xEventGroupGetBits(ctx->events);
         if (task_started && (before_capture & REC_BITS_DONE) != REC_BITS_DONE) {
             vTaskDelay(pdMS_TO_TICKS(DAY_RECORD_SECONDS * 1000));
         }
         int64_t stop_us = esp_timer_get_time();
-        xEventGroupSetBits(ctx.events, REC_BIT_STOP);
-        EventBits_t done = xEventGroupWaitBits(ctx.events, REC_BITS_DONE, false, true,
+        xEventGroupSetBits(ctx->events, REC_BIT_STOP);
+        EventBits_t done = xEventGroupWaitBits(ctx->events, REC_BITS_DONE, false, true,
                                                pdMS_TO_TICKS(REC_DONE_TIMEOUT_MS));
         if ((done & REC_BITS_DONE) != REC_BITS_DONE) {
             ESP_LOGE(TAG, "record stream completion timeout bits=0x%lx; preserving partial record",
                      (unsigned long)done);
-            mark_completion_timeout(&ctx, done);
-            (void)xEventGroupWaitBits(ctx.events, REC_BITS_DONE, false, true, portMAX_DELAY);
+            mark_completion_timeout(ctx, done);
+            (void)xEventGroupWaitBits(ctx->events, REC_BITS_DONE, false, true, portMAX_DELAY);
         }
-        int64_t duration_us = stop_us - ctx.metadata.capture_epoch_monotonic_us;
+        int64_t duration_us = stop_us - ctx->metadata.capture_epoch_monotonic_us;
         if (duration_us < 0) {
             duration_us = 0;
         }
-        ctx.metadata.actual_duration_ms = duration_us > (int64_t)UINT32_MAX * 1000 ?
+        ctx->metadata.actual_duration_ms = duration_us > (int64_t)UINT32_MAX * 1000 ?
                                           UINT32_MAX : (uint32_t)((duration_us + 500) / 1000);
 
-        result = synchronize_media_files(&ctx);
+        result = synchronize_media_files(ctx);
         if (result == ESP_OK) {
-            result = day_record_metadata_write_atomic(ctx.paths.meta_path, &ctx.metadata);
+            result = day_record_metadata_write_atomic(ctx->paths.meta_path, &ctx->metadata);
         }
         if (result == ESP_OK) {
-            result = day_storage_finalize_record(&ctx.paths);
+            result = day_storage_finalize_record(&ctx->paths);
         }
         if (result == ESP_OK) {
-            result = capture_result(&ctx);
+            result = capture_result(ctx);
         }
     }
 
     if (out_paths) {
-        *out_paths = ctx.paths;
+        *out_paths = ctx->paths;
     }
-    vEventGroupDelete(ctx.events);
+    /* A completed or failed recording must never leave XCLK/camera buffers
+     * active while USB maintenance keeps the rest of the device awake.
+     */
+    day_camera_deinit();
+    vEventGroupDelete(ctx->events);
     s_last_error = result;
     s_recording = false;
     ESP_LOGI(TAG, "record finished: %s path=%s", esp_err_to_name(result),
-             ctx.paths.dir_path[0] ? ctx.paths.dir_path : "none");
+             ctx->paths.dir_path[0] ? ctx->paths.dir_path : "none");
+    free(ctx);
     return result;
 }

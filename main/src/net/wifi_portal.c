@@ -288,12 +288,27 @@ esp_err_t day_wifi_run_portal_window(uint32_t window_ms)
     s_status.last_error = ESP_OK;
     ESP_LOGI(TAG, "portal AP running ssid=%s window_ms=%lu", s_status.ap_ssid, (unsigned long)window_ms);
 
-    int64_t deadline = esp_timer_get_time() + (int64_t)window_ms * 1000;
-    int64_t hard_deadline = esp_timer_get_time() + 300000000LL;
-    while (esp_timer_get_time() < deadline && esp_timer_get_time() < hard_deadline &&
-           !day_usb_link_maintenance_active()) {
-        if (s_status.ap_clients > 0) {
-            deadline = esp_timer_get_time() + 30000000LL;
+    int64_t now_us = esp_timer_get_time();
+    bool client_present = s_status.ap_clients > 0;
+    int64_t deadline_us = client_present ? 0 : now_us + (int64_t)window_ms * 1000;
+    while (!day_usb_link_maintenance_active()) {
+        now_us = esp_timer_get_time();
+        bool has_clients = s_status.ap_clients > 0;
+        if (has_clients) {
+            /* A connected portal user owns this phase: there is deliberately
+             * no hard deadline while at least one AP client remains. */
+            client_present = true;
+            deadline_us = 0;
+        } else {
+            if (client_present || deadline_us == 0) {
+                /* The last client has left. Start the same 10-second grace
+                 * window used for an AP that was never joined. */
+                deadline_us = now_us + (int64_t)window_ms * 1000;
+                client_present = false;
+            }
+            if (now_us >= deadline_us) {
+                break;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }

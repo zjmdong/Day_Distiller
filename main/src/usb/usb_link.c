@@ -1,6 +1,7 @@
 #include "usb_link.h"
 
 #include <inttypes.h>
+#include <stddef.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,8 @@
 
 #define DAY_USB_MAINTENANCE_TIMEOUT_US (300LL * 1000LL * 1000LL)
 #define DAY_USB_MSC_IDLE_TIMEOUT_US (900LL * 1000LL * 1000LL)
+#define DAY_USB_HOST_LATCH_MAGIC 0x4444484cUL
+#define DAY_USB_HOST_LATCH_SCHEMA 1U
 
 typedef enum {
     DAY_USB_MODE_SERIAL = 0,
@@ -75,6 +78,72 @@ static sdmmc_card_t *s_msc_card;
 static tinyusb_msc_storage_handle_t s_msc_storage;
 static bool s_msc_bus_initialized;
 static day_usb_config_apply_callback_t s_config_apply_callback;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t schema;
+    uint8_t host_seen;
+    uint8_t reserved;
+    uint32_t crc32;
+} day_usb_host_latch_t;
+
+static RTC_NOINIT_ATTR day_usb_host_latch_t s_host_latch;
+static bool s_host_latch_initialized;
+
+static uint32_t host_latch_crc(const day_usb_host_latch_t *latch)
+{
+    return day_usb_crc32(0, (const uint8_t *)latch,
+                         offsetof(day_usb_host_latch_t, crc32));
+}
+
+static bool host_latch_valid(void)
+{
+    return s_host_latch.magic == DAY_USB_HOST_LATCH_MAGIC &&
+           s_host_latch.schema == DAY_USB_HOST_LATCH_SCHEMA &&
+           s_host_latch.host_seen <= 1 &&
+           s_host_latch.crc32 == host_latch_crc(&s_host_latch);
+}
+
+static void store_host_latch(bool host_seen)
+{
+    day_usb_host_latch_t next = {
+        .magic = DAY_USB_HOST_LATCH_MAGIC,
+        .schema = DAY_USB_HOST_LATCH_SCHEMA,
+        .host_seen = host_seen ? 1 : 0,
+    };
+    next.crc32 = host_latch_crc(&next);
+    s_host_latch = next;
+}
+
+void day_usb_link_boot_init(void)
+{
+    if (s_host_latch_initialized) {
+        return;
+    }
+    if (esp_reset_reason() == ESP_RST_POWERON || !host_latch_valid()) {
+        store_host_latch(false);
+    }
+    s_host_latch_initialized = true;
+}
+
+bool day_usb_link_host_connection_latched(void)
+{
+#if CONFIG_DAY_USB_LINK_ENABLED
+    day_usb_link_boot_init();
+    return host_latch_valid() && s_host_latch.host_seen == 1;
+#else
+    return false;
+#endif
+}
+
+static void latch_host_connection(void)
+{
+    day_usb_link_boot_init();
+    if (!day_usb_link_host_connection_latched()) {
+        store_host_latch(true);
+        ESP_LOGI(TAG, "USB host connection latched until the next power-on reset");
+    }
+}
 
 enum {
     ITF_NUM_CDC0 = 0,
@@ -573,9 +642,9 @@ static char *make_status_payload(bool detailed)
         !json_add_string(root, "mode", day_usb_link_mode_name()) ||
         !json_add_string(root, "runtime_state",
                          s_mode == DAY_USB_MODE_MSC ? "msc_read_only" :
-                         (s_maintenance_active ? "serial_maintenance" : "normal_boot")) ||
+                         (day_usb_link_maintenance_active() ? "serial_maintenance" : "normal_boot")) ||
         !json_add_string(root, "session_id", session_id) ||
-        !json_add_bool(root, "maintenance", s_maintenance_active) ||
+        !json_add_bool(root, "maintenance", day_usb_link_maintenance_active()) ||
         !json_add_bool(root, "recording", recording) ||
         !json_add_bool(root, "usb_full_speed", true)) {
         cJSON_Delete(schemas);
@@ -1221,8 +1290,16 @@ static void usb_device_event(tinyusb_event_t *event, void *arg)
 {
     (void)arg;
     if (!event) return;
-    if (event->id == TINYUSB_EVENT_ATTACHED) (void)day_led_set_usb_enumerated(true);
-    else if (event->id == TINYUSB_EVENT_DETACHED) (void)day_led_set_usb_enumerated(false);
+    if (event->id == TINYUSB_EVENT_ATTACHED) {
+        latch_host_connection();
+        (void)day_led_set_usb_enumerated(true);
+    } else if (event->id == TINYUSB_EVENT_DETACHED) {
+        (void)day_led_set_usb_handshake(false);
+        /* Once a computer has been seen, detaching the cable must not resume
+         * Wi-Fi, recording or sleep. Keep the slow green wait indication
+         * latched until a genuine power-on reset clears the RTC latch. */
+        (void)day_led_set_usb_enumerated(day_usb_link_host_connection_latched());
+    }
 }
 
 static esp_err_t init_cdc_port(tinyusb_cdcacm_itf_t port, bool rx_callback)
@@ -1307,9 +1384,51 @@ esp_err_t day_usb_link_start_serial_mode(void)
 #endif
 }
 
+esp_err_t day_usb_link_stop(void)
+{
+#if CONFIG_DAY_USB_LINK_ENABLED
+    if (!s_tinyusb_started) {
+        return ESP_OK;
+    }
+
+    /* The TinyUSB task and CDC class instances must not survive the deep-sleep
+     * boundary.  Leaving them active can race the USB PHY shutdown and turn an
+     * otherwise normal sleep into an ESP_RST_PANIC reboot loop.
+     */
+    s_maintenance_active = false;
+    s_last_protocol_us = 0;
+    if (s_protocol_task) {
+        vTaskDelete(s_protocol_task);
+        s_protocol_task = NULL;
+    }
+    esp_log_set_vprintf(vprintf);
+    if (s_mode == DAY_USB_MODE_SERIAL && tinyusb_cdcacm_initialized(TINYUSB_CDC_ACM_1)) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(tinyusb_cdcacm_deinit(TINYUSB_CDC_ACM_1));
+    }
+    if (tinyusb_cdcacm_initialized(TINYUSB_CDC_ACM_0)) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(tinyusb_cdcacm_deinit(TINYUSB_CDC_ACM_0));
+    }
+    esp_err_t ret = tinyusb_driver_uninstall();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    s_tinyusb_started = false;
+    if (s_rx_queue) {
+        vQueueDelete(s_rx_queue);
+        s_rx_queue = NULL;
+    }
+    return ESP_OK;
+#else
+    return ESP_OK;
+#endif
+}
+
 bool day_usb_link_maintenance_active(void)
 {
 #if CONFIG_DAY_USB_LINK_ENABLED
+    if (day_usb_link_host_connection_latched()) {
+        return true;
+    }
     if (!s_maintenance_active) {
         return false;
     }

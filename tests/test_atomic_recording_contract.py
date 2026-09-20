@@ -86,18 +86,27 @@ class AtomicRecordingContractTests(unittest.TestCase):
 
     def test_ready_barrier_and_atomic_completion_order_are_explicit(self):
         source = (ROOT / "main/src/media/recorder.c").read_text(encoding="utf-8")
-        ready = source.index("xEventGroupWaitBits(ctx.events, REC_BITS_READY")
-        epoch = source.index("ctx.metadata.capture_epoch_monotonic_us = esp_timer_get_time()")
-        start = source.index("xEventGroupSetBits(ctx.events, REC_BIT_START)")
-        sync = source.index("result = synchronize_media_files(&ctx)")
-        metadata = source.index("day_record_metadata_write_atomic(ctx.paths.meta_path")
-        finalize = source.index("day_storage_finalize_record(&ctx.paths)")
+        ready = source.index("xEventGroupWaitBits(ctx->events, REC_BITS_READY")
+        epoch = source.index("ctx->metadata.capture_epoch_monotonic_us = esp_timer_get_time()")
+        start = source.index("xEventGroupSetBits(ctx->events, REC_BIT_START)")
+        sync = source.index("result = synchronize_media_files(ctx)")
+        metadata = source.index("day_record_metadata_write_atomic(ctx->paths.meta_path")
+        finalize = source.index("day_storage_finalize_record(&ctx->paths)")
         self.assertLess(ready, epoch)
         self.assertLess(epoch, start)
         self.assertLess(sync, metadata)
         self.assertLess(metadata, finalize)
         self.assertLess(source.index("day_storage_require_free_bytes"),
                         source.index("day_storage_make_record_paths"))
+
+    def test_transaction_context_and_unused_callback_paths_do_not_consume_main_stack(self):
+        recorder = (ROOT / "main/src/media/recorder.c").read_text(encoding="utf-8")
+        app = (ROOT / "main/src/app_core.c").read_text(encoding="utf-8")
+        self.assertIn("record_ctx_t *ctx = calloc(1, sizeof(*ctx))", recorder)
+        self.assertIn("free(ctx);", recorder)
+        self.assertNotIn("record_ctx_t ctx =", recorder)
+        self.assertIn("day_recorder_record_once(&s_config, NULL)", app)
+        self.assertNotIn("day_record_paths_t paths;", app)
 
     def test_streams_are_written_incrementally_on_one_capture_epoch(self):
         recorder = (ROOT / "main/src/media/recorder.c").read_text(encoding="utf-8")

@@ -53,6 +53,22 @@ static void log_sensor_i2c_devices(void)
 
 esp_err_t day_board_init(void)
 {
+    /* The module has no routed PWDN/power-enable signal. Keep the documented
+     * sensor RESET asserted until an explicit record or preview request lets
+     * esp-camera take ownership of the pin.
+     */
+    gpio_deep_sleep_hold_dis();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_hold_dis(DAY_PIN_CAM_RST));
+    gpio_config_t camera_reset_cfg = {
+        .pin_bit_mask = 1ULL << DAY_PIN_CAM_RST,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&camera_reset_cfg), TAG, "camera reset config failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level(DAY_PIN_CAM_RST, 0), TAG, "camera reset assert failed");
+
     ESP_RETURN_ON_ERROR(init_i2c_bus(DAY_I2C_SENSOR_PORT, DAY_PIN_I2C0_SDA, DAY_PIN_I2C0_SCL, &s_sensor_bus),
                         TAG, "sensor I2C init failed");
     log_sensor_i2c_devices();

@@ -14,7 +14,7 @@ SETTINGS_C = ROOT / "main" / "src" / "config" / "device_settings.c"
 class UsbConfigStatusV21ContractTests(unittest.TestCase):
     def test_version_and_command_ids_are_additive(self):
         header = PROTOCOL_H.read_text(encoding="utf-8")
-        self.assertIn('#define DAY_USB_FIRMWARE_VERSION "2.1.0"', header)
+        self.assertIn('#define DAY_USB_FIRMWARE_VERSION "2.1.1"', header)
         expected = {
             "HELLO": 1,
             "PING": 2,

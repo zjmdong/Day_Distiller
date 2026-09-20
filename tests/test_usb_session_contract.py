@@ -81,11 +81,24 @@ class UsbSessionContractTests(unittest.TestCase):
         self.assertNotIn("unlink(", body)
         self.assertNotIn("record_once", body)
 
-    def test_maintenance_boot_bypasses_portal_and_recording(self):
-        source = (ROOT / "main/src/app_core.c").read_text(encoding="utf-8")
-        self.assertIn("cold_boot && !maintenance_start", source)
-        self.assertIn("if (!day_usb_link_maintenance_active())", source)
-        self.assertIn("while (day_usb_link_maintenance_active())", source)
+    def test_physical_host_connection_latches_until_power_cycle(self):
+        app = (ROOT / "main/src/app_core.c").read_text(encoding="utf-8")
+        link = (ROOT / "main/src/usb/usb_link.c").read_text(encoding="utf-8")
+        for token in (
+            "RTC_NOINIT_ATTR",
+            "DAY_USB_HOST_LATCH_MAGIC",
+            "DAY_USB_HOST_LATCH_SCHEMA",
+            "host_latch_crc",
+            "ESP_RST_POWERON",
+            "TINYUSB_EVENT_ATTACHED",
+            "TINYUSB_EVENT_DETACHED",
+        ):
+            self.assertIn(token, link)
+        self.assertIn("day_usb_link_host_connection_latched()", link)
+        self.assertIn("enter_usb_wait_until_power_cycle", app)
+        wait_body = app[app.index("static void enter_usb_wait_until_power_cycle") : app.index("void day_app_run")]
+        self.assertIn("while (true)", wait_body)
+        self.assertNotIn("record_once", wait_body)
 
 
 if __name__ == "__main__":

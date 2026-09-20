@@ -9,6 +9,7 @@ esp_err_t day_camera_init(const day_config_t *cfg);
 esp_err_t day_camera_init_preview(const day_config_t *cfg);
 esp_err_t day_camera_init_record(const day_config_t *cfg);
 void day_camera_deinit(void);
+esp_err_t day_camera_prepare_for_sleep(void);
 esp_err_t day_camera_capture(camera_fb_t **out_fb);
 void day_camera_return(camera_fb_t *fb);
 void day_camera_note_frame_done(int64_t frame_start_us, uint32_t target_fps);

@@ -13,6 +13,8 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_vfs_fat.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "nvs.h"
 #include "sdmmc_cmd.h"
 
@@ -31,6 +33,22 @@ static bool s_partial_records_scanned;
 static day_storage_status_t s_status = {
     .last_error = ESP_ERR_INVALID_STATE,
 };
+
+#define DAY_STORAGE_MOUNT_ATTEMPTS 3
+#define DAY_STORAGE_RETRY_DELAY_MS 150
+
+static void release_storage_bus(void)
+{
+    s_card = NULL;
+    if (s_bus_initialized) {
+        esp_err_t ret = spi_bus_free(s_host.slot);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "SPI bus rollback failed: %s", esp_err_to_name(ret));
+        } else {
+            s_bus_initialized = false;
+        }
+    }
+}
 
 esp_err_t day_storage_init(void)
 {
@@ -51,14 +69,6 @@ esp_err_t day_storage_init(void)
         .max_transfer_sz = 32 * 1024,
     };
 
-    esp_err_t ret = spi_bus_initialize(s_host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
-    if (ret == ESP_OK) {
-        s_bus_initialized = true;
-    } else if (ret != ESP_ERR_INVALID_STATE) {
-        s_status.last_error = ret;
-        return ret;
-    }
-
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot_config.gpio_cs = DAY_PIN_TF_CS;
     slot_config.host_id = s_host.slot;
@@ -69,7 +79,27 @@ esp_err_t day_storage_init(void)
         .allocation_unit_size = 16 * 1024,
     };
 
-    ret = esp_vfs_fat_sdspi_mount(DAY_SD_MOUNT_POINT, &s_host, &slot_config, &mount_config, &s_card);
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 1; attempt <= DAY_STORAGE_MOUNT_ATTEMPTS; ++attempt) {
+        ret = spi_bus_initialize(s_host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "TF SPI init attempt %d/%d failed: %s", attempt,
+                     DAY_STORAGE_MOUNT_ATTEMPTS, esp_err_to_name(ret));
+        } else {
+            s_bus_initialized = true;
+            ret = esp_vfs_fat_sdspi_mount(DAY_SD_MOUNT_POINT, &s_host, &slot_config,
+                                           &mount_config, &s_card);
+            if (ret == ESP_OK) {
+                break;
+            }
+            ESP_LOGW(TAG, "TF mount attempt %d/%d failed: %s", attempt,
+                     DAY_STORAGE_MOUNT_ATTEMPTS, esp_err_to_name(ret));
+        }
+        release_storage_bus();
+        if (attempt < DAY_STORAGE_MOUNT_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(DAY_STORAGE_RETRY_DELAY_MS));
+        }
+    }
     s_status.mounted = ret == ESP_OK;
     s_status.available = ret == ESP_OK;
     s_status.last_error = ret;
@@ -93,6 +123,7 @@ esp_err_t day_storage_init(void)
             s_partial_records_scanned = true;
         }
     } else {
+        release_storage_bus();
         ESP_LOGW(TAG, "TF card mount failed: %s", esp_err_to_name(ret));
     }
     return ret;
@@ -363,8 +394,5 @@ void day_storage_deinit(void)
         s_card = NULL;
         s_partial_records_scanned = false;
     }
-    if (s_bus_initialized) {
-        spi_bus_free(s_host.slot);
-        s_bus_initialized = false;
-    }
+    release_storage_bus();
 }
