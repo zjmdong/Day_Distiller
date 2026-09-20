@@ -4,30 +4,33 @@
 
 # Day Distiller Desktop
 
-### Turn daily fragments into a journal.
+### A place for the moments that made the day.
 
-My desktop companion for the Day Distiller wearable.
+The desktop companion for the Day Distiller wearable.
 
-**English** · [简体中文](README.zh-CN.md)
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-[Main project](https://github.com/zjmdong/Day_Distiller/tree/firmware-production) · [Quick start](#quick-start) · [Hardware](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/docs/HARDWARE.md)
+[Main project](https://github.com/zjmdong/Day_Distiller/tree/firmware-production) · [Features](#features) · [Quick start](#quick-start) · [Hardware](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/docs/HARDWARE.md)
 
 </div>
 
 ---
 
-## About
+## Overview
 
-I built this app to bring the recordings from my wearable into one place and turn them into memories I can revisit. I developed the desktop interface, device connection, media tools and AI-assisted journal workflow alongside the hardware and firmware.
+The wearable gathers short glimpses of everyday life. This app gives those fragments a home: connect the device, revisit a day, choose a visual style and turn the selected moments into a journal and illustrated poster.
+
+The goal is a calmer way to remember a day—one that feels like returning to a story instead of sorting through a folder of recordings. The desktop app, wearable electronics, firmware and AI workflow form a project developed end to end by one person.
 
 ## Features
 
-- Import and organise recordings by day
-- Browse, edit and regenerate journals
-- Create an illustrated poster and PDF
-- Configure visual styles and AI services
-- Share a journal by email
-- Explore the workflow in offline demo mode
+| Area | Experience |
+| :--- | :--- |
+| **Start** | Guided connection, import and daily generation. |
+| **Memories** | Journals organised by date, with editing and regeneration. |
+| **Appearance & style** | Personal reference images, visual styles and poster previews. |
+| **Sharing** | Illustrated poster, PDF and email. |
+| **Settings** | Device options, AI services and an offline demo. |
 
 ## Technology
 
@@ -35,7 +38,7 @@ Python · PySide6 · SQLite · Pydantic · FFmpeg · NumPy · scikit-learn · py
 
 ## Quick start
 
-Install Python 3.11 and FFmpeg/FFprobe. Clone this branch separately from the firmware.
+Install Python 3.11 and FFmpeg/FFprobe, then clone the desktop branch.
 
 **Windows (PowerShell)**
 
@@ -58,18 +61,22 @@ python -m pip install -e '.[dev]'
 python -m day_distiller_client
 ```
 
-For an offline demo, open **Settings → Developer settings**, choose a copy of a compatible recording folder and select **Offline demo** on the generation page. Keep the virtual-card deletion option off. See the [firmware setup guide](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/docs/GETTING_STARTED.md) for the recording files.
+To explore without hardware or cloud services, open **Settings → Developer settings**, select a copy of a compatible recording folder and choose **Offline demo** on the generation page. Keep the virtual-card deletion option off. The [firmware setup guide](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/docs/GETTING_STARTED.md) describes the recording files.
 
-For AI and email, add your own service settings in the app. The interface is primarily in Chinese.
+For daily use, connect the device over USB, import a date and create a journal from the Start page. AI and email services can be added in Settings. The interface is primarily in Chinese.
 
-## Development
+## Development and guides
 
 ```sh
 python -m pytest -q
 ```
 
-Build on the target platform with scripts/build.ps1 (Windows) or scripts/build_macos.sh (Apple Silicon macOS). More help is in the [user guide](docs/user-guide.md), [build guide](docs/nuitka-build.md) and [troubleshooting guide](docs/usb-ffmpeg-troubleshooting.md).
+Build on the target platform with scripts/build.ps1 (Windows) or scripts/build_macos.sh (Apple Silicon macOS).
+
+- [User guide](docs/user-guide.md)
+- [AI and email setup](docs/mainland-model-setup.md) · [SMTP](docs/smtp-setup.md)
+- [Build guide](docs/nuitka-build.md) · [Troubleshooting](docs/usb-ffmpeg-troubleshooting.md)
 
 ## License
 
-I share this branch under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).
+This branch is shared under [Creative Commons Attribution-NonCommercial 4.0 International](LICENSE.md) (CC BY-NC 4.0).

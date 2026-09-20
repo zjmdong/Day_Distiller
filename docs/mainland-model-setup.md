@@ -1,6 +1,6 @@
 # AI 服务配置
 
-我在桌面应用的“设置”页提供 Qwen、DeepSeek 和 Seedream 的服务配置。
+桌面应用的“设置”页提供 Qwen、DeepSeek 和 Seedream 的服务配置。
 
 1. 在所选服务商的平台上开通需要的模型。
 2. 在应用中填写服务地址、模型标识和自己的 API Key。
