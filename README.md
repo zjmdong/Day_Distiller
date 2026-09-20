@@ -6,11 +6,13 @@
 
 ### A place for the moments that made the day.
 
-The desktop companion for the Day Distiller wearable.
+From captured fragments to a day worth revisiting.
+
+**Device connection · Verified import · Daily Journal · Illustrated memories**
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-[Main project](https://github.com/zjmdong/Day_Distiller/tree/firmware-production) · [Features](#features) · [Quick start](#quick-start) · [Hardware](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/docs/HARDWARE.md)
+[Main project](https://github.com/zjmdong/Day_Distiller/tree/firmware-production) · [The experience](#the-experience) · [Features](#features) · [Quick start](#quick-start) · [Hardware](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/docs/HARDWARE.md)
 
 </div>
 
@@ -18,21 +20,32 @@ The desktop companion for the Day Distiller wearable.
 
 ## Overview
 
-The wearable gathers short glimpses of everyday life. This app gives those fragments a home: connect the device, revisit a day, choose a visual style and turn the selected moments into a journal and illustrated poster.
+The moments that make a day memorable are often too small to notice while they happen. The Day Distiller wearable collects short glimpses of everyday life; this desktop companion gives those fragments a home.
 
-The goal is a calmer way to remember a day—one that feels like returning to a story instead of sorting through a folder of recordings. The desktop app, wearable electronics, firmware and AI workflow form a project developed end to end by one person.
+Connect the device, choose a day and bring its recordings into a local library. From there, the application helps turn visual, audio and motion context into a readable journal and an illustrated poster. The goal is a calmer way to remember—more like returning to a story than sorting through a folder of clips.
+
+The desktop app, custom wearable electronics, firmware and AI workflow were developed end to end by one person. See the [main project](https://github.com/zjmdong/Day_Distiller/tree/firmware-production) for the complete system.
+
+## The experience
+
+**Connect → Verify → Explore → Distil → Revisit**
+
+- **A guided connection.** Find the wearable, select a date and follow an import with visible progress.
+- **A trusted local library.** Imported files are checked before they become part of the day's collection; interrupted work can be retried.
+- **A journal with context.** AI-assisted selection brings together evidence from the recordings into a day-level reflection.
+- **A personal result.** Visual styles and reference images shape the poster; past journals stay available to browse and edit.
 
 ## Features
 
 | Area | Experience |
 | :--- | :--- |
-| **Start** | Guided connection, import and daily generation. |
+| **Start** | Guided connection, day-based import and daily generation. |
 | **Memories** | Journals organised by date, with editing and regeneration. |
 | **Appearance & style** | Personal reference images, visual styles and poster previews. |
-| **Sharing** | Illustrated poster, PDF and email. |
+| **Sharing** | Illustrated poster, PDF export and email. |
 | **Settings** | Device options, AI services and an offline demo. |
 
-## Technology
+## Technology stack
 
 Python · PySide6 · SQLite · Pydantic · FFmpeg · NumPy · scikit-learn · pytest · Nuitka
 
@@ -65,7 +78,16 @@ To explore without hardware or cloud services, open **Settings → Developer set
 
 For daily use, connect the device over USB, import a date and create a journal from the Start page. AI and email services can be added in Settings. The interface is primarily in Chinese.
 
-## Development and guides
+## For developers
+
+| Area | Starting point |
+| :--- | :--- |
+| Desktop application | [Application source](src/day_distiller_client) |
+| Hardware and firmware | [Main project](https://github.com/zjmdong/Day_Distiller/tree/firmware-production) · [hardware interface](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/docs/HARDWARE.md) |
+| Host/device connection | [USB integration](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/docs/USB_INTEGRATION.md) |
+| Application workflows | [User guide](docs/user-guide.md) · [AI and email setup](docs/mainland-model-setup.md) |
+
+## Build and guides
 
 ```sh
 python -m pytest -q
