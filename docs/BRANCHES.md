@@ -1,6 +1,6 @@
 # Branches / 分支说明
 
-I keep the current firmware and desktop app on separate branches. The older branches remain available as development history.
+The current firmware and desktop app live on separate branches. The older branches remain available as development history.
 
 | Branch | Purpose |
 | :--- | :--- |
@@ -14,4 +14,4 @@ For a new build, start with [firmware-production](https://github.com/zjmdong/Day
 
 ## 中文
 
-我将当前固件与桌面应用放在两个独立分支中，早期分支保留作开发记录。新项目建议从 [firmware-production](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/README.zh-CN.md) 和 [desktop-app](https://github.com/zjmdong/Day_Distiller/blob/desktop-app/README.zh-CN.md) 开始；firmware-dev 用于固件开发，两个 old/* 分支是早期 USB 固件与 Windows 客户端。
+当前固件与桌面应用分别位于两个分支，早期分支保留作开发记录。新项目建议从 [firmware-production](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/README.zh-CN.md) 和 [desktop-app](https://github.com/zjmdong/Day_Distiller/blob/desktop-app/README.zh-CN.md) 开始；firmware-dev 用于固件开发，两个 old/* 分支是早期 USB 固件与 Windows 客户端。

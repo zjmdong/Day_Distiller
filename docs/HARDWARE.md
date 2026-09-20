@@ -2,7 +2,7 @@
 
 [English](HARDWARE.md) · [简体中文](HARDWARE.zh-CN.md) · [Project](../README.md)
 
-I designed and assembled this wearable board and its enclosure for Day Distiller. This page lists the main parts and firmware pin assignments for anyone building compatible hardware.
+The custom HW 2.0 board and enclosure form the wearable side of Day Distiller. This page lists the main parts and firmware pin assignments for anyone building compatible hardware.
 
 ## Main components
 
@@ -56,7 +56,7 @@ These are ESP32-S3 GPIO numbers. The corresponding definitions are in [day_pins.
 | Camera D6 | 39 | `DAY_PIN_CAM_D6` |
 | Camera D7 | 45 | `DAY_PIN_CAM_D7` |
 
-No separate capture-button GPIO is defined in the firmware. My original schematics, PCB files, BOM and enclosure CAD are private; this page provides the information needed to design a compatible board.
+No separate capture-button GPIO is defined in the firmware. Original schematics, PCB files, BOM and enclosure CAD are private; this page provides the information needed to design a compatible board.
 
 ## Porting
 

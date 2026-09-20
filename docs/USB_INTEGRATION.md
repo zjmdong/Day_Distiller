@@ -2,7 +2,7 @@
 
 [Project](../README.md) · [Getting started](GETTING_STARTED.md) · [Desktop app](https://github.com/zjmdong/Day_Distiller/tree/desktop-app)
 
-I use USB to connect the wearable and desktop app. The link supports device discovery, status and settings, recording transfer, and safe storage hand-off.
+USB connects the wearable and desktop app. The link supports device discovery, status and settings, recording transfer, and safe storage hand-off.
 
 ## Connecting
 

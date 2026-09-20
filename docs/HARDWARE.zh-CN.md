@@ -2,7 +2,7 @@
 
 [English](HARDWARE.md) · [简体中文](HARDWARE.zh-CN.md) · [项目首页](../README.zh-CN.md)
 
-我为 Day Distiller 设计并组装了可穿戴电路板与外壳。这里列出主要器件和固件引脚定义，方便搭建兼容硬件。
+HW 2.0 电路板与外壳构成了 Day Distiller 的可穿戴设备。这里列出主要器件和固件引脚定义，方便搭建兼容硬件。
 
 ## 主要器件
 
