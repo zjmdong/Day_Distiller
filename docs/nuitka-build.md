@@ -1,6 +1,6 @@
 # 桌面应用构建
 
-我使用 Nuitka 为 Windows x64 和 Apple Silicon macOS 打包。先安装 Python 3.11、FFmpeg 和 FFprobe，再在目标平台运行对应脚本。
+项目使用 Nuitka 为 Windows x64 和 Apple Silicon macOS 打包。先安装 Python 3.11、FFmpeg 和 FFprobe，再在目标平台运行对应脚本。
 
 ## Windows
 
