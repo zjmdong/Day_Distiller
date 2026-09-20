@@ -4,34 +4,43 @@
 
 ### Keep the moments. Distil the day.
 
-A wearable device and desktop app for turning everyday moments into a visual journal.
+A wearable device and desktop companion for turning everyday fragments into a visual journal.
 
-**English** · [简体中文](README.zh-CN.md)
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-[Get started](docs/GETTING_STARTED.md) · [Hardware](docs/HARDWARE.md) · [Desktop app](https://github.com/zjmdong/Day_Distiller/tree/desktop-app)
+[The idea](#the-idea) · [Features](#features) · [Vision](#vision) · [Get started](#get-started) · [Hardware](docs/HARDWARE.md) · [Desktop app](https://github.com/zjmdong/Day_Distiller/tree/desktop-app)
 
 </div>
 
 ---
 
-## About
+## The idea
 
-I built Day Distiller as a personal project to make it easier to revisit the small moments of a day. I designed the wearable hardware, wrote its firmware and desktop app, and brought the whole experience together myself.
+Some days are full of moments worth keeping, yet surprisingly hard to recall by evening. A phone camera asks for attention in the moment; a diary asks for memory afterwards. Continuous recording creates more material than most people want to revisit.
 
-The device captures short video, audio and motion clips. The companion app imports them and helps create a daily journal and illustrated poster.
+Day Distiller explores a quieter middle ground. A small wearable captures brief glimpses of video, sound and movement. Later, the desktop app brings those fragments together, helps select meaningful moments and creates a daily journal with an illustrated poster.
 
 ## Features
 
-- Short recordings with scheduled and manual capture
-- Camera preview, device settings and status
-- USB transfer and an organised recording library
-- AI-assisted moment selection and daily journal creation
-- Illustrated poster, PDF export and email sharing
-- Offline demo mode for exploring the desktop app
+| | What you can do |
+| :--- | :--- |
+| **Capture** | Keep short visual, audio and motion glimpses at intervals or on demand. |
+| **Explore the device** | Preview the camera, check device status and adjust settings. |
+| **Bring moments home** | Connect over USB and organise imported recordings by day. |
+| **Distil a day** | Use AI to help select moments and compose a daily journal. |
+| **Make it yours** | Choose a visual style and reference image for an illustrated daily poster. |
+| **Revisit and share** | Browse past journals, edit them, export a PDF or send one by email. |
+| **Try it offline** | Explore the desktop workflow with a local demo. |
 
-## Technology
+## Vision
 
-| Area | Tools and technologies |
+The ambition is a personal memory companion that makes ordinary days easier to revisit. Over time, a collection of small moments can become a quiet archive of daily life: a place to notice what mattered and return to stories worth keeping.
+
+## One project, from hardware to software
+
+The custom electronics, wearable enclosure, embedded firmware, desktop app and AI-assisted journal were designed and built end to end by a single developer. The firmware lives on this branch; the companion app is on [desktop-app](https://github.com/zjmdong/Day_Distiller/tree/desktop-app).
+
+| Area | Technologies |
 | :--- | :--- |
 | Hardware design | EasyEDA, CAD, SLA 3D printing |
 | Firmware | C, ESP-IDF, FreeRTOS, CMake |
@@ -41,7 +50,7 @@ The device captures short video, audio and motion clips. The companion app impor
 
 ## Get started
 
-The firmware on this branch targets my custom HW 2.0 board. Use an activated [ESP-IDF 6.0.1](https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32s3/get-started/index.html) environment:
+The firmware targets the custom HW 2.0 board. With [ESP-IDF 6.0.1](https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32s3/get-started/index.html) activated:
 
 ```sh
 git clone --branch firmware-production https://github.com/zjmdong/Day_Distiller.git
@@ -50,17 +59,17 @@ idf.py set-target esp32s3
 idf.py build
 ```
 
-For flashing and first use, follow the [setup guide](docs/GETTING_STARTED.md). The [hardware guide](docs/HARDWARE.md) lists the components and pin map for compatible builds.
-
-The desktop app lives on the separate [desktop-app](https://github.com/zjmdong/Day_Distiller/tree/desktop-app) branch. Its README covers installation, an offline demo and development.
+The [getting started guide](docs/GETTING_STARTED.md) covers flashing and first use. For the desktop experience, follow the [desktop-app README](https://github.com/zjmdong/Day_Distiller/blob/desktop-app/README.md).
 
 ## Documentation
 
-- [Getting started](docs/GETTING_STARTED.md) · [中文](docs/GETTING_STARTED.zh-CN.md)
-- [Hardware and GPIO](docs/HARDWARE.md) · [中文](docs/HARDWARE.zh-CN.md)
-- [USB integration](docs/USB_INTEGRATION.md)
-- [Branches](docs/BRANCHES.md)
+| Guide | Use it for |
+| :--- | :--- |
+| [Getting started](docs/GETTING_STARTED.md) · [中文](docs/GETTING_STARTED.zh-CN.md) | Build, flash and first recording |
+| [Hardware](docs/HARDWARE.md) · [中文](docs/HARDWARE.zh-CN.md) | Components and GPIO map for compatible builds |
+| [USB integration](docs/USB_INTEGRATION.md) | Connecting a host client |
+| [Branches](docs/BRANCHES.md) | Current and historical development branches |
 
 ## License
 
-I share this project under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). Noncommercial use, modification and distribution are permitted under its terms.
+This project is shared under [Creative Commons Attribution-NonCommercial 4.0 International](LICENSE.md) (CC BY-NC 4.0).
