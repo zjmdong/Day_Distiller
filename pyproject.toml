@@ -24,7 +24,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "imageio>=2.37",
-    "pyinstaller>=6.21,<7",
     "pytest>=8",
     "nuitka>=2.7,<3",
     "ordered-set>=4.1",

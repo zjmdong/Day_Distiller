@@ -1,63 +1,180 @@
-# Day Distiller Desktop App
+<div align="center">
 
-Day Distiller 的 Windows / Apple Silicon macOS 桌面端与“AI 每日蒸馏”工作流。应用通过 capabilities 自动兼容 1.x、2.0.x 和 2.1.x 固件；旧设备无需升级即可继续同步，新设备会按能力开放状态与设置。
+<img src="assets/day-distiller-icon.png" alt="Day Distiller" width="88" />
 
-## 已实现
+# Day Distiller Desktop
 
-- 四入口 PySide6 消费者界面：开始、回忆、形象与风格、设置；设备、记录和生成调试页收纳在开发者设置中。
-- 现有固件 `HELLO`、`GET_STATUS`、只读/读写 MSC、`PING` 和安全弹出。
-- 固件 2.1 `GET_CONFIG` / `SET_CONFIG` / `PREVIEW_LED`，以及电量、RTC、校时来源、Wi-Fi、电源、存储和 LED 状态；所有新功能均按 capability 启用。
-- 按日期导入 `REC_XXXX_YYMMDD_HHMMSS`，复制后进行大小与 SHA-256 双重校验。
-- SQLite 可恢复任务状态机；失败记录错误与恢复阶段。
-- FFprobe/FFmpeg 媒体验证、0.5/2.5/4.5 秒关键帧与场景变化补帧。
-- IMU 特征、启发式活动/携带形态分类，以及可加载的 scikit-learn 模型。
-- 中国大陆多模型工作流：Qwen 3.5 Omni Plus批量音视频/OCR、Qwen 3.7 Plus关键帧复核、DeepSeek V4 Pro把全天素材聚合为 Moments 并筛选2–3个高价值瞬间、Seedream 5.0 Pro生成单张无文字竖版海报。
-- 固定 `864x1152` 的1K级3:4海报（995,328像素），内置5种经过完整设计的艺术风格、自定义200字风格提示和历史日报单次试片。
-- 确定性 Mock AI 与本地 `.eml` outbox，可在没有 API Key、Resend 或设备时验收。
-- 极简同版HTML/PDF、CID内嵌海报、原图与PDF双附件、Resend SMTP、确定性Message-ID、发送回执和邮件成功后的精确设备清理。
-- 日报修改、地点记忆、重新生成和手动再次发送。
+### From a day's fragments to a memory worth revisiting.
 
-## 快速开始
+The desktop companion for the Day Distiller wearable — verified import, multimodal analysis and a Daily Journal.
+
+**Windows x64 · Apple Silicon macOS · Python / PySide6**
+
+**English** · [简体中文](README.zh-CN.md)
+
+[Project & firmware](https://github.com/zjmdong/Day_Distiller/tree/firmware-production) · [Quick start](#quick-start) · [Development](#development) · [Hardware](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/docs/HARDWARE.md)
+
+</div>
+
+---
+
+## Overview
+
+Day Distiller is an independently developed hardware-to-software project by **JerryZ**. A custom wearable captures short video, audio and motion records; this application turns those records into a manageable daily reflection instead of another folder of media.
+
+The desktop work spans device communication, storage verification, recoverable background jobs, native UI, media preprocessing, AI orchestration and report delivery. It is part of the same five-month project as the custom electronics, firmware and magnetic enclosure.
+
+> This is the current **`desktop-app`** branch, package version **0.3.0**. The main project and embedded firmware are on [`firmware-production`](https://github.com/zjmdong/Day_Distiller/tree/firmware-production). Older `old/*` branches preserve earlier development snapshots; they are not the recommended starting point. The current application UI is primarily Chinese.
+
+## The experience
+
+**Connect → Verify → Select a day → Distil → Revisit**
+
+| Area | What is implemented |
+| :--- | :--- |
+| **Start** | Guided device discovery and synchronisation, with progress and retry paths |
+| **Memories** | Date-based journal history, editing, regeneration and resend |
+| **Appearance & style** | Reference portrait, five built-in art directions, custom style prompt and one-off style previews |
+| **Settings** | Provider configuration, system-keyring credentials and developer tools |
+
+Under the interface:
+
+- USB CDC discovery and capability-gated support for legacy, 2.0 and 2.1 firmware; MSC transitions and device settings where supported.
+- File-size and SHA-256 checks before imported data moves into the processing pipeline; SQLite-backed job and recovery state.
+- FFprobe/FFmpeg media validation and keyframe extraction; IMU features and heuristic activity classification, with an optional scikit-learn model.
+- Qwen-based audiovisual analysis, DeepSeek-based daily moment selection and Seedream image generation through configurable provider adapters.
+- A 3:4 illustrated poster, HTML/PDF journal, embedded email imagery and delivery receipts; source cleanup is a separate, verified step rather than an immediate side effect of copying.
+- Deterministic mock AI and local `.eml` output for development without cloud keys or an email service.
+
+## Quick start
+
+### Requirements
+
+- **Python 3.11** is the reference development/build version (`pyproject.toml` permits 3.11+).
+- **FFmpeg and FFprobe** available on `PATH` when running from source. Packaged builds bundle them.
+- Windows x64 or Apple Silicon macOS for the intended desktop/device workflow. A Linux data-directory fallback exists, but this is not a claim of supported Linux device integration.
+
+Keep a separate checkout from the firmware:
+
+```sh
+git clone --branch desktop-app https://github.com/zjmdong/Day_Distiller.git Day_Distiller_Desktop
+cd Day_Distiller_Desktop
+```
+
+**Windows / PowerShell**
 
 ```powershell
 py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e .[dev]
-.\scripts\run.ps1
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+ffmpeg -version
+ffprobe -version
+.\.venv\Scripts\python.exe -m day_distiller_client
 ```
 
-首次验收建议在“生成”选择“离线演示”，在“记录”选择一个虚拟 TF 卡目录。Mock 不发送任何素材到云端，邮件写入 `%LOCALAPPDATA%\DayDistillerV2\mock_outbox`。
+**Apple Silicon macOS** — use a native arm64 Python 3.11 installation:
 
-真实模式请依次阅读：
+```sh
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+ffmpeg -version
+ffprobe -version
+python -m day_distiller_client
+```
 
-- [中国大陆模型配置](docs/mainland-model-setup.md)
-- [完整用户指引与 Resend 配置](docs/user-guide.md)
-- [参考形象与艺术风格](docs/avatar-setup.md)
-- [Moments 筛选与 Looki L1 产品研究](docs/moments-and-art-direction.md)
-- [IMU 数据采集与训练](docs/imu-data-collection.md)
-- [USB、TF 卡与 FFmpeg 排障](docs/usb-ffmpeg-troubleshooting.md)
+### Try it without a device or API keys
 
-不要在聊天、配置文件、截图或 Git 中提交 API Key 和应用密码；只在应用“设置”页填写。已保存密钥会在本机设置页明文回显，查看页面时注意旁人和录屏软件。
+1. Prepare a **copy** of a compatible TF-card recording folder. Each `REC_NNNN_YYMMDD_HHMMSS` directory contains `video.avi`, `audio.wav`, `imu.json` and `meta.json`; see the [recording format](https://github.com/zjmdong/Day_Distiller/blob/firmware-production/docs/GETTING_STARTED.md#5-understand-the-recording-format). Personal recordings are intentionally not bundled.
+2. Open **Settings / 设置 → Developer settings / 开发者设置**. Use the records page to select the virtual TF-card folder and a date.
+3. On the generation page, choose **Offline demo / 离线演示（零云端调用）**. Leave the option to delete virtual-card records **disabled**.
+4. Import and run the workflow. Mock providers make no AI or SMTP calls; mail is written to `mock_outbox` under the application data directory. Media preprocessing still runs locally.
 
-## 当前设备的一键流程
+Mock output validates plumbing and presentation, not real AI quality. For fixture-driven checks without recordings, run the test suite.
 
-1. 连接设备，应用执行 `HELLO` 和 `GET_STATUS`。
-2. 以只读模式进入 MSC，导入所选日期并生成 `import_manifest.json`。
-3. 校验本地文件，安全弹出并退出 MSC；生成期间每 30 秒发送一次 `PING`。
-4. 完成本地分析、云端生成、HTML/PDF 与邮件发送。
-5. 只有 Resend SMTP 服务器明确接受邮件后，才重新以读写模式挂载。
-6. 删除前重新核对目录、文件集合、大小和 SHA-256，只删除本次清单中的目录。
-7. 清理失败会留下 `pending_cleanup`，可在“报告历史”重试，不影响日报。
+### Connect a real device
 
-## 测试与构建
+Use compatible [HW 2.0 firmware](https://github.com/zjmdong/Day_Distiller/tree/firmware-production), a data-capable USB cable and a backed-up card. Let the app probe with `HELLO`; do not guess the protocol port or keep a terminal attached to it. USB storage transitions re-enumerate the device, so port names can change.
+
+Start with read-only import. Eject the volume before exiting MSC. For modern transactional firmware, the app uses firmware export manifests and explicit cleanup commits; legacy devices use separately verified host-side cleanup. A failed import or generation must not be treated as permission to delete source records.
+
+### Enable real generation
+
+Configure your own provider endpoints, model IDs and credentials in Settings, then configure email and appearance. Provider availability and pricing are external to this repository; confirm them in your account rather than treating the defaults as guaranteed access.
+
+| Guide | Scope |
+| :--- | :--- |
+| [Model configuration](docs/mainland-model-setup.md) | Qwen, DeepSeek and Seedream setup |
+| [User guide](docs/user-guide.md) | Daily workflow and Resend SMTP configuration |
+| [Appearance & style](docs/avatar-setup.md) | Reference portrait and art direction |
+| [Firmware compatibility](docs/firmware-2.1-desktop-adaptation.md) | Device capabilities, status and settings |
+| [Troubleshooting](docs/usb-ffmpeg-troubleshooting.md) | USB, storage and media tools |
+
+These detailed operational guides are currently in Chinese. SMTP acceptance means a server accepted the message, not that the recipient has read it. Review the application's cleanup options before using valuable source data.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Device["USB / virtual card"] --> Import["Verified import"]
+    Import --> Media["Media + motion features"]
+    Media --> Providers["AI providers / offline mocks"]
+    Providers --> Report["Poster + HTML/PDF"]
+    Report --> Delivery["Email / local outbox"]
+    State["SQLite job state"] -.-> Import
+    State -.-> Providers
+    State -.-> Delivery
+```
+
+| Code | Responsibility |
+| :--- | :--- |
+| [`app.py`](src/day_distiller_client/app.py), [`ui_theme.py`](src/day_distiller_client/ui_theme.py) | PySide6 interface, navigation and worker-driven progress |
+| [`protocol.py`](src/day_distiller_client/protocol.py), [`device.py`](src/day_distiller_client/device.py) | SLIP/CRC32 framing, discovery and device commands |
+| [`device_workflow.py`](src/day_distiller_client/device_workflow.py), [`export_adapter.py`](src/day_distiller_client/export_adapter.py) | Firmware capabilities, import sessions and cleanup adapters |
+| [`legacy_import.py`](src/day_distiller_client/legacy_import.py), [`database.py`](src/day_distiller_client/database.py) | Verified file imports and persisted job/history data |
+| [`media.py`](src/day_distiller_client/media.py), [`imu_analysis.py`](src/day_distiller_client/imu_analysis.py) | Local media processing and motion features |
+| [`providers/`](src/day_distiller_client/providers), [`pipeline.py`](src/day_distiller_client/pipeline.py) | Swappable external/mock services and pipeline orchestration |
+| [`reporting.py`](src/day_distiller_client/reporting.py), [`credentials.py`](src/day_distiller_client/credentials.py) | HTML/PDF output and OS keyring access |
+
+## Development
+
+With the virtual environment activated:
+
+```sh
+python -m pytest -q
+```
+
+Tests cover protocol framing, import verification, job state, pipeline recovery, provider adapters, reports and UI behaviour. Mock tests are not hardware endurance tests and do not validate live providers. Never use real personal recordings or production keys as fixtures.
+
+Build the native package **on the target platform**:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
+# Windows x64
 .\scripts\build.ps1
 ```
 
-生产包使用 Nuitka 原生编译，不再使用 PyInstaller。Windows 构建输出为 `dist\DayDistiller-Windows-x64.zip`。macOS 必须在 Apple Silicon 主机上执行 `./scripts/build_macos.sh`，输出 `dist/DayDistiller-macOS-AppleSilicon.zip`；仓库的 GitHub Actions 会在 M1 arm64 runner 上同时测试并构建该版本。两个平台均内置 FFmpeg/FFprobe。
+```sh
+# Apple Silicon macOS
+./scripts/build_macos.sh
+```
 
-设备设置与兼容矩阵见 [固件 2.1 桌面端适配说明](docs/firmware-2.1-desktop-adaptation.md)，构建细节见 [Nuitka 构建与发布](docs/nuitka-build.md)。
+The Nuitka builds produce `dist/DayDistiller-Windows-x64.zip` and `dist/DayDistiller-macOS-AppleSilicon.zip`. Distribute the complete package, not the executable alone. See [build documentation](docs/nuitka-build.md) and the manually triggered [Windows/macOS workflow](.github/workflows/build-desktop.yml). macOS packaging uses ad-hoc signing; that is not Developer ID notarisation.
 
-应用数据在 Windows 默认位于 `%LOCALAPPDATA%\DayDistillerV2`，在 macOS 位于 `~/Library/Application Support/Day Distiller`；可通过 `DAY_DISTILLER_DATA_DIR` 改到测试目录。原始导入素材与成品长期保留，由用户手动清理。
+For an AI extension, implement the relevant interface in [`providers/base.py`](src/day_distiller_client/providers/base.py), wire it into the pipeline and add mock-driven tests. For USB changes, update the C firmware and Python implementation together and preserve capability negotiation.
+
+## Data, privacy & limitations
+
+| Platform | Default application data |
+| :--- | :--- |
+| Windows | `%LOCALAPPDATA%\DayDistillerV2` |
+| macOS | `~/Library/Application Support/Day Distiller` |
+| Override | Set `DAY_DISTILLER_DATA_DIR` before launch |
+
+Imported media, journal outputs, cache and the SQLite database are local files, **not an encrypted vault**. API and SMTP secrets use the system keyring; the local settings interface can display saved secrets in plain text, so keep it out of screenshots and screen recordings.
+
+Real generation sends selected media/context to external AI providers and uses an external email service. Offline mock mode does not. Review consent, recipients and provider policies before enabling real mode. AI can omit or misinterpret details; activity classification is not ground-truth sensing. Longer hardware interruption tests, wearability studies and reliability validation remain ongoing prototype work.
+
+## Author & licensing
+
+**JerryZ** — the independently developed desktop companion to Day Distiller's custom hardware and firmware.
+
+No project-wide software license is supplied. Public visibility is not an open-source license; contact the author before reuse or redistribution. Third-party dependencies retain their own licenses. The original hardware manufacturing files are not distributed.
