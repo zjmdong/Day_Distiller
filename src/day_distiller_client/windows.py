@@ -170,10 +170,20 @@ def close_explorer_windows_for_drive(letter: str) -> int:
 def _wait_for_drive_removal(letter: str, timeout: float = 10.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if letter not in drive_letters():
+        if letter not in drive_letters() or not _drive_root_accessible(letter):
             return True
         time.sleep(0.25)
-    return letter not in drive_letters()
+    return letter not in drive_letters() or not _drive_root_accessible(letter)
+
+
+def _drive_root_accessible(letter: str) -> bool:
+    """Return whether Windows can still access the volume, despite stale WMI data."""
+
+    try:
+        next(Path(f"{letter}:\\").iterdir(), None)
+    except OSError:
+        return False
+    return True
 
 
 def safe_eject(letter: str) -> None:
@@ -210,10 +220,12 @@ def safe_eject(letter: str) -> None:
             name = str(verb.Name).replace("&", "").lower()
             if "eject" in name or "弹出" in name:
                 verb.DoIt()
-                _wait_for_drive_removal(letter, timeout=2.0)
+                if not _wait_for_drive_removal(letter, timeout=8.0):
+                    raise RuntimeError(f"drive {letter}: is still mounted after eject request")
                 return
         item.InvokeVerb("Eject")
-        _wait_for_drive_removal(letter, timeout=2.0)
+        if not _wait_for_drive_removal(letter, timeout=8.0):
+            raise RuntimeError(f"drive {letter}: is still mounted after eject request")
         return
     except Exception as exc:
         script = (
@@ -233,3 +245,5 @@ def safe_eject(letter: str) -> None:
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip() or str(exc)
             raise RuntimeError(f"failed to eject {letter}: {detail}") from exc
+        if not _wait_for_drive_removal(letter, timeout=8.0):
+            raise RuntimeError(f"drive {letter}: is still mounted after eject request") from exc

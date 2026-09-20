@@ -691,13 +691,24 @@ class MainWindow:
         self.guided_sync_subtitle = QLabel("正在安全读取设备内今天的记录，请稍等。")
         self.guided_sync_subtitle.setObjectName("workflowSubtitle")
         self.guided_sync_subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.guided_sync_subtitle.setWordWrap(True)
+        self.guided_sync_subtitle.setMaximumWidth(860)
         sync_layout.addWidget(sync_title)
-        sync_layout.addWidget(self.guided_sync_subtitle)
+        sync_layout.addSpacing(28)
         self.guided_sync_progress = RoundedProgressBar()
         self.guided_sync_progress.setRange(0, 100)
         self.guided_sync_progress.setValue(0)
         self.guided_sync_progress.setFormat("%p%")
-        sync_layout.addWidget(self.guided_sync_progress)
+        self.guided_sync_progress.setMinimumWidth(520)
+        self.guided_sync_progress.setMaximumWidth(860)
+        sync_layout.addWidget(
+            self.guided_sync_progress,
+            alignment=Qt.AlignmentFlag.AlignHCenter,
+        )
+        sync_layout.addWidget(
+            self.guided_sync_subtitle,
+            alignment=Qt.AlignmentFlag.AlignHCenter,
+        )
         self.guided_records_list = QListWidget()
         self.guided_records_list.setObjectName("guidedRecordsList")
         self.guided_records_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)

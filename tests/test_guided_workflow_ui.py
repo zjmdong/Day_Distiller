@@ -91,6 +91,23 @@ def test_device_search_timeout_exposes_retry_and_home_return() -> None:
         _close(window, temporary)
 
 
+def test_sync_progress_is_centered_and_details_follow_it() -> None:
+    window, temporary = _window()
+    try:
+        progress = window.guided_sync_progress
+        details = window.guided_sync_subtitle
+        layout = progress.parentWidget().layout()
+
+        assert progress.maximumWidth() == 860
+        assert progress.minimumWidth() == 520
+        assert details.maximumWidth() == 860
+        assert layout.indexOf(progress) < layout.indexOf(details)
+        assert layout.itemAt(layout.indexOf(progress)).alignment() & Qt.AlignmentFlag.AlignHCenter
+        assert layout.itemAt(layout.indexOf(details)).alignment() & Qt.AlignmentFlag.AlignHCenter
+    finally:
+        _close(window, temporary)
+
+
 def test_landing_intro_uses_ordered_title_subtitle_button_footer_timeline() -> None:
     window, temporary = _window()
     try:

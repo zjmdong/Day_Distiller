@@ -498,18 +498,22 @@ class LegacyDeviceWorkflow:
         root: str,
         next_mode: str | None = None,
     ) -> None:
-        errors: list[str] = []
+        eject_error: Exception | None = None
         self._emit(f"数据读取已结束，正在安全弹出设备卷 {root}")
         try:
             safe_eject(letter)
         except Exception as exc:
-            errors.append(f"安全弹出失败：{exc}")
+            eject_error = exc
         try:
             self._exit_msc(next_mode=next_mode)
-        except Exception as exc:
-            errors.append(f"退出 MSC 失败：{exc}")
-        if errors:
-            raise RuntimeError("；".join(errors))
+        except Exception as exit_error:
+            if eject_error is not None:
+                raise RuntimeError(
+                    f"安全弹出确认失败：{eject_error}；退出 MSC 失败：{exit_error}"
+                ) from exit_error
+            raise RuntimeError(f"退出 MSC 失败：{exit_error}") from exit_error
+        if eject_error is not None:
+            self._emit("Windows 盘符状态更新较慢，设备端已确认安全弹出")
 
     def _exit_msc(self, next_mode: str | None = None) -> None:
         port, _status = self._wait_for_device()

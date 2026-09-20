@@ -1,5 +1,5 @@
 from datetime import date
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -86,3 +86,32 @@ def test_date_already_prepared_reuses_only_the_active_transaction() -> None:
 
     assert transaction.export_id == "exp-active"
     assert transaction.state == "prepared"
+
+
+def test_device_exit_confirmation_overrides_stale_windows_eject_state() -> None:
+    messages: list[str] = []
+    workflow = LegacyDeviceWorkflow(None, status=messages.append)  # type: ignore[arg-type]
+    workflow._exit_msc = MagicMock()  # type: ignore[method-assign]
+
+    with patch(
+        "day_distiller_client.device_workflow.safe_eject",
+        side_effect=RuntimeError("drive E: is still mounted after eject request"),
+    ):
+        workflow._eject_and_exit("E", "E:\\", next_mode="maintenance")
+
+    workflow._exit_msc.assert_called_once_with(next_mode="maintenance")  # type: ignore[attr-defined]
+    assert any("设备端已确认安全弹出" in message for message in messages)
+
+
+def test_eject_and_device_exit_failure_reports_both_causes() -> None:
+    workflow = LegacyDeviceWorkflow(None)  # type: ignore[arg-type]
+    workflow._exit_msc = MagicMock(side_effect=RuntimeError("device refused"))  # type: ignore[method-assign]
+
+    with patch(
+        "day_distiller_client.device_workflow.safe_eject",
+        side_effect=RuntimeError("drive remains mounted"),
+    ), pytest.raises(RuntimeError) as error:
+        workflow._eject_and_exit("E", "E:\\", next_mode="maintenance")
+
+    assert "安全弹出确认失败" in str(error.value)
+    assert "退出 MSC 失败" in str(error.value)

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from day_distiller_client.device import UsbLinkDevice, device_profile
+from day_distiller_client import windows
 from day_distiller_client.device_settings import (
     DeviceSettingsSnapshot,
     build_patch,
@@ -78,6 +79,39 @@ def test_device_settings_ui_keeps_hello_capabilities_after_status_read() -> None
     )
     assert '"profile": profile' in app_source
     assert 'profile = result.get("profile") or device_profile(result.get("hello", status), port)' in app_source
+
+
+def test_device_settings_save_reads_back_without_entering_msc() -> None:
+    app_source = (Path(__file__).parents[1] / "src/day_distiller_client/app.py").read_text(
+        encoding="utf-8"
+    )
+    save_flow = app_source[
+        app_source.index("    def save_device_settings") :
+        app_source.index("    def choose_device_led_color")
+    ]
+    assert "device.set_config" in save_flow
+    assert "device.get_config" in save_flow
+    assert "device.get_status" in save_flow
+    assert save_flow.index("device.set_config") < save_flow.index("device.get_config")
+    assert "_perform_safe_restart" not in save_flow
+    assert "enter_msc" not in save_flow
+
+
+def test_safe_eject_confirms_removal_without_trusting_stale_wmi_alone() -> None:
+    source = (Path(__file__).parents[1] / "src/day_distiller_client/windows.py").read_text(
+        encoding="utf-8"
+    )
+    safe_eject = source[source.index("def safe_eject") :]
+    assert safe_eject.count("if not _wait_for_drive_removal") >= 3
+    assert "is still mounted after eject request" in safe_eject
+    assert "timeout=8.0" in safe_eject
+
+    with patch.object(windows, "drive_letters", return_value={"E"}), patch.object(
+        windows,
+        "_drive_root_accessible",
+        return_value=False,
+    ):
+        assert windows._wait_for_drive_removal("E", timeout=0.01)
 
 
 def test_usb_device_2_1_payloads_match_contract() -> None:
