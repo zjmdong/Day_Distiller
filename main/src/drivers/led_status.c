@@ -1,6 +1,7 @@
 #include "led_status.h"
 
 #include "day_pins.h"
+#include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -11,6 +12,9 @@
 static const char *TAG = "day_led";
 
 static led_strip_handle_t s_strip;
+static TaskHandle_t s_led_task;
+static volatile bool s_stop_requested;
+static volatile bool s_task_stopped = true;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static struct {
     day_led_mode_t base_mode;
@@ -59,6 +63,12 @@ esp_err_t day_led_init(void)
     if (s_strip) {
         return ESP_OK;
     }
+    /* A deep-sleep entry holds DIN low to prevent a floating input from
+     * clocking a stale color into the LEDs. Release that hold before RMT
+     * takes ownership again on the next wake. */
+    gpio_deep_sleep_hold_dis();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_hold_dis(DAY_PIN_RGB_DIN));
+    s_stop_requested = false;
     led_strip_config_t strip_config = {
         .strip_gpio_num = DAY_PIN_RGB_DIN,
         .max_leds = DAY_RGB_LED_COUNT,
@@ -155,7 +165,8 @@ esp_err_t day_led_get_snapshot(day_led_status_snapshot_t *out)
 
 static void led_task(void *arg)
 {
-    while (true) {
+    (void)arg;
+    while (!s_stop_requested) {
         int64_t now = esp_timer_get_time(); uint8_t r=0,g=0,b=0,brightness=100; day_led_mode_t mode; bool preview=false,battery_low=false; int64_t battery_elapsed=0;
         portENTER_CRITICAL(&s_lock);
         if (s_state.preview && now >= s_state.preview_until_us) s_state.preview = false;
@@ -183,13 +194,71 @@ static void led_task(void *arg)
         fill_all(scale_channel(r,brightness),scale_channel(g,brightness),scale_channel(b,brightness));
         vTaskDelay(pdMS_TO_TICKS(33)); /* >= 30 FPS breathing animation */
     }
+    (void)fill_all(0, 0, 0);
+    s_led_task = NULL;
+    s_task_stopped = true;
+    vTaskDelete(NULL);
 }
 
 void day_led_task_start(void)
 {
-    static bool started;
-    if (!started) {
-        started = true;
-        xTaskCreate(led_task, "day_led", 3072, NULL, 3, NULL);
+    if (!s_led_task) {
+        s_stop_requested = false;
+        s_task_stopped = false;
+        if (xTaskCreate(led_task, "day_led", 3072, NULL, 3, &s_led_task) != pdPASS) {
+            s_led_task = NULL;
+            s_task_stopped = true;
+            ESP_LOGE(TAG, "failed to create LED task");
+        }
     }
+}
+
+esp_err_t day_led_prepare_for_sleep(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_state.base_mode = DAY_LED_OFF;
+    s_state.recording = false;
+    s_state.fatal_error = false;
+    s_state.usb_enumerated = false;
+    s_state.usb_handshake = false;
+    s_state.preview = false;
+    s_state.preview_until_us = 0;
+    s_state.battery_pattern_until_us = 0;
+    s_state.battery_lock = false;
+    portEXIT_CRITICAL(&s_lock);
+
+    s_stop_requested = true;
+    int64_t stop_deadline_us = esp_timer_get_time() + 150000;
+    while (!s_task_stopped && esp_timer_get_time() < stop_deadline_us) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (s_led_task) {
+        vTaskDelete(s_led_task);
+        s_led_task = NULL;
+        s_task_stopped = true;
+    }
+
+    esp_err_t first_error = ESP_OK;
+    if (s_strip) {
+        esp_err_t ret = led_strip_clear(s_strip);
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
+        }
+        ret = led_strip_del(s_strip);
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
+        }
+        s_strip = NULL;
+    }
+
+    esp_err_t ret = gpio_reset_pin(DAY_PIN_RGB_DIN);
+    if (ret == ESP_OK) ret = gpio_set_direction(DAY_PIN_RGB_DIN, GPIO_MODE_OUTPUT);
+    if (ret == ESP_OK) ret = gpio_set_level(DAY_PIN_RGB_DIN, 0);
+    if (ret == ESP_OK) ret = gpio_set_pull_mode(DAY_PIN_RGB_DIN, GPIO_PULLDOWN_ONLY);
+    if (ret == ESP_OK) ret = gpio_hold_en(DAY_PIN_RGB_DIN);
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+    gpio_deep_sleep_hold_en();
+    return first_error;
 }

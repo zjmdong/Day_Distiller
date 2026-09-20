@@ -58,6 +58,10 @@
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .switch { display: flex; align-items: center; gap: 8px; min-height: 38px; font-size: 14px; color: var(--ink); }
     .switch input { width: 18px; min-height: 18px; }
+    .range-row { display: grid; grid-template-columns: 1fr 64px; gap: 10px; align-items: center; }
+    input[type="range"] { padding: 0; }
+    input[type="color"] { padding: 3px; min-height: 44px; }
+    output { color: var(--ink); font-weight: 750; text-align: right; }
     .banner {
       display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px;
       border: 1px solid #d2ebe7; border-radius: 6px; background: #eefaf7; color: #11443f;
@@ -285,7 +289,7 @@
       <div class="grid">
         <div class="metric"><div class="label">连接状态</div><div class="value" id="wifiConnState">--</div></div>
         <label>保存的 Wi-Fi 名称<input id="savedSsid" readonly></label>
-        <label>保存的 Wi-Fi 密码<input id="savedPassword" readonly></label>
+        <label>Wi-Fi 密码状态<input id="savedPassword" readonly></label>
       </div>
     </section>
 
@@ -309,6 +313,29 @@
         <button id="saveTimeBtn" class="secondary">保存时间设置</button>
         <span class="log" id="timeLog"></span>
       </div>
+    </section>
+
+    <section class="wide">
+      <div class="section-head">
+        <h2>RGB 状态灯</h2>
+        <div class="row">
+          <button id="previewLedBtn" class="secondary">预览灯效</button>
+          <button id="saveLedBtn" class="secondary">保存状态灯设置</button>
+        </div>
+      </div>
+      <div class="grid">
+        <label>全局亮度
+          <div class="range-row">
+            <input id="ledBrightness" type="range" min="5" max="100" step="1" value="100">
+            <output id="ledBrightnessValue">100%</output>
+          </div>
+        </label>
+        <label>录制指示灯颜色
+          <input id="ledRecordingColor" type="color" value="#ff3000">
+        </label>
+        <div class="metric"><div class="label">颜色预览</div><div class="value" id="ledColorValue">#FF3000</div></div>
+      </div>
+      <div class="log" id="ledLog"></div>
     </section>
 
     <section class="wide">
@@ -561,7 +588,7 @@
       $("provisionSection").hidden = !needProvision;
       $("wifiInfoSection").hidden = !configured && !forceProvision;
       $("savedSsid").value = c ? (c.wifi_ssid || "") : "";
-      $("savedPassword").value = c ? (c.wifi_password || "") : "";
+      $("savedPassword").value = c && c.wifi_password_set ? "••••••••" : "未设置";
       $("wifiConnState").textContent = opActive ? "正在配网/对时" :
         (opOk ? "最近配网成功，对时成功" : (connected ? (timeOk ? "已联网并完成对时" : "已联网，对时失败") : "未连接"));
       if (!configured) {
@@ -632,6 +659,10 @@
       $("ntpServer").value = c.ntp_server || "ntp1.aliyun.com";
       $("autoRec").checked = c.auto_record_enabled;
       $("shake").checked = c.shake_trigger_enabled;
+      $("ledBrightness").value = c.led_brightness_percent ?? 100;
+      $("ledBrightnessValue").textContent = `${$("ledBrightness").value}%`;
+      $("ledRecordingColor").value = c.led_recording_color || "#ff3000";
+      $("ledColorValue").textContent = $("ledRecordingColor").value.toUpperCase();
       updateProvisionUi();
     }
     function configBody() {
@@ -650,7 +681,9 @@
         ntp_server: $("ntpServer").value.trim() || "ntp1.aliyun.com",
         timezone: $("timezone").value || "CST-8",
         auto_record_enabled: $("autoRec").checked,
-        shake_trigger_enabled: $("shake").checked
+        shake_trigger_enabled: $("shake").checked,
+        led_brightness_percent: +$("ledBrightness").value,
+        led_recording_color: $("ledRecordingColor").value.toUpperCase()
       };
     }
     async function saveConfig(messageTarget = "configLog") {
@@ -660,6 +693,21 @@
       await loadConfig();
       await poll();
       return r.ok;
+    }
+    async function previewLed() {
+      $("ledLog").textContent = "正在预览";
+      try {
+        const r = await fetch("/api/led/preview", {
+          method: "POST",
+          body: JSON.stringify({
+            brightness_percent: +$("ledBrightness").value,
+            color: $("ledRecordingColor").value.toUpperCase()
+          })
+        }).then(r => r.json());
+        $("ledLog").textContent = r.ok ? "正在预览 2 秒" : "预览失败";
+      } catch (e) {
+        $("ledLog").textContent = "预览失败";
+      }
     }
     async function poll() {
       try { applyStatus(await fetch("/api/status").then(r => r.json())); }
@@ -807,6 +855,10 @@
     $("saveAudioBtn").onclick = () => saveConfig("configLog");
     $("saveMotionBtn").onclick = () => saveConfig("configLog");
     $("saveTimeBtn").onclick = () => saveConfig("timeLog");
+    $("previewLedBtn").onclick = previewLed;
+    $("saveLedBtn").onclick = () => saveConfig("ledLog");
+    $("ledBrightness").oninput = () => { $("ledBrightnessValue").textContent = `${$("ledBrightness").value}%`; };
+    $("ledRecordingColor").oninput = () => { $("ledColorValue").textContent = $("ledRecordingColor").value.toUpperCase(); };
     $("syncTimeBtn").onclick = syncTimeNow;
     $("retryWifiBtn").onclick = () => retryWifiSync("configLog");
     $("scanBtn").onclick = scanWifi;

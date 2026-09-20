@@ -437,8 +437,11 @@ esp_err_t day_imu_configure_shake_wake(bool enabled)
     if (ret == ESP_OK) {
         ret = day_i2c_write_reg(s_dev, REG_MD1_CFG, enabled ? 0x20 : 0x00);
     }
-    gpio_wakeup_enable(DAY_PIN_IMU_INT, GPIO_INTR_HIGH_LEVEL);
-    return ret;
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    return enabled ? gpio_wakeup_enable(DAY_PIN_IMU_INT, GPIO_INTR_HIGH_LEVEL)
+                   : gpio_wakeup_disable(DAY_PIN_IMU_INT);
 }
 
 esp_err_t day_imu_enter_sleep(void)

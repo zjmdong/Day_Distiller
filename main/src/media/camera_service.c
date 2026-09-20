@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "day_pins.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -16,6 +17,19 @@ static int s_current_quality = -1;
 static day_camera_status_t s_status = {
     .last_error = ESP_ERR_INVALID_STATE,
 };
+
+static void hold_camera_in_reset(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << DAY_PIN_CAM_RST,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&cfg));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_set_level(DAY_PIN_CAM_RST, 0));
+}
 
 static framesize_t sanitize_framesize(int value)
 {
@@ -61,6 +75,7 @@ static esp_err_t init_with_framesize(const day_config_t *cfg, int framesize_valu
         jpeg_quality = 12;
     }
     framesize_t frame_size = sanitize_framesize(framesize_value);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_hold_dis(DAY_PIN_CAM_RST));
 
     camera_config_t camera_config = {
         .pin_pwdn = -1,
@@ -103,6 +118,7 @@ static esp_err_t init_with_framesize(const day_config_t *cfg, int framesize_valu
     }
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "camera init failed: %s", esp_err_to_name(ret));
+        hold_camera_in_reset();
     }
     return ret;
 }
@@ -124,6 +140,10 @@ void day_camera_deinit(void)
     if (s_initialized) {
         esp_camera_deinit();
     }
+    /* esp_camera_deinit stops XCLK; assert the known reset signal as the
+     * lowest-power software-controlled idle state. There is no PWDN pin.
+     */
+    hold_camera_in_reset();
     s_initialized = false;
     s_status.initialized = false;
     s_status.streaming = false;
@@ -132,6 +152,15 @@ void day_camera_deinit(void)
     s_status.frame_count = 0;
     s_current_framesize = FRAMESIZE_INVALID;
     s_current_quality = -1;
+}
+
+esp_err_t day_camera_prepare_for_sleep(void)
+{
+    day_camera_deinit();
+    /* RESET is the only routed camera power-control signal on this board.
+     * Hold it low across deep sleep so the sensor cannot leave reset because
+     * the GPIO became high impedance. */
+    return gpio_hold_en(DAY_PIN_CAM_RST);
 }
 
 esp_err_t day_camera_capture(camera_fb_t **out_fb)
@@ -221,6 +250,9 @@ esp_err_t day_camera_stream_mjpeg(httpd_req_t *req, uint32_t target_fps)
     }
     httpd_resp_send_chunk(req, NULL, 0);
     s_status.streaming = false;
+    if (!s_status.recording) {
+        day_camera_deinit();
+    }
     return ret;
 }
 

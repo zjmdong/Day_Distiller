@@ -11,6 +11,7 @@
 #include "imu.h"
 #include "led_status.h"
 #include "storage_service.h"
+#include "usb_link.h"
 #include "wifi_portal.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
@@ -57,10 +58,23 @@ void day_power_latch_low_battery(void)
 
 static void shutdown_peripherals(void)
 {
+    ESP_LOGI(TAG, "shutdown stage: sensors");
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_imu_enter_sleep());
-    day_audio_deinit(); day_camera_deinit(); day_wifi_deinit_for_sleep(); day_storage_deinit();
-    ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_OFF));
-    vTaskDelay(pdMS_TO_TICKS(50));
+    day_audio_deinit();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_camera_prepare_for_sleep());
+    ESP_LOGI(TAG, "shutdown stage: network");
+    day_wifi_deinit_for_sleep();
+    ESP_LOGI(TAG, "shutdown stage: storage");
+    day_storage_deinit();
+    ESP_LOGI(TAG, "shutdown stage: rgb off");
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_prepare_for_sleep());
+}
+
+static void stop_usb_before_sleep(void)
+{
+    ESP_LOGI(TAG, "shutdown stage: usb");
+    vTaskDelay(pdMS_TO_TICKS(20));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_usb_link_stop());
 }
 
 esp_err_t day_power_enter_locked_sleep(void)
@@ -69,6 +83,7 @@ esp_err_t day_power_enter_locked_sleep(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_imu_configure_shake_wake(false));
     shutdown_peripherals();
     ESP_LOGW(TAG, "entering low-battery locked sleep with all wake sources disabled");
+    stop_usb_before_sleep();
     esp_deep_sleep_start();
 }
 
@@ -95,5 +110,6 @@ esp_err_t day_power_enter_deep_sleep(const day_config_t *cfg)
 
     ESP_LOGI(TAG, "entering deep sleep timer=%d interval=%lu seconds", cfg->auto_record_enabled,
              (unsigned long)cfg->wake_interval_sec);
+    stop_usb_before_sleep();
     esp_deep_sleep_start();
 }

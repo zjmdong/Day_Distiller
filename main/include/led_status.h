@@ -27,3 +27,4 @@ esp_err_t day_led_preview(uint8_t r, uint8_t g, uint8_t b,
 esp_err_t day_led_show_battery(const day_battery_status_t *battery);
 esp_err_t day_led_get_snapshot(day_led_status_snapshot_t *snapshot);
 void day_led_task_start(void);
+esp_err_t day_led_prepare_for_sleep(void);

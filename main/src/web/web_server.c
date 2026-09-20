@@ -6,7 +6,9 @@
 #include "audio_service.h"
 #include "camera_service.h"
 #include "app_config.h"
+#include "device_settings.h"
 #include "imu.h"
+#include "led_status.h"
 #include "recorder.h"
 #include "rtc_clock.h"
 #include "storage_service.h"
@@ -220,11 +222,11 @@ static void config_to_json(const day_config_t *cfg, char *buf, size_t len)
     char ntp[DAY_NTP_SERVER_MAX * 2 + 1];
     char tz[DAY_TIMEZONE_MAX * 2 + 1];
     char ssid[DAY_WIFI_SSID_MAX * 2 + 1];
-    char pass[DAY_WIFI_PASSWORD_MAX * 2 + 1];
+    char recording_color[8];
     json_escape_string(cfg->ntp_server, ntp, sizeof(ntp));
     json_escape_string(cfg->timezone, tz, sizeof(tz));
     json_escape_string(cfg->wifi_ssid, ssid, sizeof(ssid));
-    json_escape_string(cfg->wifi_password, pass, sizeof(pass));
+    day_settings_format_recording_color(cfg, recording_color);
     snprintf(buf, len,
              "{"
              "\"auto_record_enabled\":%s,"
@@ -240,11 +242,13 @@ static void config_to_json(const day_config_t *cfg, char *buf, size_t len)
              "\"imu_sample_rate_hz\":%lu,"
              "\"imu_orientation\":%u,"
              "\"low_battery_percent\":%u,"
+             "\"led_brightness_percent\":%u,"
+             "\"led_recording_color\":\"%s\","
              "\"ntp_server\":\"%s\","
              "\"timezone\":\"%s\","
              "\"wifi_configured\":%s,"
              "\"wifi_ssid\":\"%s\","
-             "\"wifi_password\":\"%s\""
+             "\"wifi_password_set\":%s"
              "}",
              boolstr(cfg->auto_record_enabled),
              (unsigned long)cfg->wake_interval_sec,
@@ -259,11 +263,13 @@ static void config_to_json(const day_config_t *cfg, char *buf, size_t len)
              (unsigned long)cfg->imu_sample_rate_hz,
              cfg->imu_orientation,
              cfg->low_battery_percent,
+             cfg->led_brightness_percent,
+             recording_color,
              ntp,
              tz,
              boolstr(cfg->wifi_ssid[0] != '\0'),
              ssid,
-             pass);
+             boolstr(cfg->wifi_password[0] != '\0'));
 }
 
 static esp_err_t config_get_handler(httpd_req_t *req)
@@ -359,6 +365,34 @@ static bool json_string(const char *json, const char *name, char *out, size_t le
     return true;
 }
 
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool json_color(const char *json, const char *name, uint8_t *red, uint8_t *green, uint8_t *blue)
+{
+    char color[8] = {0};
+    if (!json_string(json, name, color, sizeof(color))) {
+        return false;
+    }
+    if (strlen(color) != 7 || color[0] != '#') {
+        return false;
+    }
+    int digits[6];
+    for (int i = 0; i < 6; ++i) {
+        digits[i] = hex_nibble(color[i + 1]);
+        if (digits[i] < 0) return false;
+    }
+    *red = (uint8_t)((digits[0] << 4) | digits[1]);
+    *green = (uint8_t)((digits[2] << 4) | digits[3]);
+    *blue = (uint8_t)((digits[4] << 4) | digits[5]);
+    return true;
+}
+
 static esp_err_t config_post_handler(httpd_req_t *req)
 {
     char body[1100];
@@ -389,6 +423,13 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     if (low_batt > 0 && low_batt < 100) {
         next.low_battery_percent = (uint8_t)low_batt;
     }
+    uint32_t led_brightness = next.led_brightness_percent;
+    json_u32(body, "led_brightness_percent", &led_brightness);
+    if (led_brightness >= 5 && led_brightness <= 100) {
+        next.led_brightness_percent = (uint8_t)led_brightness;
+    }
+    (void)json_color(body, "led_recording_color", &next.led_recording_r,
+                     &next.led_recording_g, &next.led_recording_b);
     json_string(body, "ntp_server", next.ntp_server, sizeof(next.ntp_server));
     json_string(body, "timezone", next.timezone, sizeof(next.timezone));
     if (s_cb.save_config) {
@@ -396,6 +437,28 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
     json_send(req, ret == ESP_OK ? "{\"ok\":true}" : "{\"ok\":false}");
     return ret;
+}
+
+static esp_err_t led_preview_handler(httpd_req_t *req)
+{
+    char body[160];
+    esp_err_t ret = read_body(req, body, sizeof(body));
+    if (ret != ESP_OK) {
+        json_send(req, "{\"ok\":false,\"error\":\"bad_body\"}");
+        return ESP_OK;
+    }
+    uint32_t brightness = 0;
+    uint8_t red = 0, green = 0, blue = 0;
+    json_u32(body, "brightness_percent", &brightness);
+    bool color_valid = json_color(body, "color", &red, &green, &blue);
+    if (brightness < 5 || brightness > 100 || !color_valid ||
+        (red == 0 && green == 0 && blue == 0)) {
+        json_send(req, "{\"ok\":false,\"error\":\"invalid_led_preview\"}");
+        return ESP_OK;
+    }
+    ret = day_led_preview(red, green, blue, (uint8_t)brightness, 2000);
+    json_send(req, ret == ESP_OK ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"preview_failed\"}");
+    return ESP_OK;
 }
 
 static esp_err_t record_handler(httpd_req_t *req)
@@ -800,6 +863,7 @@ esp_err_t day_web_start(const day_web_callbacks_t *callbacks)
     httpd_uri_t status = {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler};
     httpd_uri_t cfg_get = {.uri = "/api/config", .method = HTTP_GET, .handler = config_get_handler};
     httpd_uri_t cfg_post = {.uri = "/api/config", .method = HTTP_POST, .handler = config_post_handler};
+    httpd_uri_t led_preview = {.uri = "/api/led/preview", .method = HTTP_POST, .handler = led_preview_handler};
     httpd_uri_t record = {.uri = "/api/record", .method = HTTP_POST, .handler = record_handler};
     httpd_uri_t files = {.uri = "/api/files", .method = HTTP_GET, .handler = files_handler};
     httpd_uri_t scan = {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = wifi_scan_handler};
@@ -812,6 +876,7 @@ esp_err_t day_web_start(const day_web_callbacks_t *callbacks)
     httpd_register_uri_handler(s_server, &status);
     httpd_register_uri_handler(s_server, &cfg_get);
     httpd_register_uri_handler(s_server, &cfg_post);
+    httpd_register_uri_handler(s_server, &led_preview);
     httpd_register_uri_handler(s_server, &record);
     httpd_register_uri_handler(s_server, &files);
     httpd_register_uri_handler(s_server, &scan);

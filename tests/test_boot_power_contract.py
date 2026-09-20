@@ -13,8 +13,23 @@ class BootPowerContractTests(unittest.TestCase):
         self.assertIn("6000000LL", wifi)
         self.assertIn("pdMS_TO_TICKS(100)", wifi)
         self.assertIn("day_usb_link_maintenance_active()", wifi)
-        self.assertIn("300000000LL", wifi)
+        self.assertIn("client_present", wifi)
+        self.assertIn("deadline_us = now_us + (int64_t)window_ms * 1000", wifi)
+        self.assertNotIn("300000000LL", wifi)
+        self.assertNotIn("30000000LL", wifi)
         self.assertIn("day_wifi_run_portal_window(10000)", app)
+
+    def test_usb_only_starts_on_cold_boot_and_stops_before_recording(self):
+        app = read("main/src/app_core.c")
+        defaults = read("sdkconfig.defaults")
+        cold_start = app.index("if (cold_boot) {")
+        usb_start = app.index("day_usb_link_start_serial_mode()", cold_start)
+        board_start = app.index("day_board_init()", usb_start)
+        self.assertLess(cold_start, usb_start)
+        self.assertLess(usb_start, board_start)
+        self.assertLess(app.index("day_usb_link_stop()"), app.index("record_once_cb()", app.index("void day_app_run")))
+        self.assertIn("CONFIG_ESP_CONSOLE_NONE=y", defaults)
+        self.assertNotIn("CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y", defaults)
 
     def test_low_battery_latch_is_crc_protected_and_poweron_only_clear(self):
         power = read("main/src/power/power_manager.c")

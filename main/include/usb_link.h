@@ -20,9 +20,12 @@ typedef esp_err_t (*day_usb_config_apply_callback_t)(const day_config_t *candida
 
 bool day_usb_link_should_run_msc_mode(void);
 bool day_usb_link_should_resume_maintenance(void);
+void day_usb_link_boot_init(void);
 esp_err_t day_usb_link_start_serial_mode(void);
+esp_err_t day_usb_link_stop(void);
 void day_usb_link_run_msc_mode(void);
 bool day_usb_link_maintenance_active(void);
+bool day_usb_link_host_connection_latched(void);
 const char *day_usb_link_mode_name(void);
 void day_usb_link_set_config_apply_callback(day_usb_config_apply_callback_t callback);
 

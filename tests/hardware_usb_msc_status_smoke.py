@@ -14,7 +14,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", required=True)
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--expected-firmware", default="2.1.0")
+    parser.add_argument("--expected-firmware", default="2.1.1")
     args = parser.parse_args()
     assert args.iterations > 0
 

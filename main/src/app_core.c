@@ -114,8 +114,11 @@ static esp_err_t save_config_cb(const day_config_t *config)
 static esp_err_t record_once_cb(void)
 {
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_RECORDING));
-    day_record_paths_t paths;
-    esp_err_t ret = day_recorder_record_once(&s_config, &paths);
+    /* The caller does not consume the paths. Keeping the 752-byte path object
+     * on app_main's small stack needlessly reduces the headroom available to
+     * the camera/storage initialization chain.
+     */
+    esp_err_t ret = day_recorder_record_once(&s_config, NULL);
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_status_refresh(DAY_STATUS_REFRESH_BATTERY |
                                                      DAY_STATUS_REFRESH_STORAGE));
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(ret == ESP_OK ? DAY_LED_BOOT : DAY_LED_ERROR));
@@ -153,6 +156,33 @@ static bool is_automatic_wakeup(uint32_t wakeup_causes)
     return (wakeup_causes & (timer_wake | shake_wake)) != 0;
 }
 
+static bool wait_for_usb_preemption(uint32_t wait_ms)
+{
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)wait_ms * 1000;
+    do {
+        if (day_usb_link_maintenance_active()) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    } while (esp_timer_get_time() < deadline_us);
+    return day_usb_link_maintenance_active();
+}
+
+static void enter_usb_wait_until_power_cycle(void)
+{
+    /* A physical USB host connection is deliberately irreversible for this
+     * power cycle. Closing the desktop app or unplugging the cable must not
+     * allow the boot flow to fall through into recording. */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_web_stop());
+    day_wifi_deinit_for_sleep();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_usb_handshake(false));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_usb_enumerated(true));
+    ESP_LOGI(TAG, "USB host latched; waiting until a real power cycle");
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 void day_app_run(void)
 {
     ESP_ERROR_CHECK(init_nvs());
@@ -163,13 +193,24 @@ void day_app_run(void)
     ESP_ERROR_CHECK(day_status_service_init(&s_config, s_config_revision));
     day_status_set_low_battery_latched(day_power_low_battery_latched());
     day_usb_link_set_config_apply_callback(apply_config_cb);
+    day_usb_link_boot_init();
+
+    uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
+    bool automatic_wakeup = is_automatic_wakeup(wakeup_causes);
+    bool cold_boot = !automatic_wakeup;
+    ESP_LOGI(TAG, "boot wake causes=0x%08lx cold=%d", (unsigned long)wakeup_causes, cold_boot);
 
     if (day_usb_link_should_run_msc_mode()) {
         day_usb_link_run_msc_mode();
         return;
     }
 
-    ESP_ERROR_CHECK_WITHOUT_ABORT(day_usb_link_start_serial_mode());
+    bool serial_started = false;
+    if (cold_boot) {
+        esp_err_t usb_start = day_usb_link_start_serial_mode();
+        serial_started = usb_start == ESP_OK;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(usb_start);
+    }
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_board_init());
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_init());
     day_led_task_start();
@@ -177,12 +218,12 @@ void day_app_run(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_BOOT));
 
     if (day_power_low_battery_latched()) {
-        ESP_LOGW(TAG, "low-battery sleep lock retained across reset; waiting briefly for USB maintenance");
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        if (!day_usb_link_maintenance_active()) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(day_power_enter_locked_sleep());
-            return;
+        if (cold_boot && wait_for_usb_preemption(1500)) {
+            enter_usb_wait_until_power_cycle();
         }
+        ESP_LOGW(TAG, "low-battery sleep lock retained; entering locked sleep");
+        ESP_ERROR_CHECK_WITHOUT_ABORT(day_power_enter_locked_sleep());
+        return;
     }
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_battery_init());
@@ -191,18 +232,16 @@ void day_app_run(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_storage_init());
     ESP_ERROR_CHECK_WITHOUT_ABORT(day_status_refresh(DAY_STATUS_REFRESH_ALL));
 
-    uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
-    bool cold_boot = !is_automatic_wakeup(wakeup_causes);
-    ESP_LOGI(TAG, "boot wake causes=0x%08lx cold=%d", (unsigned long)wakeup_causes, cold_boot);
-
-    if (cold_boot && !day_usb_link_should_resume_maintenance()) {
-        vTaskDelay(pdMS_TO_TICKS(1500));
+    if (cold_boot && wait_for_usb_preemption(1500)) {
+        enter_usb_wait_until_power_cycle();
     }
-    bool maintenance_start = day_usb_link_maintenance_active();
 
-    if (cold_boot && !maintenance_start) {
+    if (cold_boot) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_TIME_SYNC));
         esp_err_t sync_ret = day_wifi_sync_time(&s_config);
+        if (day_usb_link_maintenance_active()) {
+            enter_usb_wait_until_power_cycle();
+        }
         if (sync_ret == ESP_OK) {
             sync_rtc_from_system_if_valid();
         } else {
@@ -221,12 +260,37 @@ void day_app_run(void)
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_run_portal_window(10000));
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_web_stop());
         ESP_ERROR_CHECK_WITHOUT_ABORT(day_wifi_stop_portal());
+        if (day_usb_link_maintenance_active()) {
+            enter_usb_wait_until_power_cycle();
+        }
+
+        /* Keep CDC available for one final second after the portal phase.
+         * Once this delay completes without a host, USB is shut down before
+         * recording and is never started again during this power cycle. */
+        if (wait_for_usb_preemption(1000)) {
+            enter_usb_wait_until_power_cycle();
+        }
+        if (serial_started) {
+            esp_err_t usb_stop = day_usb_link_stop();
+            if (usb_stop != ESP_OK) {
+                ESP_LOGE(TAG, "USB did not stop before recording: %s", esp_err_to_name(usb_stop));
+                ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_set_mode(DAY_LED_ERROR));
+                enter_usb_wait_until_power_cycle();
+            }
+            serial_started = false;
+        }
+        if (day_usb_link_host_connection_latched()) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(day_usb_link_start_serial_mode());
+            enter_usb_wait_until_power_cycle();
+        }
     } else {
         sync_system_from_rtc_if_valid();
     }
 
-    if (!day_usb_link_maintenance_active() && s_config.auto_record_enabled) {
-        bool automatic_wakeup = is_automatic_wakeup(wakeup_causes);
+    /* A genuine cold power-up always makes one record after the portal stage.
+     * auto_record_enabled controls subsequent wake scheduling and whether an
+     * automatic wake records; it does not remove the one cold-boot record. */
+    if (cold_boot || s_config.auto_record_enabled) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(record_once_cb());
         if (automatic_wakeup) {
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -246,13 +310,6 @@ void day_app_run(void)
                 ESP_ERROR_CHECK_WITHOUT_ABORT(day_led_show_battery(&battery));
                 vTaskDelay(pdMS_TO_TICKS(900));
             }
-        }
-    }
-
-    if (day_usb_link_maintenance_active()) {
-        ESP_LOGI(TAG, "USB Link maintenance active; staying awake");
-        while (day_usb_link_maintenance_active()) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 
