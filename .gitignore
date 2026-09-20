@@ -22,13 +22,13 @@ build/
 *.o
 *.a
 *.out
-*.exe # For any host-side utilities compiled on Windows
+*.exe
 
 # ESP-IDF specific build outputs
 *.bin
 *.elf
 *.map
-flasher_args.json # Generated in build directory
+flasher_args.json
 sdkconfig.old
 sdkconfig
 
@@ -73,6 +73,47 @@ Desktop.ini
 
 # User-specific configuration files
 *.user
-*.workspace # General workspace files, can be from various tools
-*.suo       # Visual Studio Solution User Options
-*.sln.docstates # Visual Studio
+*.workspace
+*.suo
+*.sln.docstates
+
+# Private design material and machine-local configuration
+/.Project_Info/
+/.vscode/
+/.idea/
+/.clangd
+.env
+.env.*
+!.env.example
+!.env.template
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Local recordings, diagnostics and generated reports (not test source)
+/test-logs/
+/test-results/
+/logs/
+/imports/
+/reports/
+/cache/
+/mock_outbox/
+/tmp/
+/output/
+**/REC_*/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-shm
+*.db-wal
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+/docs/firmware_v2_implementation_plan_zh.md
+/docs/firmware_v2_1_implementation_plan_zh.md
+/docs/firmware_v2_1_device_status_plan_zh.md
+/docs/usb_link_protocol_v2_draft.md
