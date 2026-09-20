@@ -2,7 +2,7 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-> **Historical development branch:** I keep this snapshot of my earlier firmware and USB work for reference. Use [firmware-production](https://github.com/zjmdong/Day_Distiller/tree/firmware-production) for the current project.
+> **Historical development branch:** This snapshot preserves earlier firmware and USB development for reference. Use [firmware-production](https://github.com/zjmdong/Day_Distiller/tree/firmware-production) for the current project.
 
 This branch includes the wearable capture firmware and an early USB maintenance mode. Its companion is [old/windows-dev-client-py](https://github.com/zjmdong/Day_Distiller/tree/old/windows-dev-client-py).
 
@@ -21,4 +21,4 @@ See the [historical USB reference](docs/usb_link_protocol.md) or the [current ha
 
 ## License
 
-I share this branch under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).
+This branch is shared under [Creative Commons Attribution-NonCommercial 4.0 International](LICENSE.md) (CC BY-NC 4.0).

@@ -2,7 +2,7 @@
 
 [English](README.md) · **简体中文**
 
-> **历史开发分支：** 我保留早期固件与 USB 开发代码供参考。当前项目请从 [firmware-production](https://github.com/zjmdong/Day_Distiller/tree/firmware-production) 开始。
+> **历史开发分支：** 这里保留早期固件与 USB 开发代码供参考。当前项目请从 [firmware-production](https://github.com/zjmdong/Day_Distiller/tree/firmware-production) 开始。
 
 这里包含可穿戴设备的采集固件与早期 USB 维护模式。配套的历史客户端位于 [old/windows-dev-client-py](https://github.com/zjmdong/Day_Distiller/tree/old/windows-dev-client-py)。
 
@@ -21,4 +21,4 @@ idf.py build
 
 ## 许可
 
-我以 [PolyForm Noncommercial License 1.0.0](LICENSE.md) 发布此分支。
+此分支采用[知识共享 署名—非商业性使用 4.0 国际许可协议](LICENSE.md)（CC BY-NC 4.0）。
